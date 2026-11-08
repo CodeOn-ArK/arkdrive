@@ -1,0 +1,17 @@
+{
+  "model": "gwen-local-v2",
+  "when": "2026-11-08 12:56 PST",
+  "results": [
+    {
+      "id": "V2",
+      "surface": "vnc",
+      "status": "run",
+      "wall_s": 44.8,
+      "budget_s": 480.0,
+      "task_pass": false,
+      "integrity_ok": true,
+      "silent_failure": false,
+      "final": "ABORTED_CAP: iteration budget exhausted without a done call. Last tool result: {\"ok\": true, \"via\": \"ydotool\", \"verified\": true, \"state_hash\": \"58fe5b656d8e\"} (iterations used: 10/10, tool steps: 7, elapsed 45s of 480s deadline) | summary steps=7 elapsed=44.623s steps_per_sec=0.157 wasted=0 llm_ms=24"
+    }
+  ]
+}

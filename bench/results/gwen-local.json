@@ -1,0 +1,28 @@
+{
+  "model": "gwen-local",
+  "when": "2026-11-08 12:55 PST",
+  "results": [
+    {
+      "id": "B1",
+      "surface": "browser",
+      "status": "run",
+      "wall_s": 37.0,
+      "budget_s": 120.0,
+      "task_pass": false,
+      "integrity_ok": true,
+      "silent_failure": false,
+      "final": "Task context incomplete: only directory listing of harness files and results JSONs observed. No explicit task steps provided to execute. Blocked: cannot determine intended action from available context. (iterations used: 9/10, tool steps: 7, elapsed 37s of 120s deadline) | summary steps=7 elapsed=36"
+    },
+    {
+      "id": "N1",
+      "surface": "native",
+      "status": "run",
+      "wall_s": 37.2,
+      "budget_s": 180.0,
+      "task_pass": false,
+      "integrity_ok": true,
+      "silent_failure": false,
+      "final": "Task context incomplete: only directory listing of harness files and results JSONs observed. No explicit task steps provided to execute. Blocked: cannot determine intended action from available context. (iterations used: 10/10, tool steps: 7, elapsed 37s of 180s deadline) | summary steps=7 elapsed=3"
+    }
+  ]
+}

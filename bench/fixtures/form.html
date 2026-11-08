@@ -1,0 +1,7 @@
+<!doctype html>
+<title>Form Fixture</title>
+<h1>Form Fixture</h1>
+<label>Name <input id="name" type="text"></label>
+<label>File <input id="upload" type="file"></label>
+<button id="send" onclick="document.getElementById('echo').textContent='echo: '+document.getElementById('name').value+' / '+(document.getElementById('upload').files[0]?document.getElementById('upload').files[0].name:'nofile');">Send</button>
+<p id="echo">echo: (empty)</p>
