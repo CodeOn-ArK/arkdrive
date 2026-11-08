@@ -1,0 +1,1532 @@
+#!/usr/bin/env python3
+"""X11 computer-use CLI. Public invocations emit exactly one JSON object.
+
+Mouse coordinates are native desktop pixels, not resized screenshot pixels.
+Only cua-created Chromium windows are eligible for keyboard/mouse input.
+The private clipboard server mode keeps ownership until another owner takes it.
+"""
+import argparse
+import base64
+import ctypes as C
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import select
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+os.environ["DISPLAY"] = os.environ.get("CUA_DISPLAY", ":0")
+ROOT = Path(os.environ.get("CUA_ROOT", "/tmp/cua"))
+STATE = ROOT / "state.json"
+SHOT = ROOT / "shot.jpg"
+U = C.c_ulong
+P = C.c_void_p
+I = C.c_int
+L = C.c_long
+HEADER = [("type", I), ("serial", U), ("send_event", I), ("display", P)]
+# Xlib retains this process-wide function pointer even after a read connection
+# closes. Keep the callback alive for the entire process, including screenshots.
+X_ERROR_HANDLER = C.CFUNCTYPE(I, P, P)(lambda display, error: 0)
+
+
+class Request(C.Structure):
+    _fields_ = HEADER + [(n, U) for n in
+                        ("owner", "requestor", "selection", "target", "property", "time")]
+
+
+class Selection(C.Structure):
+    _fields_ = HEADER + [(n, U) for n in
+                        ("requestor", "selection", "target", "property", "time")]
+
+
+class Property(C.Structure):
+    _fields_ = HEADER + [("window", U), ("atom", U), ("time", U), ("state", I)]
+
+
+class Event(C.Union):
+    _fields_ = [("type", I), ("request", Request), ("selection", Selection),
+                ("property", Property), ("pad", L * 24)]
+
+
+class X11:
+    """Selection protocol, including INCR in both directions."""
+    def __init__(self):
+        self.x = C.CDLL("libX11.so.6")
+        signatures = {
+            "XOpenDisplay": (P, [C.c_char_p]),
+            "XDefaultRootWindow": (U, [P]),
+            "XCreateSimpleWindow": (U, [P, U, I, I, C.c_uint, C.c_uint,
+                                        C.c_uint, U, U]),
+            "XInternAtom": (U, [P, C.c_char_p, I]),
+            "XSelectInput": (I, [P, U, L]),
+            "XConvertSelection": (I, [P, U, U, U, U, U]),
+            "XSetSelectionOwner": (I, [P, U, U, U]),
+            "XGetSelectionOwner": (U, [P, U]),
+            "XNextEvent": (I, [P, C.POINTER(Event)]),
+            "XPending": (I, [P]),
+            "XChangeProperty": (I, [P, U, U, U, I, I, P, I]),
+            "XGetWindowProperty": (I, [P, U, U, L, L, I, U,
+                                       C.POINTER(U), C.POINTER(I), C.POINTER(U),
+                                       C.POINTER(U), C.POINTER(P)]),
+            "XDeleteProperty": (I, [P, U, U]),
+            "XSendEvent": (I, [P, U, I, L, C.POINTER(Event)]),
+            "XFlush": (I, [P]),
+            "XCloseDisplay": (I, [P]),
+            "XFree": (I, [P]),
+        }
+        for name, (restype, args) in signatures.items():
+            fn = getattr(self.x, name)
+            fn.restype, fn.argtypes = restype, args
+        # Requestors may disappear during a clipboard transfer. Don't let an
+        # asynchronous BadWindow terminate the persistent clipboard owner.
+        self.x.XSetErrorHandler.argtypes = [type(X_ERROR_HANDLER)]
+        self.x.XSetErrorHandler.restype = P
+        self.x.XSetErrorHandler(X_ERROR_HANDLER)
+        self.d = self.x.XOpenDisplay(os.environ.get("CUA_DISPLAY", ":0").encode())
+        if not self.d:
+            raise RuntimeError("cannot open display :0")
+        self.w = self.x.XCreateSimpleWindow(
+            self.d, self.x.XDefaultRootWindow(self.d), 0, 0, 1, 1, 0, 0, 0)
+        self.x.XSelectInput(self.d, self.w, 1 << 22)  # PropertyChangeMask
+        self.clip, self.incr = self.atom("CLIPBOARD"), self.atom("INCR")
+
+    def atom(self, name):
+        return self.x.XInternAtom(self.d, name.encode(), 0)
+
+    def event(self, deadline):
+        while time.monotonic() < deadline:
+            if self.x.XPending(self.d):
+                ev = Event()
+                self.x.XNextEvent(self.d, C.byref(ev))
+                return ev
+            time.sleep(0.005)
+        raise TimeoutError("clipboard transfer timed out")
+
+    def prop(self, atom, delete=False):
+        typ, fmt, count, after, data = U(), I(), U(), U(), P()
+        rc = self.x.XGetWindowProperty(self.d, self.w, atom, 0, 1 << 26,
+                                      int(delete), 0, C.byref(typ), C.byref(fmt),
+                                      C.byref(count), C.byref(after), C.byref(data))
+        try:
+            if rc or after.value:
+                raise RuntimeError("cannot read complete clipboard property")
+            if fmt.value == 32:
+                values = C.cast(data, C.POINTER(U))
+                result = b"".join(int(values[i]).to_bytes(4, sys.byteorder)
+                                  for i in range(count.value))
+            else:
+                result = C.string_at(data, count.value * (fmt.value // 8)) if data else b""
+            return typ.value, result
+        finally:
+            if data:
+                self.x.XFree(data)
+
+    def read(self, target="UTF8_STRING"):
+        try:
+            if not self.x.XGetSelectionOwner(self.d, self.clip):
+                raise RuntimeError("CLIPBOARD has no owner")
+            target_atom, prop = self.atom(target), self.atom("CUA_CLIP_READ")
+            self.x.XConvertSelection(self.d, self.clip, target_atom, prop, self.w, 0)
+            self.x.XFlush(self.d)
+            deadline = time.monotonic() + 5
+            while True:
+                ev = self.event(deadline)
+                if ev.type == 31 and ev.selection.selection == self.clip:
+                    if not ev.selection.property:
+                        raise RuntimeError("clipboard conversion refused for " + target)
+                    break
+            typ, data = self.prop(prop)
+            if typ != self.incr:
+                return data
+            self.x.XDeleteProperty(self.d, self.w, prop)
+            self.x.XFlush(self.d)
+            chunks = []
+            deadline = time.monotonic() + 30
+            while True:
+                ev = self.event(deadline)
+                if (ev.type == 28 and ev.property.atom == prop
+                        and ev.property.state == 0):
+                    typ, chunk = self.prop(prop, delete=True)
+                    self.x.XFlush(self.d)
+                    # Ignore an obsolete notification for the INCR header.
+                    if not typ:
+                        continue
+                    if not chunk:
+                        return b"".join(chunks)
+                    chunks.append(chunk)
+        finally:
+            self.x.XCloseDisplay(self.d)
+
+    def change(self, win, prop, typ, data, fmt=8):
+        if fmt == 32:
+            buf = (U * len(data))(*data)
+            size = len(data)
+        else:
+            buf = C.create_string_buffer(data)
+            size = len(data)
+        self.x.XChangeProperty(self.d, win, prop, typ, fmt, 0,
+                               C.cast(buf, P), size)
+
+    def serve(self, data, ready_fd):
+        targets = self.atom("TARGETS")
+        encodings = {self.atom(n): data for n in
+                     ("UTF8_STRING", "text/plain;charset=utf-8", "text/plain")}
+        encodings[self.atom("STRING")] = data.decode("utf-8").encode("latin-1", "replace")
+        self.x.XSetSelectionOwner(self.d, self.clip, self.w, 0)
+        self.x.XFlush(self.d)
+        if self.x.XGetSelectionOwner(self.d, self.clip) != self.w:
+            raise RuntimeError("failed to own CLIPBOARD")
+        os.write(ready_fd, b"1")
+        os.close(ready_fd)
+        # Readiness signaled: notify the fork watchdog (it exits) and
+        # disarm the signal watchdog; from here the owner is
+        # SUPPOSED to outlive the lane while it holds the selection
+        # (trio-2 pass-37/38/39).
+        try:
+            if _OWNER_WATCH_FD is not None:
+                os.write(_OWNER_WATCH_FD, b"R")
+                os.close(_OWNER_WATCH_FD)
+        except Exception:
+            pass
+        try:
+            import signal as _signal
+            _signal.setitimer(_signal.ITIMER_REAL, 0)
+        except Exception:
+            pass
+        transfers = {}
+        cleared = False
+        while True:
+            try:
+                ev = self.event(time.monotonic() + 1)
+            except TimeoutError:
+                ev = None
+            now = time.monotonic()
+            transfers = {k: v for k, v in transfers.items() if v[3] > now}
+            if cleared and not transfers:
+                # Ownership was lost AND every in-flight INCR
+                # transfer has completed: safe to exit (pass-117).
+                return
+            if ev is None:
+                continue
+            if ev.type == 29:  # SelectionClear: another owner replaced us.
+                if not transfers:
+                    return
+                # An INCR transfer is mid-flight: exiting now
+                # abandons its remaining chunks (including the
+                # terminating empty one) and stalls the receiver.
+                # Keep serving PropertyDelete-driven chunks until
+                # the transfer drains (trio-2 pass-117).
+                cleared = True
+                continue
+            if ev.type == 30:
+                req = ev.request
+                prop = req.property or req.target
+                if req.target == targets:
+                    self.change(req.requestor, prop, self.atom("ATOM"),
+                                [targets, *encodings], 32)
+                elif req.target in encodings:
+                    payload = encodings[req.target]
+                    if len(payload) <= 65536:
+                        self.change(req.requestor, prop, req.target, payload)
+                    else:
+                        self.x.XSelectInput(self.d, req.requestor, 1 << 22)
+                        self.change(req.requestor, prop, self.incr, [len(payload)], 32)
+                        transfers[req.requestor, prop] = (payload, 0, req.target, now + 30)
+                else:
+                    prop = 0
+                reply = Event()
+                reply.selection = Selection(31, 0, 1, self.d, req.requestor,
+                                            req.selection, req.target, prop, req.time)
+                self.x.XSendEvent(self.d, req.requestor, 0, 0, C.byref(reply))
+            elif ev.type == 28 and ev.property.state == 1:  # PropertyDelete
+                key = ev.property.window, ev.property.atom
+                if key in transfers:
+                    payload, offset, target, _ = transfers[key]
+                    chunk = payload[offset:offset + 65536]
+                    self.change(key[0], key[1], target, chunk)
+                    if chunk:
+                        transfers[key] = (payload, offset + len(chunk), target, now + 30)
+                    else:
+                        del transfers[key]
+            self.x.XFlush(self.d)
+
+
+def run(*args, timeout=8, allowed=(0,)):
+    proc = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout)
+    if proc.returncode not in allowed:
+        error = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(error[:800] or f"{args[0]} exited {proc.returncode}")
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def xd(*args, **kwargs):
+    return run("xdotool", *args, **kwargs)
+
+
+def active():
+    try:
+        return int(xd("getactivewindow"))
+    except Exception:
+        return 0
+
+
+def title(wid):
+    return xd("getwindowname", wid)
+
+
+def window_class(wid):
+    return run("xprop", "-id", wid, "WM_CLASS")
+
+
+def clients():
+    raw = run("xprop", "-root", "_NET_CLIENT_LIST")
+    return [int(v, 16) for v in re.findall(r"0x[0-9a-fA-F]+", raw)]
+
+
+def visible_windows():
+    visible = set(xd("search", "--onlyvisible", "--name", ".*", allowed=(0, 1)).split())
+    result = []
+    for wid in clients():
+        if str(wid) in visible:
+            try:
+                result.append({"id": wid, "title": title(wid)})
+            except RuntimeError:  # A window may disappear between requests.
+                pass
+    return result
+
+
+def load_state():
+    if not STATE.exists():
+        return {"version": 1}
+    try:
+        state = json.loads(STATE.read_text())
+        if not isinstance(state, dict) or state.get("version") != 1:
+            raise ValueError("unsupported state version")
+        return state
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"cannot read {STATE}: {exc}") from exc
+
+
+def save_state(state):
+    fd, name = tempfile.mkstemp(prefix="state-", dir=ROOT)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(state, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, STATE)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def window_pid(wid):
+    try:
+        return int(xd("getwindowpid", wid))
+    except Exception:
+        return 0
+
+
+def remember(state):
+    if "previous_window" not in state:
+        wid = active()
+        if not wid:
+            return
+        # Identity is (XID, PID): an XID alone is reusable, so the
+        # PID is captured for the release check (trio-2 pass-98).
+        state["previous_window"] = {"id": wid, "title": title(wid),
+                                    "class": window_class(wid),
+                                    "pid": window_pid(wid)}
+        save_state(state)
+
+
+def focus(wid):
+    xd("windowactivate", "--sync", wid)
+    deadline = time.monotonic() + 3
+    while active() != wid:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"focus verification failed for window {wid}")
+        time.sleep(0.03)
+
+
+def input_window(state, wid=None):
+    wid = active() if wid is None else wid
+    if not wid:
+        raise RuntimeError("no window focused; focus a window first")
+    cls = window_class(wid).lower()
+    if any(name in cls for name in ("chromium", "chrome", "firefox")):
+        tab = state.get("automation_tab", {})
+        if not (tab.get("window_id") == wid and automation_valid(tab)):
+            raise RuntimeError("refusing input to a browser window not owned by cua")
+    return wid
+
+
+_OWNER_WATCH_FD = None
+_KEYCODE_MAP = None
+_MOD_BINDINGS = None
+
+
+def check_focus(wid):
+    if active() != wid:
+        raise RuntimeError("focus changed before input; no further input sent")
+
+
+def move_pointer(x, y):
+    # xdotool mousemove --sync hangs when the pointer is already there.
+    xd("mousemove", x, y)
+    deadline = time.monotonic() + 2
+    while True:
+        location = dict(line.split("=", 1) for line in xd("getmouselocation", "--shell").splitlines())
+        if (int(location["X"]), int(location["Y"])) == (x, y):
+            return int(location["WINDOW"])
+        if time.monotonic() >= deadline:
+            raise RuntimeError("pointer position verification failed")
+        time.sleep(0.02)
+
+
+def set_clip(text):
+    data = text.encode("utf-8")
+    read_fd, write_fd = os.pipe()
+    child = None
+    became_ready = False
+    try:
+        child = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--clipboard-owner", str(write_fd)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=(write_fd,), start_new_session=True)
+        os.close(write_fd)
+        write_fd = None
+        child.stdin.write(data)
+        child.stdin.close()
+        ready, _, _ = select.select([read_fd], [], [], 5)
+        if not ready or os.read(read_fd, 1) != b"1":
+            raise RuntimeError("clipboard owner did not become ready")
+        became_ready = True
+        if X11().read() != data:
+            raise RuntimeError("clipboard verification failed")
+    finally:
+        if child is not None and not became_ready:
+            # The owner runs in its own session precisely so it can
+            # outlive us while HOLDING the selection -- but a child
+            # that never became ready holds nothing and must not
+            # leak past this failure (trio-2 pass-36).
+            try:
+                os.killpg(child.pid, 9)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                child.wait(timeout=2)
+            except Exception:
+                pass
+        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
+
+
+def paste(text, wid):
+    set_clip(text)
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "ctrl+v")
+    time.sleep(0.15)
+
+
+def screenshot():
+    import mss
+    from PIL import Image
+    with mss.MSS() as capture:
+        raw = capture.grab(capture.monitors[0])
+        im = Image.frombytes("RGB", raw.size, raw.rgb)
+    original = im.size
+    if im.width > 960:
+        im = im.resize((960, max(1, round(im.height * 960 / im.width))), Image.Resampling.LANCZOS)
+    fd, name = tempfile.mkstemp(prefix="shot-", suffix=".jpg", dir=ROOT)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            im.save(out, "JPEG", quality=70, optimize=True)
+        os.replace(name, SHOT)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    return {"shot": str(SHOT), "screen_size": list(original), "shot_size": list(im.size)}
+
+
+def validate_url(url):
+    if any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError("URL must not contain control characters")
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https", "about", "file"):
+        raise ValueError("use an http, https, about, or file URL")
+    if parsed.scheme in ("http", "https") and not parsed.netloc:
+        raise ValueError("URL has no host")
+
+
+def automation_valid(tab):
+    if not (tab and tab.get("trusted") and tab.get("tab_count") == 1
+            and tab.get("dedicated_window")):
+        return False
+    wid = tab.get("window_id")
+    return (wid in clients() and window_class(wid) == tab.get("window_class")
+            and run("xprop", "-id", wid, "_NET_WM_PID") == tab.get("pid_property"))
+
+
+
+# ---------------- CDP channel (added 2026-10-31) ----------------
+# Chromium on the virtual lane displays drops XTEST mouse-button events and
+# its X event queue delivers keys with wild, stacking lag. CDP input goes
+# through the browser itself: trusted clicks/keys, instant delivery, fresh
+# compositor screenshots, and DOM.setFileInputFiles for uploads (no chooser).
+
+def _cdp_port():
+    env = os.environ.get("CUA_CDP_PORT")
+    if env:
+        return int(env)
+    disp = os.environ.get("CUA_DISPLAY") or os.environ.get("DISPLAY", ":0")
+    m = re.search(r":(\d+)", disp)
+    return 9210 + (int(m.group(1)) if m else 0)
+
+
+def _page_focus_score(ws_url):
+    """Visibility/focus score for a CDP page target: 2 = visible and
+    focused, 1 = visible, 0 = hidden/unfocused, None = probe failed.
+    Used only to disambiguate duplicate-URL targets (trio-2 pass-41):
+    the automation tab is the one the user/automation window shows."""
+    try:
+        import websocket
+        ws = websocket.create_connection(ws_url, timeout=3)
+        try:
+            ws.send(json.dumps(
+                {"id": 1, "method": "Runtime.evaluate",
+                 "params": {"expression":
+                            "document.visibilityState + '|' + document.hasFocus()",
+                            "returnByValue": True}}))
+            while True:
+                m = json.loads(ws.recv())
+                if m.get("id") == 1:
+                    value = (m.get("result", {}).get("result", {})
+                             .get("value") or "")
+                    break
+        finally:
+            ws.close()
+    except Exception:
+        return None
+    if value.startswith("visible|true"):
+        return 2
+    if value.startswith("visible"):
+        return 1
+    return 0
+
+
+class _CDP:
+    def __init__(self):
+        import urllib.request
+        port = _cdp_port()
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/json/list" % port, timeout=10) as r:
+                targets = json.load(r)
+        except Exception as exc:
+            raise RuntimeError("CDP port %d unreachable (%s); lane Chromium "
+                               "must run with --remote-debugging-port" % (port, exc))
+        pages = [t for t in targets if t.get("type") == "page"
+                 and t.get("webSocketDebuggerUrl")]
+        if not pages:
+            raise RuntimeError("no CDP page target on port %d" % port)
+        target_id = os.environ.get("CUA_CDP_TARGET_ID", "")
+        pick = None
+        if target_id:
+            # Strong identity: unique per tab, stable across
+            # navigations and /json/list reordering (trio-2 pass-36).
+            pick = next((t for t in pages
+                         if t.get("id", "") == target_id), None)
+            if pick is None:
+                raise RuntimeError("cdp hint matched no page: id:" + target_id)
+        hint = os.environ.get("CUA_CDP_HINT", "")
+        if pick is None and hint:
+            # Hints are exact URL identity for EVERY scheme: a hint
+            # names a specific page, and any looser match (substring,
+            # prefix sibling, non-:// schemes like about:blank) can
+            # select a background page. Exact match or failure
+            # (trio-2 pass-26/27/33).
+            matches = [t for t in pages if t.get("url", "") == hint]
+            if not matches:
+                raise RuntimeError("cdp hint matched no page: " + hint)
+            pick = matches[0]
+            pick_score = None
+            if len(matches) > 1:
+                # Duplicate URLs: prefer the visible/focused target —
+                # a background tab sharing the automation URL must not
+                # win the pin (trio-2 pass-41).
+                best = None
+                for cand in matches:
+                    score = _page_focus_score(cand["webSocketDebuggerUrl"])
+                    if score is not None and (best is None or score > best[0]):
+                        best = (score, cand)
+                if best is not None:
+                    pick, pick_score = best[1], best[0]
+            if pick_score is None:
+                pick_score = _page_focus_score(pick["webSocketDebuggerUrl"])
+            if pick_score is not None and pick_score < 2:
+                # The hinted page exists but is not the focused
+                # window's foreground page (0 hidden, 1 visible in an
+                # unfocused window): the hint may be lagging bootstrap
+                # metadata while the operator's actual page sits
+                # visible at a different URL. If exactly one other
+                # page is visible+focused, it is the live page and
+                # wins over the stale hint (trio-2 passes 69/91). No
+                # signal or ambiguity keeps the hint's exact match.
+                visible = []
+                for cand in pages:
+                    if cand is pick:
+                        continue
+                    if _page_focus_score(cand["webSocketDebuggerUrl"]) == 2:
+                        visible.append(cand)
+                if len(visible) == 1:
+                    pick = visible[0]
+        if pick is None:
+            nonmail = [t for t in pages if "mail.google.com" not in t.get("url", "")]
+            pick = (nonmail or pages)[0]
+            if len(pages) > 1:
+                # No identity hint at all: prefer the visible/focused
+                # page over list order — a stale recovery read must
+                # not pin a background page (trio-2 pass-50). ALL
+                # pages are scored, webmail included: a focused webmail page
+                # must beat a hidden non-mail page (pass-55). The
+                # historical non-mail preference survives only as
+                # the no-signal default above.
+                best = None
+                for cand in pages:
+                    score = _page_focus_score(cand["webSocketDebuggerUrl"])
+                    if score is not None and (best is None or score > best[0]):
+                        best = (score, cand)
+                if best is not None:
+                    pick = best[1]
+        import websocket
+        self.ws = websocket.create_connection(pick["webSocketDebuggerUrl"], timeout=20)
+        self._i = 0
+        self.url = pick.get("url", "")
+        self.target_id = pick.get("id", "")
+        self.ws_url = pick.get("webSocketDebuggerUrl", "")
+
+    def cmd(self, method, **params):
+        self._i += 1
+        i = self._i
+        self.ws.send(json.dumps({"id": i, "method": method, "params": params}))
+        while True:
+            m = json.loads(self.ws.recv())
+            if m.get("id") == i:
+                if "error" in m:
+                    raise RuntimeError(method + ": " + str(m["error"].get("message", m["error"])))
+                return m.get("result", {})
+
+    def ev(self, expr):
+        r = self.cmd("Runtime.evaluate", expression=expr, returnByValue=True)
+        if "exceptionDetails" in r:
+            raise RuntimeError("eval failed: " + json.dumps(r["exceptionDetails"])[:300])
+        return r.get("result", {}).get("value")
+
+    def close(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+
+def _cdp_click_at(c, x, y, receipt=None):
+    c.cmd("Input.dispatchMouseEvent", type="mousePressed", x=float(x), y=float(y),
+          button="left", buttons=1, clickCount=1)
+    if receipt is not None:
+        # The press was accepted by the browser: the input WAS sent,
+        # whatever happens to the release (receipt redesign,
+        # 2026-11-08).
+        receipt["dispatched"] = True
+        receipt["phase"] = "dispatch"
+    c.cmd("Input.dispatchMouseEvent", type="mouseReleased", x=float(x), y=float(y),
+          button="left", buttons=0, clickCount=1)
+
+
+def _cdp_node(c, selector):
+    doc = c.cmd("DOM.getDocument")["root"]["nodeId"]
+    nid = c.cmd("DOM.querySelector", nodeId=doc, selector=selector)["nodeId"]
+    if not nid:
+        raise RuntimeError("selector not found: " + selector)
+    return nid
+
+
+def _cdp_center(c, selector):
+    doc = c.cmd("DOM.getDocument")["root"]["nodeId"]
+    nid = c.cmd("DOM.querySelector", nodeId=doc, selector=selector)["nodeId"]
+    if not nid:
+        raise RuntimeError("selector not found: " + selector)
+    # Computed-visibility gate: a visibility:hidden / display:none
+    # element can retain a positive-area layout quad, and clicking
+    # its center would hit whatever is underneath (trio-2
+    # pass-104). The clicktext path already filters this way.
+    try:
+        obj = c.cmd("DOM.resolveNode", nodeId=nid)["object"]["objectId"]
+        info = c.cmd(
+            "Runtime.callFunctionOn", objectId=obj,
+            functionDeclaration=(
+                "function() { const s = getComputedStyle(this); "
+                "return s.display + '|' + s.visibility; }"),
+            returnByValue=True)
+        style = info["result"]["value"]
+        display, _, visibility = style.partition("|")
+        if display == "none" or visibility == "hidden":
+            raise RuntimeError("selector not visible: " + selector)
+    except RuntimeError:
+        raise
+    except Exception:
+        # An unconfirmable probe (e.g. a JS exception surfaced as
+        # exceptionDetails, so no value came back) must fail
+        # CLOSED: visibility was never established (pass-112).
+        raise RuntimeError("selector not visible: " + selector)
+    c.cmd("DOM.scrollIntoViewIfNeeded", nodeId=nid)
+    _model = c.cmd("DOM.getBoxModel", nodeId=nid)["model"]
+    # The BORDER quad is the element's visible outer box: the
+    # content quad excludes padding/border, so a padded button
+    # with zero content size would falsely read as degenerate
+    # (trio-2 pass-113).
+    bm = _model.get("border") or _model["content"]
+    # Degenerate-box test via the shoelace area of the content
+    # quad: axis-aligned span arithmetic rejects VISIBLE rotated
+    # elements (their winding-order quad is not x/y monotonic),
+    # while a hidden element's quad has zero area (trio-2
+    # passes 81/82).
+    xs = bm[0::2]
+    ys = bm[1::2]
+    area2 = 0.0
+    for i in range(4):
+        j = (i + 1) % 4
+        area2 += xs[i] * ys[j] - xs[j] * ys[i]
+    if abs(area2) < 1e-9:
+        raise RuntimeError("selector not visible: " + selector)
+    cx, cy = (bm[0] + bm[4]) / 2.0, (bm[1] + bm[5]) / 2.0
+    # Hit-test: a visible element can still be COVERED at its
+    # center by an overlay, and the click would land on the cover
+    # (trio-2 pass-106). elementFromPoint must name the target
+    # itself or one of its descendants.
+    try:
+        obj = c.cmd("DOM.resolveNode", nodeId=nid)["object"]["objectId"]
+        hit = c.cmd(
+            "Runtime.callFunctionOn", objectId=obj,
+            functionDeclaration=(
+                "function(x, y) { const t = "
+                "document.elementFromPoint(x, y); "
+                "return !!t && (t === this || this.contains(t)); }"),
+            arguments=[{"value": cx}, {"value": cy}],
+            returnByValue=True)
+        if hit["result"]["value"] is not True:
+            raise RuntimeError("selector covered: " + selector)
+    except RuntimeError:
+        raise
+    except Exception:
+        # Same fail-closed rule for the hit-test (pass-112).
+        raise RuntimeError("selector covered: " + selector)
+    return cx, cy, nid
+
+
+_CDP_KEYS = {
+    "return": ("Enter", "Enter", 13), "enter": ("Enter", "Enter", 13),
+    "tab": ("Tab", "Tab", 9), "escape": ("Escape", "Escape", 27),
+    "esc": ("Escape", "Escape", 27), "backspace": ("Backspace", "Backspace", 8),
+    "delete": ("Delete", "Delete", 46), "space": (" ", "Space", 32),
+    "up": ("ArrowUp", "ArrowUp", 38), "down": ("ArrowDown", "ArrowDown", 40),
+    "left": ("ArrowLeft", "ArrowLeft", 37), "right": ("ArrowRight", "ArrowRight", 39),
+    "home": ("Home", "Home", 36), "end": ("End", "End", 35),
+    "pageup": ("PageUp", "PageUp", 33), "pagedown": ("PageDown", "PageDown", 34),
+    "f6": ("F6", "F6", 117),
+}
+
+
+def _cdp_key(c, combo, receipt=None):
+    raw_parts = combo.split("+")
+    parts = [p.lower() for p in raw_parts]
+    mods = 0
+    for mod, bit in (("alt", 1), ("ctrl", 2), ("control", 2), ("meta", 4),
+                     ("cmd", 4), ("shift", 8)):
+        if mod in parts:
+            mods |= bit
+    key = parts[-1]
+    raw_key = raw_parts[-1]
+    # Case matters for single characters: lowercasing the whole
+    # combo turned a requested "A" into insertText("a") (trio-2
+    # pass-89). Only modifier names and named keys are folded.
+    if len(raw_key) == 1 and not mods:
+        c.cmd("Input.insertText", text=raw_key)
+        if receipt is not None:
+            receipt["dispatched"] = True
+            receipt["phase"] = "dispatch"
+        return
+    if key in _CDP_KEYS:
+        k, code, vk = _CDP_KEYS[key]
+        params = dict(type="keyDown", key=k, code=code,
+                      windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk, modifiers=mods)
+        if key == "space":
+            params["text"] = " "
+        c.cmd("Input.dispatchKeyEvent", **params)
+        if receipt is not None:
+            receipt["dispatched"] = True
+            receipt["phase"] = "dispatch"
+        params["type"] = "keyUp"
+        c.cmd("Input.dispatchKeyEvent", **params)
+        return
+    if len(raw_key) == 1:
+        # key keeps its requested case; the browser applies any
+        # shift modifier itself when deriving the character.
+        kw = dict(key=raw_key, code="Key" + raw_key.upper(), modifiers=mods)
+        c.cmd("Input.dispatchKeyEvent", type="keyDown", **kw)
+        if receipt is not None:
+            receipt["dispatched"] = True
+            receipt["phase"] = "dispatch"
+        c.cmd("Input.dispatchKeyEvent", type="keyUp", **kw)
+        return
+    raise ValueError("cdp-key: unknown key " + key)
+
+
+RECEIPT_VERSION = 1
+_RECEIPT_COMMANDS = ("cdp-click", "cdp-clicktext", "cdp-clickxy",
+                     "cdp-type", "cdp-key", "cdp-setfile")
+
+
+class _ReceiptError(RuntimeError):
+    """An input-command failure carrying its structured dispatch
+    receipt (receipt redesign, 2026-11-08). The executor branches on
+    the receipt's `dispatched` flag; the error text is diagnostic
+    only — dispatch state no longer travels via message prefixes."""
+    def __init__(self, receipt, message):
+        super().__init__(message)
+        self.receipt = receipt
+
+
+def cdp_dispatch(args):
+    cmd = args.command
+    receipt = None
+    if cmd in _RECEIPT_COMMANDS:
+        receipt = {"version": RECEIPT_VERSION, "phase": "lookup",
+                   "dispatched": False, "effect": "none"}
+    try:
+        result = _cdp_dispatch_inner(args, receipt)
+    except _ReceiptError:
+        raise
+    except Exception as exc:
+        if receipt is not None:
+            raise _ReceiptError(
+                receipt, str(exc) or type(exc).__name__) from exc
+        raise
+    if receipt is not None:
+        result = dict(result)
+        result["receipt"] = receipt
+    return result
+
+
+def _cdp_dispatch_inner(args, receipt):
+    cmd = args.command
+    c = _CDP()
+    try:
+        if cmd == "cdp-eval":
+            value = c.ev(args.expr)
+            try:
+                live_url = c.ev("location.href")
+            except Exception:
+                live_url = c.url
+            return {"value": value, "cdp_url": live_url}
+        if cmd == "cdp-text":
+            # cdp_visible lets the executor detect a pin that went
+            # stale via a same-title tab switch: the served page's
+            # own focus score (2 visible+focused, 0 hidden)
+            # (trio-2 pass-70). Text and URL come from ONE evaluate
+            # so a navigation between the target listing and the
+            # read cannot pair new text with the previous page's
+            # URL (trio-2 pass-81).
+            raw = c.ev('JSON.stringify({t: document.body ? '
+                       'document.body.innerText : "", u: location.href})')
+            try:
+                parsed = json.loads(raw)
+                text_v, url_v = parsed["t"], parsed["u"]
+            except Exception:
+                text_v, url_v = raw, c.url
+            return {"text": text_v,
+                    "cdp_url": url_v, "cdp_target_id": c.target_id,
+                    "cdp_visible": _page_focus_score(c.ws_url)}
+        if cmd == "cdp-click":
+            # Every _cdp_center failure precedes any input event:
+            # the receipt stays phase="lookup", dispatched=False and
+            # the wrapper attaches it to the error envelope — the
+            # executor advances its ladder on the receipt alone
+            # (receipt redesign, 2026-11-08; replaces the trio-2
+            # "pre-dispatch:" string marking of passes 113/114).
+            x, y, _ = _cdp_center(c, args.selector)
+            receipt["phase"] = "dispatch"
+            _cdp_click_at(c, x, y, receipt)
+            receipt["phase"] = "done"
+            receipt["effect"] = "unverified"
+            return {"clicked": args.selector, "x": x, "y": y}
+        if cmd == "cdp-clickxy":
+            receipt["phase"] = "dispatch"
+            _cdp_click_at(c, args.x, args.y, receipt)
+            receipt["phase"] = "done"
+            receipt["effect"] = "unverified"
+            return {"clicked_xy": [args.x, args.y]}
+        if cmd == "cdp-clicktext":
+            js = ('(function(t){var els=[].slice.call(document.querySelectorAll('
+                  '"button, a, [role=button], input[type=submit], input[type=button]"));'
+                  'function tx(e){return ((e.innerText||e.value||"").trim());}'
+                  # A hidden match (display:none / zero box) has its
+                  # rect at (0,0): clicking it hits the page corner,
+                  # not the element (trio-2 pass-81). Only visible
+                  # candidates may match.
+                  'function vis(e){var r=e.getBoundingClientRect();'
+                  'if(r.width<=0||r.height<=0) return false;'
+                  'var s=getComputedStyle(e);'
+                  'return s.display!=="none" && s.visibility!=="hidden";}'
+                  'var pool=els.filter(vis);'
+                  'var m=pool.filter(function(e){return tx(e)===t;})[0] || '
+                  'pool.filter(function(e){return tx(e).indexOf(t)>-1;})[0];'
+                  'if(!m) return null;'
+                  'm.scrollIntoView({block:"center"});'
+                  'var r=m.getBoundingClientRect();'
+                  'var cx=r.x + r.width/2, cy=r.y + r.height/2;'
+                  # Hit-test like the selector path: a covered
+                  # match would hand the click to the overlay
+                  # (trio-2 pass-107).
+                  'var hit=document.elementFromPoint(cx, cy);'
+                  'if(!hit || (hit!==m && !m.contains(hit))) return null;'
+                  'return [cx, cy];})(' + json.dumps(args.text) + ')')
+            pt = c.ev(js)
+            if not pt:
+                raise RuntimeError("no clickable element with text: " + args.text)
+            receipt["phase"] = "dispatch"
+            _cdp_click_at(c, pt[0], pt[1], receipt)
+            receipt["phase"] = "done"
+            receipt["effect"] = "unverified"
+            return {"clicked_text": args.text, "x": pt[0], "y": pt[1]}
+        if cmd == "cdp-type":
+            receipt["phase"] = "dispatch"
+            c.cmd("Input.insertText", text=args.text)
+            receipt["dispatched"] = True
+            receipt["phase"] = "done"
+            receipt["effect"] = "unverified"
+            return {"typed": len(args.text)}
+        if cmd == "cdp-key":
+            receipt["phase"] = "dispatch"
+            _cdp_key(c, args.combo, receipt)
+            receipt["phase"] = "done"
+            receipt["effect"] = "unverified"
+            return {"key": args.combo}
+        if cmd == "cdp-setfile":
+            path = os.path.abspath(args.path)
+            if not os.path.isfile(path):
+                raise RuntimeError("file not found: " + path)
+            nid = _cdp_node(c, args.selector)
+            receipt["phase"] = "dispatch"
+            c.cmd("DOM.setFileInputFiles", nodeId=nid, files=[path])
+            receipt["dispatched"] = True
+            receipt["effect"] = "unverified"
+            receipt["phase"] = "verify"
+            n = c.ev("document.querySelector(" + json.dumps(args.selector) + ").files.length")
+            # The files.length readback is a real verification.
+            receipt["effect"] = "verified"
+            receipt["phase"] = "done"
+            return {"files_set": n, "path": path}
+        if cmd == "cdp-shot":
+            data = c.cmd("Page.captureScreenshot", format="png")["data"]
+            out = ROOT / "cdp-shot.png"
+            out.write_bytes(base64.b64decode(data))
+            return {"shot": str(out), "cdp_shot": True, "cdp_url": c.url}
+        raise ValueError("unknown cdp command " + cmd)
+    finally:
+        c.close()
+
+def _chromium_args(url):
+    args = ["/snap/bin/chromium"]
+    profile = os.environ.get("CUA_PROFILE")
+    if profile:
+        args += ["--user-data-dir=" + profile, "--no-first-run",
+                 "--disable-session-crashed-bubble",
+                 "--remote-debugging-port=" + str(_cdp_port()),
+                 "--remote-allow-origins=*"]
+    args += ["--new-window", url]
+    return args
+
+def _window_is_automation_browser(wid):
+    # When a dedicated profile is configured, the automation
+    # browser's main process carries --user-data-dir=<profile> on
+    # its command line. A window that merely APPEARED during the
+    # launch window — an unrelated Chromium the user opened — does
+    # not, and must never be adopted as the automation tab (trio-2
+    # pass-101).
+    profile = os.environ.get("CUA_PROFILE")
+    if not profile:
+        return True
+    pid = window_pid(wid)
+    if not pid:
+        return False
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            tokens = fh.read().split(b"\0")
+    except OSError:
+        return False
+    # Exact-token match: a substring check would also accept a
+    # DIFFERENT profile that merely starts with ours, e.g.
+    # --user-data-dir=/profX-foreign (trio-2 pass-102).
+    return ("--user-data-dir=" + profile).encode() in tokens
+
+
+def new_tab(url, state):
+    # A separate window is necessary: cycling a shared window N times cannot
+    # identify an automation tab and could navigate one of the user's tabs.
+    before = set(clients())
+    old_focus = active()
+    state["automation_pending"] = {"existing_windows": sorted(before)}
+    save_state(state)
+    try:
+        subprocess.Popen(_chromium_args(url),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        # A definite spawn failure must not leave the pending flag
+        # set: it would block every later launch attempt with
+        # "previous launch unresolved" (trio-2 pass-103).
+        state.pop("automation_pending", None)
+        save_state(state)
+        raise
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        candidates = [wid for wid in clients() if wid not in before
+                      and "chromium" in window_class(wid).lower()
+                      and _window_is_automation_browser(wid)]
+        if len(candidates) > 1:
+            raise RuntimeError("multiple new Chromium windows; automation ownership is uncertain")
+        if len(candidates) == 1:
+            wid = candidates[0]
+            if active() not in (old_focus, wid):
+                raise RuntimeError("focus changed during Chromium launch; retry tab goto")
+            state["automation_tab"] = {
+                "window_id": wid, "window_class": window_class(wid),
+                "pid_property": run("xprop", "-id", wid, "_NET_WM_PID"),
+                "tab_count": 1, "dedicated_window": True, "trusted": True, "url": url,
+            }
+            state.pop("automation_pending", None)
+            save_state(state)
+            focus(wid)
+            return {"automation_tab": state["automation_tab"], "created": True}
+        time.sleep(0.1)
+    raise RuntimeError("Chromium did not expose a new window; no existing tab was selected")
+
+
+def tab_command(args, state):
+    validate_url(args.url)
+    tab = state.get("automation_tab")
+    if state.get("automation_pending"):
+        raise RuntimeError("a previous Chromium launch is unresolved; inspect state before retrying")
+    if not automation_valid(tab):
+        return new_tab(args.url, state)
+    if args.action == "new":
+        focus(tab["window_id"])
+        return {"automation_tab": tab, "created": False,
+                "note": "automation tab already exists; use tab goto to navigate"}
+    wid = tab["window_id"]
+    focus(wid)
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "--repeat", tab["tab_count"], "--repeat-delay", 80, "ctrl+Tab")
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "ctrl+l")
+    paste(args.url, wid)
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "Return")
+    time.sleep(0.3)
+    tab["url"] = args.url
+    save_state(state)
+    return {"automation_tab": tab, "created": False}
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+def parser():
+    p = Parser(description=__doc__, add_help=False)
+    p.add_argument("-h", "--help", action="store_true")
+    commands = p.add_subparsers(dest="command", parser_class=Parser)
+    commands.add_parser("shot", add_help=False)
+    for name in ("click", "move"):
+        c = commands.add_parser(name, add_help=False)
+        c.add_argument("x", type=int)
+        c.add_argument("y", type=int)
+        if name == "click":
+            buttons = c.add_mutually_exclusive_group()
+            buttons.add_argument("--right", action="store_true")
+            buttons.add_argument("--middle", action="store_true")
+    c = commands.add_parser("scroll", add_help=False)
+    c.add_argument("direction", choices=("up", "down"))
+    c.add_argument("count", type=int)
+    for name, field in (("key", "combo"), ("paste", "text"), ("type", "text")):
+        c = commands.add_parser(name, add_help=False)
+        c.add_argument(field)
+    c = commands.add_parser("win", add_help=False)
+    w = c.add_subparsers(dest="action", required=True, parser_class=Parser)
+    w.add_parser("list", add_help=False)
+    w.add_parser("focus", add_help=False).add_argument("window")
+    c = commands.add_parser("tab", add_help=False)
+    c.add_argument("action", choices=("goto", "new"))
+    c.add_argument("url")
+    c = commands.add_parser("clip", add_help=False)
+    w = c.add_subparsers(dest="action", required=True, parser_class=Parser)
+    w.add_parser("get", add_help=False).add_argument("target", nargs="?", default="UTF8_STRING")
+    w.add_parser("set", add_help=False).add_argument("text")
+    commands.add_parser("release", add_help=False)
+    c = commands.add_parser("cdp-eval", add_help=False); c.add_argument("expr")
+    commands.add_parser("cdp-text", add_help=False)
+    c = commands.add_parser("cdp-click", add_help=False); c.add_argument("selector")
+    c = commands.add_parser("cdp-clickxy", add_help=False)
+    c.add_argument("x", type=float); c.add_argument("y", type=float)
+    c = commands.add_parser("cdp-clicktext", add_help=False); c.add_argument("text")
+    c = commands.add_parser("cdp-type", add_help=False); c.add_argument("text")
+    c = commands.add_parser("cdp-key", add_help=False); c.add_argument("combo")
+    c = commands.add_parser("cdp-setfile", add_help=False)
+    c.add_argument("selector"); c.add_argument("path")
+    commands.add_parser("cdp-shot", add_help=False)
+    return p
+
+
+def dispatch(args, state):
+    cmd = args.command
+    if cmd == "win" and args.action == "list":
+        return {"windows": visible_windows()}
+    if cmd == "shot":
+        return {}
+    if cmd == "clip":
+        if args.action == "set":
+            set_clip(args.text)
+            return {"bytes": len(args.text.encode("utf-8"))}
+        data = X11().read(args.target)
+        result = {"target": args.target, "text": data.decode("utf-8", "replace"), "bytes": len(data)}
+        if args.target not in ("UTF8_STRING", "text/plain;charset=utf-8", "text/plain"):
+            result["base64"] = base64.b64encode(data).decode("ascii")
+        return result
+    if cmd == "release":
+        previous = state.get("previous_window")
+        if not previous:
+            return {"restored": False}
+        wid = previous["id"]
+        if wid not in clients() or window_class(wid) != previous["class"]:
+            raise RuntimeError("previous window no longer exists; no window was focused")
+        saved_pid = previous.get("pid") or 0
+        if saved_pid and window_pid(wid) != saved_pid:
+            # Same XID, different process: the remembered window is
+            # gone and this is a recycled identity (pass-98).
+            raise RuntimeError("previous window no longer exists; no window was focused")
+        focus(wid)
+        state.pop("previous_window")
+        save_state(state)
+        return {"restored": True}
+    if cmd == "win":
+        windows = visible_windows()
+        query = args.window
+        try:
+            numeric = int(query, 16 if query.lower().startswith("0x") else 10)
+        except ValueError:
+            numeric = None
+        matches = [w for w in windows if w["id"] == numeric] if numeric is not None else [
+            w for w in windows if query.casefold() in w["title"].casefold()]
+        if len(matches) != 1:
+            raise ValueError(f"window selector matched {len(matches)} visible windows; use a unique ID")
+        remember(state)
+        focus(matches[0]["id"])
+        return {"window_id": matches[0]["id"]}
+    if cmd == "tab":
+        remember(state)
+        return tab_command(args, state)
+    if cmd.startswith("cdp-"):
+        return cdp_dispatch(args)
+    wid = input_window(state)
+    if cmd in ("click", "move"):
+        width, height = map(int, xd("getdisplaygeometry").split())
+        if not (0 <= args.x < width and 0 <= args.y < height):
+            raise ValueError(f"coordinates outside desktop {width}x{height}")
+        if cmd == "click":
+            # Do not click through into a different window, including an
+            # existing browser. Move first, inspect the window under the pointer.
+            remember(state)
+            pointer = move_pointer(args.x, args.y)
+            if pointer != wid:
+                raise RuntimeError("pointer is outside the focused window; focus its window first")
+            check_focus(wid)
+            xd("click", "--clearmodifiers", 3 if args.right else 2 if args.middle else 1)
+        else:
+            remember(state)
+            move_pointer(args.x, args.y)
+    elif cmd == "scroll":
+        if not 1 <= args.count <= 1000:
+            raise ValueError("scroll count must be between 1 and 1000")
+        location = xd("getmouselocation", "--shell")
+        if int(re.search(r"WINDOW=(\d+)", location).group(1)) != wid:
+            raise RuntimeError("pointer is outside the focused window; move it before scrolling")
+        remember(state)
+        check_focus(wid)
+        xd("click", "--clearmodifiers", "--repeat", args.count, "--delay", 40,
+           4 if args.direction == "up" else 5,
+           # 40 ms per repeat: the default 8 s budget times out
+           # mid-scroll for counts above ~200 (trio-2 pass-116).
+           timeout=max(8, args.count * 0.04 + 3))
+    elif cmd == "key":
+        # Normalize modifier aliases before the guard checks:
+        # xdotool accepts Control_L/Alt_L/Shift_L spellings, and
+        # the guards must see the same combo the key would perform
+        # (trio-2 pass-103).
+        _mod_alias = {
+            "control_l": "ctrl", "control_r": "ctrl", "control": "ctrl",
+            "alt_l": "alt", "alt_r": "alt", "mod1": "alt",
+            "shift_l": "shift", "shift_r": "shift",
+            "super_l": "super", "super_r": "super", "mod4": "super",
+            "meta_l": "meta", "meta_r": "meta",
+        }
+        # Keysym spellings of the same keys must normalize too:
+        # hex keysyms (0xffc1 = F4, 0xffe3 = Control_L) and unicode
+        # keysyms (U0077 = w) otherwise slip past the guards
+        # (trio-2 pass-104).
+        _keysym_map = {
+            0xffbe: "f1", 0xffbf: "f2", 0xffc0: "f3", 0xffc1: "f4",
+            0xffc2: "f5", 0xffc3: "f6", 0xffc4: "f7", 0xffc5: "f8",
+            0xffc6: "f9", 0xffc7: "f10", 0xffc8: "f11", 0xffc9: "f12",
+            0xffe1: "shift_l", 0xffe2: "shift_r",
+            0xffe3: "control_l", 0xffe4: "control_r",
+            0xffe9: "alt_l", 0xffea: "alt_r",
+            0xffeb: "super_l", 0xffec: "super_r", 0xffe5: "caps_lock",
+            0xff08: "backspace",
+            0xff0d: "return", 0xff1b: "escape", 0xff09: "tab",
+            0xffff: "delete",
+        }
+        def _modifier_bindings():
+            # The EFFECTIVE modifier map (xmodmap -pm): XKB options
+            # like caps:ctrl_modifier bind Caps_Lock to Control
+            # while its keysym name stays Caps_Lock — name-only
+            # normalization misses it (trio-2 pass-118). Returns
+            # (by_name, by_code): name -> SET of modifiers, keycode
+            # -> SET of modifiers. Sets because one keysym NAME can
+            # sit on several physical keys with different bindings;
+            # the physical (keycode) binding is level-independent
+            # (trio-2 pass-123).
+            global _MOD_BINDINGS
+            if _MOD_BINDINGS is None:
+                by_name, by_code = {}, {}
+                canon = {"shift": "shift", "control": "ctrl",
+                         "mod1": "alt", "mod4": "super"}
+                try:
+                    for line in run("xmodmap", "-pm").splitlines():
+                        fields = line.split()
+                        if len(fields) < 2:
+                            continue
+                        # Non-canonical modifiers (lock, mod2/3/5)
+                        # still record PRESENCE: a keycode bound
+                        # only to one of them HAS its own binding,
+                        # so the name-union fallback must not fire
+                        # for it (trio-3 debugger verification of
+                        # trio-2 pass-124 fix 4).
+                        mod = canon.get(fields[0], fields[0])
+                        for name, code in re.findall(
+                                r"(\S+)\s*\(0x([0-9a-fA-F]+)\)", line):
+                            by_name.setdefault(
+                                name.lower(), set()).add(mod)
+                            by_code.setdefault(
+                                int(code, 16), set()).add(mod)
+                except Exception:
+                    pass
+                _MOD_BINDINGS = (by_name, by_code)
+            return _MOD_BINDINGS
+
+        def _keysym_name(value):
+            # Canonical keysym NAME for a value via libX11
+            # (0xffe7 -> meta_l, 0xe4 -> adiaeresis); None when
+            # libX11 cannot name it (trio-2 pass-119/122).
+            try:
+                import ctypes as _ct
+                lib = _ct.CDLL("libX11.so.6")
+                lib.XKeysymToString.restype = _ct.c_char_p
+                raw = lib.XKeysymToString(value)
+                if raw:
+                    return raw.decode("utf-8", "replace").lower()
+            except Exception:
+                pass
+            return None
+
+        _LEFT_NAMES = {"ctrl": "control_l", "alt": "alt_l",
+                       "shift": "shift_l", "super": "super_l",
+                       "meta": "meta_l"}
+
+        def _modifier_of(raw, base, code=None):
+            # The modifier SET a token ACTIVATES: its live bindings
+            # by physical keycode and by keysym name (any key can
+            # be modifier-bound — a bound plain letter still sends
+            # its keysym, so the token keeps BOTH facts; trio-2
+            # pass-122), else its canonical modifier identity
+            # (consulting the left key's binding for shorthand and
+            # modifier tokens).
+            by_name, by_code = _modifier_bindings()
+            mods = set()
+            if code is not None:
+                mods |= by_code.get(code, set())
+            mods |= by_name.get(raw, set())
+            if not mods and base in _LEFT_NAMES:
+                mods |= by_name.get(_LEFT_NAMES[base], set())
+                if not mods:
+                    mods = {base}
+            return mods
+
+        def _shifted_names():
+            # Keysym names that live at level 1 of some key —
+            # sending one needs Shift held (exclam, Ä, ...).
+            # Case is significant: the level map preserves
+            # canonical keysym case, and a name that also lives
+            # at level 0 of some key needs no Shift to send
+            # (trio-3 debugger verification of pass-124 fix 2).
+            names = set()
+            base_names = set()
+            for levels in _keycode_levels().values():
+                if levels and levels[0].lower() != "nosymbol":
+                    base_names.add(levels[0])
+                if len(levels) > 1 and levels[1].lower() != "nosymbol" \
+                        and levels[1] != levels[0]:
+                    names.add(levels[1])
+            return names - base_names
+
+        def _resolve_token(part, level=0):
+            # -> (base, modifiers, shifted): base is the token's
+            # action identity for the guard rules; modifiers is
+            # the set it activates; shifted marks a token whose
+            # keysym needs Shift held (an uppercase letter or a
+            # level-1 keysym in any spelling), which xdotool
+            # applies to tokens AFTER it in the chord (pass-123).
+            orig = part
+            part = part.lower()
+            if len(part) > 1 and part[0].isdigit() \
+                    and not part.startswith("0x"):
+                # Keycode spelling: see the level note below.
+                if not part.isdigit():
+                    raise ValueError(
+                        "malformed key token: " + part)
+                code = int(part)
+                names = _keycode_levels().get(code) or []
+                name = None
+                for idx in ((level, 0) if level else (0,)):
+                    if idx < len(names) and \
+                            names[idx].lower() != "nosymbol":
+                        # Action identity and binding lookups are
+                        # case-normalized; the level map itself
+                        # keeps canonical case for _shifted_names.
+                        name = names[idx].lower()
+                        break
+                if name is None:
+                    raise ValueError(
+                        "raw keycodes are not permitted in key "
+                        "combinations")
+                base = _mod_alias.get(name, name)
+                # The physical key's modifier-map entry is
+                # authoritative; name-based union is only a
+                # fallback when the keycode is absent from the
+                # modifier map (trio-2 pass-124).
+                _by_name, _by_code = _modifier_bindings()
+                if code in _by_code:
+                    mods = set(_by_code[code])
+                else:
+                    mods = set()
+                    for each in names:
+                        if each.lower() != "nosymbol":
+                            low = each.lower()
+                            mods |= _modifier_of(
+                                low, _mod_alias.get(low, low),
+                                code=code)
+                return (base, mods, False)
+            if re.fullmatch(r"0x[0-9a-f]+", part):
+                value = int(part, 16)
+                if 0x20 <= value <= 0x7e:
+                    # ASCII keysym: base is the character (0x57 is
+                    # w — pass-105); the NAME feeds the bindings.
+                    char = chr(value)
+                    raw = _keysym_name(value) or char.lower()
+                    return (char.lower(),
+                            _modifier_of(raw, char.lower()),
+                            char != char.lower()
+                            or raw in _shifted_names())
+                name = _keysym_map.get(value) or \
+                    _keysym_name(value) or part
+                base = _mod_alias.get(name, name)
+                char = chr(value) if value <= 0xFF else ""
+                return (base, _modifier_of(name, base),
+                        (bool(char) and char != char.lower())
+                        or name in _shifted_names())
+            if re.fullmatch(r"u[0-9a-f]+", part):
+                try:
+                    cp = int(part[1:], 16)
+                    char = chr(cp)
+                except ValueError:
+                    return (part, set(), False)
+                # Unicode keysym value: the codepoint itself in
+                # the Latin-1 range, else 0x01000000 + codepoint.
+                kval = cp if cp < 0x100 else 0x01000000 + cp
+                raw = _keysym_name(kval) or char.lower()
+                return (char.lower(),
+                        _modifier_of(raw, char.lower()),
+                        char != char.lower()
+                        or raw in _shifted_names())
+            base = _mod_alias.get(part, part)
+            # Only a single cased CHARACTER implies Shift — a
+            # capitalized NAME (Control_L, Return, F1) does not —
+            # but a level-1 keysym NAME (exclam) does
+            # (trio-2 pass-124).
+            return (base, _modifier_of(part, base),
+                    (len(orig) == 1 and orig != orig.lower())
+                    or orig in _shifted_names())
+
+        def _keycode_levels():
+            global _KEYCODE_MAP
+            if _KEYCODE_MAP is None:
+                _KEYCODE_MAP = {}
+                try:
+                    for line in run("xmodmap", "-pke").splitlines():
+                        km = re.match(
+                            r"keycode\s+(\d+)\s*=\s*(.*)", line)
+                        if km:
+                            # Canonical keysym case is preserved:
+                            # folding it destroyed the level-0 vs
+                            # level-1 distinction for cased pairs
+                            # (a/A, adiaeresis/Adiaeresis) that
+                            # _shifted_names depends on (trio-3).
+                            _KEYCODE_MAP[int(km.group(1))] = \
+                                km.group(2).split()
+                except Exception:
+                    pass
+            return _KEYCODE_MAP
+
+        _raw_parts = args.combo.split("+")
+        # Tokens resolve IN ORDER: xdotool presses the chord
+        # sequentially, so Shift — an explicit shift modifier or
+        # a token whose keysym needs Shift held — affects only
+        # the tokens AFTER the one introducing it; a keycode
+        # token's level is decided by the Shift state at ITS
+        # position (trio-2 pass-112/123/124).
+        facts = []
+        _shift_active = False
+        for part in _raw_parts:
+            if len(part) > 1 and part[0].isdigit() \
+                    and not part.lower().startswith("0x") \
+                    and part.isdigit():
+                fact = _resolve_token(
+                    part, level=1 if _shift_active else 0)
+            else:
+                fact = _resolve_token(part)
+            facts.append(fact)
+            if "shift" in fact[1] or fact[2]:
+                _shift_active = True
+        _acts = {base for base, _mods, _sh in facts}
+        _mods = set()
+        for _base, mods, _sh in facts:
+            _mods |= mods
+        if any(c in args.combo for c in (" ", "\n", "\r")) or not args.combo or args.combo.startswith("-"):
+            raise ValueError("key expects one xdotool key combination")
+        if ("f4" in _acts and _mods & {"alt", "ctrl"}) or (
+                "ctrl" in _mods and _acts & {"w", "q"}) or (
+                "alt" in _mods and "f9" in _acts) or (
+                "super" in _mods and _acts & {"d", "h", "m"}):
+            raise ValueError("window/tab close or minimize shortcuts are not permitted")
+        if (state.get("automation_tab", {}).get("window_id") == wid
+                and "ctrl" in _mods and _acts & {"t", "n"}):
+            raise ValueError("use tab new/goto to preserve the single automation tab")
+        remember(state)
+        check_focus(wid)
+        xd("key", "--clearmodifiers", args.combo)
+    elif cmd == "paste":
+        remember(state)
+        paste(args.text, wid)
+    elif cmd == "type":
+        if len(args.text) > 256 or any(c in args.text for c in ("\x00", "\n", "\r", "\t")):
+            raise ValueError("type accepts at most 256 characters without control keys; use paste")
+        remember(state)
+        check_focus(wid)
+        xd("type", "--clearmodifiers", "--delay", 40, "--", args.text,
+           timeout=max(8, len(args.text) * 0.05 + 3))
+    else:
+        raise ValueError("a command is required; use cua --help")
+    time.sleep(0.1)
+    return {}
+
+
+def main():
+    p = parser()
+    args = p.parse_args()
+    if args.help:
+        return {"ok": True, "help": p.format_help()}
+    if not args.command:
+        raise ValueError("a command is required; use cua --help")
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (ROOT / "command.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_state()
+        result = dispatch(args, state)
+        time.sleep(0.08)
+        shot = screenshot()
+        wid = active()
+        try:
+            wtitle = title(wid) if wid else ""
+        except Exception:
+            wtitle = ""
+        return {"ok": True, "window": wtitle, "window_id": wid, **shot, **result}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--clipboard-owner":
+        import signal as _signal
+        def _watchdog(signum, frame):
+            os._exit(1)
+        _signal.signal(_signal.SIGALRM, _watchdog)
+        _signal.setitimer(_signal.ITIMER_REAL, 15)
+        # Fork watchdog BEFORE any X work: it shares no execution
+        # with the owner, so even a natively blocked XOpenDisplay
+        # cannot defer it. It kills the owner if the readiness byte
+        # does not arrive on the pipe within 15s (trio-2 pass-39).
+        _watch_r, _watch_w = os.pipe()
+        _owner_pid = os.getpid()
+        _watch_child = os.fork()
+        if _watch_child == 0:
+            # Double-fork: the worker is a grandchild, so when it
+            # exits it reparents away instead of lingering as this
+            # process's unreaped zombie (trio-2 pass-50). The
+            # intermediate exits at once and is reaped below.
+            if os.fork() > 0:
+                os._exit(0)
+            try:
+                os.close(_watch_w)
+                import select as _select
+                _ready, _, _ = _select.select([_watch_r], [], [], 15)
+                if not _ready:
+                    os.kill(_owner_pid, 9)
+            except Exception:
+                pass
+            os._exit(0)
+        try:
+            os.waitpid(_watch_child, 0)
+        except OSError:
+            pass
+        os.close(_watch_r)
+        _OWNER_WATCH_FD = _watch_w
+        try:
+            X11().serve(sys.stdin.buffer.read(), int(sys.argv[2]))
+        except Exception:
+            sys.exit(1)
+    else:
+        try:
+            result = main()
+        except (Exception, KeyboardInterrupt) as exc:
+            result = {"ok": False, "error": str(exc) or type(exc).__name__}
+            _receipt = getattr(exc, "receipt", None)
+            if _receipt is not None:
+                result["receipt"] = _receipt
+        print(json.dumps(result, ensure_ascii=True))
+        sys.exit(0 if result["ok"] else 1)

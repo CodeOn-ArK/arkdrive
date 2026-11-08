@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""X11 computer-use CLI. Public invocations emit exactly one JSON object.
+
+Mouse coordinates are native desktop pixels, not resized screenshot pixels.
+Only cua-created Chromium windows are eligible for keyboard/mouse input.
+The private clipboard server mode keeps ownership until another owner takes it.
+"""
+import argparse
+import base64
+import ctypes as C
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import select
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+os.environ["DISPLAY"] = ":0"
+ROOT = Path("/tmp/cua")
+STATE = ROOT / "state.json"
+SHOT = ROOT / "shot.jpg"
+U = C.c_ulong
+P = C.c_void_p
+I = C.c_int
+L = C.c_long
+HEADER = [("type", I), ("serial", U), ("send_event", I), ("display", P)]
+# Xlib retains this process-wide function pointer even after a read connection
+# closes. Keep the callback alive for the entire process, including screenshots.
+X_ERROR_HANDLER = C.CFUNCTYPE(I, P, P)(lambda display, error: 0)
+
+
+class Request(C.Structure):
+    _fields_ = HEADER + [(n, U) for n in
+                        ("owner", "requestor", "selection", "target", "property", "time")]
+
+
+class Selection(C.Structure):
+    _fields_ = HEADER + [(n, U) for n in
+                        ("requestor", "selection", "target", "property", "time")]
+
+
+class Property(C.Structure):
+    _fields_ = HEADER + [("window", U), ("atom", U), ("time", U), ("state", I)]
+
+
+class Event(C.Union):
+    _fields_ = [("type", I), ("request", Request), ("selection", Selection),
+                ("property", Property), ("pad", L * 24)]
+
+
+class X11:
+    """Selection protocol, including INCR in both directions."""
+    def __init__(self):
+        self.x = C.CDLL("libX11.so.6")
+        signatures = {
+            "XOpenDisplay": (P, [C.c_char_p]),
+            "XDefaultRootWindow": (U, [P]),
+            "XCreateSimpleWindow": (U, [P, U, I, I, C.c_uint, C.c_uint,
+                                        C.c_uint, U, U]),
+            "XInternAtom": (U, [P, C.c_char_p, I]),
+            "XSelectInput": (I, [P, U, L]),
+            "XConvertSelection": (I, [P, U, U, U, U, U]),
+            "XSetSelectionOwner": (I, [P, U, U, U]),
+            "XGetSelectionOwner": (U, [P, U]),
+            "XNextEvent": (I, [P, C.POINTER(Event)]),
+            "XPending": (I, [P]),
+            "XChangeProperty": (I, [P, U, U, U, I, I, P, I]),
+            "XGetWindowProperty": (I, [P, U, U, L, L, I, U,
+                                       C.POINTER(U), C.POINTER(I), C.POINTER(U),
+                                       C.POINTER(U), C.POINTER(P)]),
+            "XDeleteProperty": (I, [P, U, U]),
+            "XSendEvent": (I, [P, U, I, L, C.POINTER(Event)]),
+            "XFlush": (I, [P]),
+            "XCloseDisplay": (I, [P]),
+            "XFree": (I, [P]),
+        }
+        for name, (restype, args) in signatures.items():
+            fn = getattr(self.x, name)
+            fn.restype, fn.argtypes = restype, args
+        # Requestors may disappear during a clipboard transfer. Don't let an
+        # asynchronous BadWindow terminate the persistent clipboard owner.
+        self.x.XSetErrorHandler.argtypes = [type(X_ERROR_HANDLER)]
+        self.x.XSetErrorHandler.restype = P
+        self.x.XSetErrorHandler(X_ERROR_HANDLER)
+        self.d = self.x.XOpenDisplay(b":0")
+        if not self.d:
+            raise RuntimeError("cannot open display :0")
+        self.w = self.x.XCreateSimpleWindow(
+            self.d, self.x.XDefaultRootWindow(self.d), 0, 0, 1, 1, 0, 0, 0)
+        self.x.XSelectInput(self.d, self.w, 1 << 22)  # PropertyChangeMask
+        self.clip, self.incr = self.atom("CLIPBOARD"), self.atom("INCR")
+
+    def atom(self, name):
+        return self.x.XInternAtom(self.d, name.encode(), 0)
+
+    def event(self, deadline):
+        while time.monotonic() < deadline:
+            if self.x.XPending(self.d):
+                ev = Event()
+                self.x.XNextEvent(self.d, C.byref(ev))
+                return ev
+            time.sleep(0.005)
+        raise TimeoutError("clipboard transfer timed out")
+
+    def prop(self, atom, delete=False):
+        typ, fmt, count, after, data = U(), I(), U(), U(), P()
+        rc = self.x.XGetWindowProperty(self.d, self.w, atom, 0, 1 << 26,
+                                      int(delete), 0, C.byref(typ), C.byref(fmt),
+                                      C.byref(count), C.byref(after), C.byref(data))
+        try:
+            if rc or after.value:
+                raise RuntimeError("cannot read complete clipboard property")
+            if fmt.value == 32:
+                values = C.cast(data, C.POINTER(U))
+                result = b"".join(int(values[i]).to_bytes(4, sys.byteorder)
+                                  for i in range(count.value))
+            else:
+                result = C.string_at(data, count.value * (fmt.value // 8)) if data else b""
+            return typ.value, result
+        finally:
+            if data:
+                self.x.XFree(data)
+
+    def read(self, target="UTF8_STRING"):
+        try:
+            if not self.x.XGetSelectionOwner(self.d, self.clip):
+                raise RuntimeError("CLIPBOARD has no owner")
+            target_atom, prop = self.atom(target), self.atom("CUA_CLIP_READ")
+            self.x.XConvertSelection(self.d, self.clip, target_atom, prop, self.w, 0)
+            self.x.XFlush(self.d)
+            deadline = time.monotonic() + 5
+            while True:
+                ev = self.event(deadline)
+                if ev.type == 31 and ev.selection.selection == self.clip:
+                    if not ev.selection.property:
+                        raise RuntimeError("clipboard conversion refused for " + target)
+                    break
+            typ, data = self.prop(prop)
+            if typ != self.incr:
+                return data
+            self.x.XDeleteProperty(self.d, self.w, prop)
+            self.x.XFlush(self.d)
+            chunks = []
+            deadline = time.monotonic() + 30
+            while True:
+                ev = self.event(deadline)
+                if (ev.type == 28 and ev.property.atom == prop
+                        and ev.property.state == 0):
+                    typ, chunk = self.prop(prop, delete=True)
+                    self.x.XFlush(self.d)
+                    # Ignore an obsolete notification for the INCR header.
+                    if not typ:
+                        continue
+                    if not chunk:
+                        return b"".join(chunks)
+                    chunks.append(chunk)
+        finally:
+            self.x.XCloseDisplay(self.d)
+
+    def change(self, win, prop, typ, data, fmt=8):
+        if fmt == 32:
+            buf = (U * len(data))(*data)
+            size = len(data)
+        else:
+            buf = C.create_string_buffer(data)
+            size = len(data)
+        self.x.XChangeProperty(self.d, win, prop, typ, fmt, 0,
+                               C.cast(buf, P), size)
+
+    def serve(self, data, ready_fd):
+        targets = self.atom("TARGETS")
+        encodings = {self.atom(n): data for n in
+                     ("UTF8_STRING", "text/plain;charset=utf-8", "text/plain")}
+        encodings[self.atom("STRING")] = data.decode("utf-8").encode("latin-1", "replace")
+        self.x.XSetSelectionOwner(self.d, self.clip, self.w, 0)
+        self.x.XFlush(self.d)
+        if self.x.XGetSelectionOwner(self.d, self.clip) != self.w:
+            raise RuntimeError("failed to own CLIPBOARD")
+        os.write(ready_fd, b"1")
+        os.close(ready_fd)
+        transfers = {}
+        while True:
+            try:
+                ev = self.event(time.monotonic() + 1)
+            except TimeoutError:
+                ev = None
+            now = time.monotonic()
+            transfers = {k: v for k, v in transfers.items() if v[3] > now}
+            if ev is None:
+                continue
+            if ev.type == 29:  # SelectionClear: another owner replaced us.
+                return
+            if ev.type == 30:
+                req = ev.request
+                prop = req.property or req.target
+                if req.target == targets:
+                    self.change(req.requestor, prop, self.atom("ATOM"),
+                                [targets, *encodings], 32)
+                elif req.target in encodings:
+                    payload = encodings[req.target]
+                    if len(payload) <= 65536:
+                        self.change(req.requestor, prop, req.target, payload)
+                    else:
+                        self.x.XSelectInput(self.d, req.requestor, 1 << 22)
+                        self.change(req.requestor, prop, self.incr, [len(payload)], 32)
+                        transfers[req.requestor, prop] = (payload, 0, req.target, now + 30)
+                else:
+                    prop = 0
+                reply = Event()
+                reply.selection = Selection(31, 0, 1, self.d, req.requestor,
+                                            req.selection, req.target, prop, req.time)
+                self.x.XSendEvent(self.d, req.requestor, 0, 0, C.byref(reply))
+            elif ev.type == 28 and ev.property.state == 1:  # PropertyDelete
+                key = ev.property.window, ev.property.atom
+                if key in transfers:
+                    payload, offset, target, _ = transfers[key]
+                    chunk = payload[offset:offset + 65536]
+                    self.change(key[0], key[1], target, chunk)
+                    if chunk:
+                        transfers[key] = (payload, offset + len(chunk), target, now + 30)
+                    else:
+                        del transfers[key]
+            self.x.XFlush(self.d)
+
+
+def run(*args, timeout=8, allowed=(0,)):
+    proc = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout)
+    if proc.returncode not in allowed:
+        error = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(error[:800] or f"{args[0]} exited {proc.returncode}")
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def xd(*args, **kwargs):
+    return run("xdotool", *args, **kwargs)
+
+
+def active():
+    try:
+        return int(xd("getactivewindow"))
+    except Exception:
+        return 0
+
+
+def title(wid):
+    return xd("getwindowname", wid)
+
+
+def window_class(wid):
+    return run("xprop", "-id", wid, "WM_CLASS")
+
+
+def clients():
+    raw = run("xprop", "-root", "_NET_CLIENT_LIST")
+    return [int(v, 16) for v in re.findall(r"0x[0-9a-fA-F]+", raw)]
+
+
+def visible_windows():
+    visible = set(xd("search", "--onlyvisible", "--name", ".*", allowed=(0, 1)).split())
+    result = []
+    for wid in clients():
+        if str(wid) in visible:
+            try:
+                result.append({"id": wid, "title": title(wid)})
+            except RuntimeError:  # A window may disappear between requests.
+                pass
+    return result
+
+
+def load_state():
+    if not STATE.exists():
+        return {"version": 1}
+    try:
+        state = json.loads(STATE.read_text())
+        if not isinstance(state, dict) or state.get("version") != 1:
+            raise ValueError("unsupported state version")
+        return state
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"cannot read {STATE}: {exc}") from exc
+
+
+def save_state(state):
+    fd, name = tempfile.mkstemp(prefix="state-", dir=ROOT)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(state, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, STATE)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def remember(state):
+    if "previous_window" not in state:
+        wid = active()
+        if not wid:
+            return
+        state["previous_window"] = {"id": wid, "title": title(wid),
+                                    "class": window_class(wid)}
+        save_state(state)
+
+
+def focus(wid):
+    xd("windowactivate", "--sync", wid)
+    deadline = time.monotonic() + 3
+    while active() != wid:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"focus verification failed for window {wid}")
+        time.sleep(0.03)
+
+
+def input_window(state, wid=None):
+    wid = active() if wid is None else wid
+    if not wid:
+        raise RuntimeError("no window focused; focus a window first")
+    cls = window_class(wid).lower()
+    if any(name in cls for name in ("chromium", "chrome", "firefox")):
+        tab = state.get("automation_tab", {})
+        if not (tab.get("window_id") == wid and automation_valid(tab)):
+            raise RuntimeError("refusing input to a browser window not owned by cua")
+    return wid
+
+
+def check_focus(wid):
+    if active() != wid:
+        raise RuntimeError("focus changed before input; no further input sent")
+
+
+def move_pointer(x, y):
+    # xdotool mousemove --sync hangs when the pointer is already there.
+    xd("mousemove", x, y)
+    deadline = time.monotonic() + 2
+    while True:
+        location = dict(line.split("=", 1) for line in xd("getmouselocation", "--shell").splitlines())
+        if (int(location["X"]), int(location["Y"])) == (x, y):
+            return int(location["WINDOW"])
+        if time.monotonic() >= deadline:
+            raise RuntimeError("pointer position verification failed")
+        time.sleep(0.02)
+
+
+def set_clip(text):
+    data = text.encode("utf-8")
+    read_fd, write_fd = os.pipe()
+    try:
+        child = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--clipboard-owner", str(write_fd)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=(write_fd,), start_new_session=True)
+        os.close(write_fd)
+        write_fd = None
+        child.stdin.write(data)
+        child.stdin.close()
+        ready, _, _ = select.select([read_fd], [], [], 5)
+        if not ready or os.read(read_fd, 1) != b"1":
+            raise RuntimeError("clipboard owner did not become ready")
+        if X11().read() != data:
+            raise RuntimeError("clipboard verification failed")
+    finally:
+        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
+
+
+def paste(text, wid):
+    set_clip(text)
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "ctrl+v")
+    time.sleep(0.15)
+
+
+def screenshot():
+    import mss
+    from PIL import Image
+    with mss.MSS() as capture:
+        raw = capture.grab(capture.monitors[0])
+        im = Image.frombytes("RGB", raw.size, raw.rgb)
+    original = im.size
+    if im.width > 960:
+        im = im.resize((960, max(1, round(im.height * 960 / im.width))), Image.Resampling.LANCZOS)
+    fd, name = tempfile.mkstemp(prefix="shot-", suffix=".jpg", dir=ROOT)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            im.save(out, "JPEG", quality=70, optimize=True)
+        os.replace(name, SHOT)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    return {"shot": str(SHOT), "screen_size": list(original), "shot_size": list(im.size)}
+
+
+def validate_url(url):
+    if any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError("URL must not contain control characters")
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https", "about", "file"):
+        raise ValueError("use an http, https, about, or file URL")
+    if parsed.scheme in ("http", "https") and not parsed.netloc:
+        raise ValueError("URL has no host")
+
+
+def automation_valid(tab):
+    if not (tab and tab.get("trusted") and tab.get("tab_count") == 1
+            and tab.get("dedicated_window")):
+        return False
+    wid = tab.get("window_id")
+    return (wid in clients() and window_class(wid) == tab.get("window_class")
+            and run("xprop", "-id", wid, "_NET_WM_PID") == tab.get("pid_property"))
+
+
+def new_tab(url, state):
+    # A separate window is necessary: cycling a shared window N times cannot
+    # identify an automation tab and could navigate one of the user's tabs.
+    before = set(clients())
+    old_focus = active()
+    state["automation_pending"] = {"existing_windows": sorted(before)}
+    save_state(state)
+    subprocess.Popen(["/snap/bin/chromium", "--new-window", url],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        candidates = [wid for wid in clients() if wid not in before
+                      and "chromium" in window_class(wid).lower()]
+        if len(candidates) > 1:
+            raise RuntimeError("multiple new Chromium windows; automation ownership is uncertain")
+        if len(candidates) == 1:
+            wid = candidates[0]
+            if active() not in (old_focus, wid):
+                raise RuntimeError("focus changed during Chromium launch; retry tab goto")
+            state["automation_tab"] = {
+                "window_id": wid, "window_class": window_class(wid),
+                "pid_property": run("xprop", "-id", wid, "_NET_WM_PID"),
+                "tab_count": 1, "dedicated_window": True, "trusted": True, "url": url,
+            }
+            state.pop("automation_pending", None)
+            save_state(state)
+            focus(wid)
+            return {"automation_tab": state["automation_tab"], "created": True}
+        time.sleep(0.1)
+    raise RuntimeError("Chromium did not expose a new window; no existing tab was selected")
+
+
+def tab_command(args, state):
+    validate_url(args.url)
+    tab = state.get("automation_tab")
+    if state.get("automation_pending"):
+        raise RuntimeError("a previous Chromium launch is unresolved; inspect state before retrying")
+    if not automation_valid(tab):
+        return new_tab(args.url, state)
+    if args.action == "new":
+        focus(tab["window_id"])
+        return {"automation_tab": tab, "created": False,
+                "note": "automation tab already exists; use tab goto to navigate"}
+    wid = tab["window_id"]
+    focus(wid)
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "--repeat", tab["tab_count"], "--repeat-delay", 80, "ctrl+Tab")
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "ctrl+l")
+    paste(args.url, wid)
+    check_focus(wid)
+    xd("key", "--clearmodifiers", "Return")
+    time.sleep(0.3)
+    tab["url"] = args.url
+    save_state(state)
+    return {"automation_tab": tab, "created": False}
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+def parser():
+    p = Parser(description=__doc__, add_help=False)
+    p.add_argument("-h", "--help", action="store_true")
+    commands = p.add_subparsers(dest="command", parser_class=Parser)
+    commands.add_parser("shot", add_help=False)
+    for name in ("click", "move"):
+        c = commands.add_parser(name, add_help=False)
+        c.add_argument("x", type=int)
+        c.add_argument("y", type=int)
+        if name == "click":
+            buttons = c.add_mutually_exclusive_group()
+            buttons.add_argument("--right", action="store_true")
+            buttons.add_argument("--middle", action="store_true")
+    c = commands.add_parser("scroll", add_help=False)
+    c.add_argument("direction", choices=("up", "down"))
+    c.add_argument("count", type=int)
+    for name, field in (("key", "combo"), ("paste", "text"), ("type", "text")):
+        c = commands.add_parser(name, add_help=False)
+        c.add_argument(field)
+    c = commands.add_parser("win", add_help=False)
+    w = c.add_subparsers(dest="action", required=True, parser_class=Parser)
+    w.add_parser("list", add_help=False)
+    w.add_parser("focus", add_help=False).add_argument("window")
+    c = commands.add_parser("tab", add_help=False)
+    c.add_argument("action", choices=("goto", "new"))
+    c.add_argument("url")
+    c = commands.add_parser("clip", add_help=False)
+    w = c.add_subparsers(dest="action", required=True, parser_class=Parser)
+    w.add_parser("get", add_help=False).add_argument("target", nargs="?", default="UTF8_STRING")
+    w.add_parser("set", add_help=False).add_argument("text")
+    commands.add_parser("release", add_help=False)
+    return p
+
+
+def dispatch(args, state):
+    cmd = args.command
+    if cmd == "win" and args.action == "list":
+        return {"windows": visible_windows()}
+    if cmd == "shot":
+        return {}
+    if cmd == "clip":
+        if args.action == "set":
+            set_clip(args.text)
+            return {"bytes": len(args.text.encode("utf-8"))}
+        data = X11().read(args.target)
+        result = {"target": args.target, "text": data.decode("utf-8", "replace"), "bytes": len(data)}
+        if args.target not in ("UTF8_STRING", "text/plain;charset=utf-8", "text/plain"):
+            result["base64"] = base64.b64encode(data).decode("ascii")
+        return result
+    if cmd == "release":
+        previous = state.get("previous_window")
+        if not previous:
+            return {"restored": False}
+        wid = previous["id"]
+        if wid not in clients() or window_class(wid) != previous["class"]:
+            raise RuntimeError("previous window no longer exists; no window was focused")
+        focus(wid)
+        state.pop("previous_window")
+        save_state(state)
+        return {"restored": True}
+    if cmd == "win":
+        windows = visible_windows()
+        query = args.window
+        try:
+            numeric = int(query, 16 if query.lower().startswith("0x") else 10)
+        except ValueError:
+            numeric = None
+        matches = [w for w in windows if w["id"] == numeric] if numeric is not None else [
+            w for w in windows if query.casefold() in w["title"].casefold()]
+        if len(matches) != 1:
+            raise ValueError(f"window selector matched {len(matches)} visible windows; use a unique ID")
+        remember(state)
+        focus(matches[0]["id"])
+        return {"window_id": matches[0]["id"]}
+    if cmd == "tab":
+        remember(state)
+        return tab_command(args, state)
+    wid = input_window(state)
+    if cmd in ("click", "move"):
+        width, height = map(int, xd("getdisplaygeometry").split())
+        if not (0 <= args.x < width and 0 <= args.y < height):
+            raise ValueError(f"coordinates outside desktop {width}x{height}")
+        if cmd == "click":
+            # Do not click through into a different window, including an
+            # existing browser. Move first, inspect the window under the pointer.
+            remember(state)
+            pointer = move_pointer(args.x, args.y)
+            if pointer != wid:
+                raise RuntimeError("pointer is outside the focused window; focus its window first")
+            check_focus(wid)
+            xd("click", "--clearmodifiers", 3 if args.right else 2 if args.middle else 1)
+        else:
+            remember(state)
+            move_pointer(args.x, args.y)
+    elif cmd == "scroll":
+        if not 1 <= args.count <= 1000:
+            raise ValueError("scroll count must be between 1 and 1000")
+        location = xd("getmouselocation", "--shell")
+        if int(re.search(r"WINDOW=(\d+)", location).group(1)) != wid:
+            raise RuntimeError("pointer is outside the focused window; move it before scrolling")
+        remember(state)
+        check_focus(wid)
+        xd("click", "--clearmodifiers", "--repeat", args.count, "--delay", 40,
+           4 if args.direction == "up" else 5)
+    elif cmd == "key":
+        combo = args.combo.lower().split("+")
+        if any(c in args.combo for c in (" ", "\n", "\r")) or not args.combo or args.combo.startswith("-"):
+            raise ValueError("key expects one xdotool key combination")
+        if ("f4" in combo and any(c in combo for c in ("alt", "ctrl"))) or (
+                "ctrl" in combo and any(c in combo for c in ("w", "q"))) or (
+                "alt" in combo and "f9" in combo) or (
+                "super" in combo and any(c in combo for c in ("d", "h", "m"))):
+            raise ValueError("window/tab close or minimize shortcuts are not permitted")
+        if (state.get("automation_tab", {}).get("window_id") == wid
+                and "ctrl" in combo and any(c in combo for c in ("t", "n"))):
+            raise ValueError("use tab new/goto to preserve the single automation tab")
+        remember(state)
+        check_focus(wid)
+        xd("key", "--clearmodifiers", args.combo)
+    elif cmd == "paste":
+        remember(state)
+        paste(args.text, wid)
+    elif cmd == "type":
+        if len(args.text) > 256 or any(c in args.text for c in ("\x00", "\n", "\r", "\t")):
+            raise ValueError("type accepts at most 256 characters without control keys; use paste")
+        remember(state)
+        check_focus(wid)
+        xd("type", "--clearmodifiers", "--delay", 40, "--", args.text,
+           timeout=max(8, len(args.text) * 0.05 + 3))
+    else:
+        raise ValueError("a command is required; use cua --help")
+    time.sleep(0.1)
+    return {}
+
+
+def main():
+    p = parser()
+    args = p.parse_args()
+    if args.help:
+        return {"ok": True, "help": p.format_help()}
+    if not args.command:
+        raise ValueError("a command is required; use cua --help")
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (ROOT / "command.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_state()
+        result = dispatch(args, state)
+        time.sleep(0.08)
+        shot = screenshot()
+        wid = active()
+        try:
+            wtitle = title(wid) if wid else ""
+        except Exception:
+            wtitle = ""
+        return {"ok": True, "window": wtitle, "window_id": wid, **shot, **result}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--clipboard-owner":
+        try:
+            X11().serve(sys.stdin.buffer.read(), int(sys.argv[2]))
+        except Exception:
+            sys.exit(1)
+    else:
+        try:
+            result = main()
+        except (Exception, KeyboardInterrupt) as exc:
+            result = {"ok": False, "error": str(exc) or type(exc).__name__}
+        print(json.dumps(result, ensure_ascii=True))
+        sys.exit(0 if result["ok"] else 1)
