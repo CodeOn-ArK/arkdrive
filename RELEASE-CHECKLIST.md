@@ -22,7 +22,7 @@ is why the release prep stopped here. The code is ready to flip.
       as-is, or first run the suite against one cloud model for a
       stronger V column (per-run API cost; screen content leaves the
       machine during bench runs).
-- [ ] **Jev-style switch adjudicator** (an optional second-opinion
+- [ ] **Switch adjudicator** (an optional second-opinion model
       call at the strategy-switch point; spec-only today). Plan
       recommendation: ship v1 without it.
 - [ ] **Lanes scope.** `lane.sh` ships as the reference multi-session
