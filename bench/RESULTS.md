@@ -7,7 +7,7 @@ A "fail" here is a task the model did not complete; the run still
 ended in DONE or a named structured abort, inside its budget, with a
 full timing summary.
 
-## Nov 8, 2026 — first suite run (ArK2 desktop, live state)
+## Nov 8, 2026 — first suite run (development desktop, live state)
 
 | Model | B1 browser | N1 native | V2 vnc (flagship) | Silent failures |
 |---|---|---|---|---|

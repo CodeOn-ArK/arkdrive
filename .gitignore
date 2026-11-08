@@ -1,4 +1,28 @@
+# Python caches
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Logs and run artifacts
+*.log
 *.jsonl
+*.bak
+*.bak-*
 .kill
+cu-v8-progress*.json
+audit-report*.txt
+
+# Secrets / local config
+.env
+.env.*
+
+# Editor / OS noise
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
