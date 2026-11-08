@@ -1,4 +1,4 @@
-# cu-executor (name pending — see RELEASE-CHECKLIST.md)
+# ArkDrive
 
 A **model-agnostic GUI computer-use executor** for Linux/X11: a hardened
 runtime that sits between any tool-calling LLM and a real desktop, and

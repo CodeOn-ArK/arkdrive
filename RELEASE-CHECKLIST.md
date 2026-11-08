@@ -9,11 +9,7 @@ is why the release prep stopped here. The code is ready to flip.
 
 - [x] **License.** DECIDED Nov 8, 2026: **MIT**, copyright holder
       **Saheb Panda** (filled in `LICENSE`).
-- [ ] **Name.** Candidates from the plan: **FlightDeck**,
-      **GroundTruth**, **Rung**, **Deadreckon**, **Veranda** — or
-      another name entirely. Before adopting: check PyPI + GitHub for
-      collisions, then rename the repo, the README title, and the
-      `<NAME PENDING>` spots.
+- [x] **Name.** DECIDED Nov 8, 2026: **ArkDrive**. Collision check done: Codeon-ark/arkdrive free on GitHub; `arkdrive` free on PyPI and npm. README title renamed.
 - [ ] **Headline benchmark models.** The launch table currently shows
       the local 27B model's row (V-cards failing, printed on purpose)
       plus the Codex-driver and human-reference rows. Decide: publish
