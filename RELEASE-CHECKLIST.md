@@ -5,6 +5,8 @@ is why the release prep stopped here. The code is ready to flip.
 
 ## Decisions (owner)
 
+- Publishing target DECIDED Nov 8, 2026: ArK's PERSONAL GitHub **Codeon-ark** — NOT the USC-linked 11ark account. Align commit identity to the personal account before pushing.
+
 - [x] **License.** DECIDED Nov 8, 2026: **MIT**, copyright holder
       **Saheb Panda** (filled in `LICENSE`).
 - [ ] **Name.** Candidates from the plan: **FlightDeck**,
