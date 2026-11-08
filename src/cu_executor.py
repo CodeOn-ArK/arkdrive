@@ -3351,6 +3351,14 @@ def _run_tool_impl(tool_call):
     if tool in ("kbd_agent", "mouse_agent", "win_agent"):
         return globals()[tool](tc["action"], tc["args"])
     if tool == "shell":
+        if os.environ.get("CU_DRY_RUN") == "1":
+            # Dry-run means NO effects (release hardening, P4). The
+            # desktop-input tools are simulated by the dry runner, but
+            # the shell tool's effects are real commands, so it gets
+            # its own gate: the intended command is returned (and so
+            # logged) and never executed.
+            return ("[dry-run] shell command NOT executed: "
+                    + str(tc.get("cmd", ""))[:500])
         try:
             # Same process-group discipline as _default_runner:
             # subprocess.run's timeout kills only the shell, leaving
@@ -3522,6 +3530,11 @@ def _run_tool_impl(tool_call):
             return t3
         return t3 + " [settled:3]"
     elif tool == "edit":
+        if os.environ.get("CU_DRY_RUN") == "1":
+            # Dry-run gate (P4): file edits are effects; report the
+            # intended edit, apply nothing.
+            return ("[dry-run] edit NOT applied: %s lines %s"
+                    % (tc.get("file", ""), tc.get("lines", "")))
         try:
             # Canonical path: aliases (./, symlinks) must hit the
             # same snapshot slot verify consults (Codex trio-2
