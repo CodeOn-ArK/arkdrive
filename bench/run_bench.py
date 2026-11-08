@@ -15,7 +15,7 @@ table. The model is whatever CU_MODEL_SERVER / CU_MODEL point at --
 the executor is model-agnostic, the table is per-model by design.
 
 Usage:
-  python3 bench/run_bench.py --label gwen-local --cards B1,N1,V2 \
+  python3 bench/run_bench.py --label qwen38-27b-local --cards B1,N1,V2 \
       --executor src/cu_executor.py
 Environment: the executor's own env (CU_*), plus card-specific knobs
 (CU_BENCH_V2_LIBRARY, CU_BENCH_V2_CELLS, CU_BENCH_V*_NEEDLES as JSON).

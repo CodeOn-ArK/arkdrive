@@ -11,13 +11,13 @@ full timing summary.
 
 | Model | B1 browser | N1 native | V2 vnc (flagship) | Silent failures |
 |---|---|---|---|---|
-| Qwen3.8-27B local ("Gwen"), via this executor | fail (37.0s) | fail (37.2s) | fail (44.8s, ABORTED_CAP) | **0** |
+| Qwen3.8-27B local, via this executor | fail (37.0s) | fail (37.2s) | fail (44.8s, ABORTED_CAP) | **0** |
 | GPT-6.1 Sol via Codex as agentic driver (cua toolset, not this executor's loop) | — | — | **PASS (159s, first attempt)** | 0 |
 | Human-driven reference (operator driving cua directly) | pass | pass | pass | — |
 
-Notes on this run — read before quoting the Gwen row:
+Notes on this run — read before quoting the local-model row:
 
-- Gwen's three failures were all the same shape: the model listed the
+- The local model's three failures were all the same shape: the model listed the
   working directory in the shell, then concluded "no explicit task
   steps provided" and stopped, despite the task text being in its
   prompt. The **untouched production executor produced the identical
@@ -25,7 +25,7 @@ Notes on this run — read before quoting the Gwen row:
   harness-state result, not a release-build regression.
 - The same model passed B1-class and N1 tasks on Nov 7, 2026 on the
   same machine (browser 8.7–9.4s correct; native 17.3s, file
-  byte-exact) under a fresher desktop state. Gwen's GUI reliability is
+  byte-exact) under a fresher desktop state. Its GUI reliability is
   high-variance; the table prints the run we measured, not the best
   run we have seen. One unverified suspicion, flagged as such: the
   long-lived local model server had served dozens of runs that day,
@@ -40,6 +40,6 @@ Notes on this run — read before quoting the Gwen row:
   the project's Phase-1 GUI work (schematic captures verified frame
   by frame).
 
-Machine-readable runs: `bench/results/gwen-local.json`,
-`bench/results/gwen-local-v2.json` (from this run; the V2 card used a
+Machine-readable runs: `bench/results/qwen38-27b-local.json`,
+`bench/results/qwen38-27b-local-v2.json` (from this run; the V2 card used a
 site runbook pack kept outside this repo, as packs are meant to be).

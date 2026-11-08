@@ -120,7 +120,7 @@ case "$ACTION" in
             fi
             exit 1
         fi
-        if ! printf '%s %s\n' "${2:-raj}" "$(date -Is)" > "$LOCKDIR/owner"; then
+        if ! printf '%s %s\n' "${2:-${USER:-owner}}" "$(date -Is)" > "$LOCKDIR/owner"; then
             rmdir -- "$LOCKDIR" 2>/dev/null
             exit 1
         fi
