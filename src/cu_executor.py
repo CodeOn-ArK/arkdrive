@@ -21,10 +21,13 @@ Usage:
   python3 cu_executor.py --check-config      # print effective config
   python3 cu_executor.py --dry-run "<task>"  # plan only: no input sent
 
-Configuration is environment-driven (CU_MODEL_SERVER, CU_MODEL,
-CU_VISION_SERVER, CUA_BIN, CU_RUNBOOK_PACK, CU_KILL_FILE, ...), with an
-optional JSON config file named by CU_CONFIG. See docs/ARCHITECTURE.md
-and docs/SAFETY.md.
+Configuration is environment-driven (CU_MODEL_PROVIDER, CU_MODEL_SERVER,
+CU_MODEL, CU_MODEL_API_KEY, CU_VISION_SERVER, CUA_BIN, CU_RUNBOOK_PACK,
+CU_KILL_FILE, ...), with an optional JSON config file named by CU_CONFIG.
+Provider presets (llama / openai / deepseek / openrouter / anthropic)
+shape the model call in _chat(); API keys come from the environment
+only. External coding agents can also drive the tool layer directly --
+see docs/DRIVERS.md. Also see docs/ARCHITECTURE.md and docs/SAFETY.md.
 
 Design rules baked in over many hardening passes:
 - edit tool: line-range replace + new_file option (biggest reliability win)
@@ -49,6 +52,12 @@ import tempfile
 import threading
 import types
 from contextlib import contextmanager
+
+# The model API key is captured BEFORE the optional config file below
+# is applied: keys come from the real environment only (CU_MODEL_API_KEY),
+# never from CU_CONFIG, and they are never logged.
+_ENV_API_KEY = os.environ.get("CU_MODEL_API_KEY", "")
+
 
 def _apply_config_file():
     """Optional JSON config (CU_CONFIG=/path/to.json): keys are env var
@@ -2867,11 +2876,64 @@ def mouse_agent(action="click", args=None):
             return result if isinstance(result, str) else json.dumps(result)
         return _bounded("mouse_agent", perform)
 
+# ---------------------------------------------------------------------
+# Driving-model provider presets.
+#
+# CU_MODEL_PROVIDER selects how the per-step model call in _chat() is
+# shaped. A preset only fills defaults: CU_MODEL_SERVER / CU_MODEL (and
+# the legacy QWEN_SERVER / QWEN_MODEL names) still override it.
+#
+#   llama      (default) a local llama.cpp server: OpenAI-compatible
+#              endpoint plus llama.cpp extensions (n_predict,
+#              cache_prompt, chat_template_kwargs). No key.
+#   openai     api.openai.com -- standard chat-completions fields only.
+#   deepseek   api.deepseek.com -- same wire format as openai.
+#   openrouter openrouter.ai/api -- same wire format as openai; one
+#              key fronts many vendors' models.
+#   anthropic  api.anthropic.com -- NOT OpenAI-shaped. _chat() is the
+#              single HTTP call site, and it translates there: system
+#              messages lift to the top-level "system" field, auth is
+#              x-api-key + anthropic-version, response content blocks
+#              join back into text, and stop_reason maps onto the
+#              finish_reason spellings the run loop already handles
+#              (max_tokens -> "length", end_turn -> "stop").
+#
+# Keys come from CU_MODEL_API_KEY (captured from the real environment
+# above, before any config file is applied) -- never logged;
+# --check-config reports set/not-set only. The vision rung is separate:
+# vision_text() always speaks OpenAI-compatible chat to
+# CU_VISION_SERVER (default a local server), whatever preset drives.
+PROVIDER_PRESETS = {
+    "llama":      {"server": "http://127.0.0.1:8080", "wire": "llama",
+                   "model": "local-model", "key_required": False},
+    "openai":     {"server": "https://api.openai.com", "wire": "openai",
+                   "model": None, "key_required": True},
+    "deepseek":   {"server": "https://api.deepseek.com", "wire": "openai",
+                   "model": "deepseek-chat", "key_required": True},
+    "openrouter": {"server": "https://openrouter.ai/api", "wire": "openai",
+                   "model": None, "key_required": True},
+    "anthropic":  {"server": "https://api.anthropic.com", "wire": "anthropic",
+                   "model": None, "key_required": True},
+}
+
+PROVIDER = (os.environ.get("CU_MODEL_PROVIDER") or "llama").strip().lower()
+_preset = PROVIDER_PRESETS.get(PROVIDER)
+PROVIDER_ERROR = None
+if _preset is None:
+    PROVIDER_ERROR = ("unknown CU_MODEL_PROVIDER %r (choose: %s)"
+                      % (PROVIDER, ", ".join(sorted(PROVIDER_PRESETS))))
+    _preset = PROVIDER_PRESETS["llama"]  # inert stand-in; _chat refuses
+WIRE = _preset["wire"]
+API_KEY = _ENV_API_KEY
+
 SERVER = (os.environ.get("CU_MODEL_SERVER") or os.environ.get("QWEN_SERVER")
-          or "http://127.0.0.1:8080")
+          or _preset["server"])
 MODEL = (os.environ.get("CU_MODEL") or os.environ.get("QWEN_MODEL")
-         or "local-model")
-CHAT_URL = SERVER.rstrip("/") + "/v1/chat/completions"
+         or _preset["model"] or "")
+if WIRE == "anthropic":
+    CHAT_URL = SERVER.rstrip("/") + "/v1/messages"
+else:
+    CHAT_URL = SERVER.rstrip("/") + "/v1/chat/completions"
 VISION_SERVER = (os.environ.get("CU_VISION_SERVER")
                  or "http://127.0.0.1:8081")
 VISION_URL = VISION_SERVER.rstrip("/") + "/v1/chat/completions"
@@ -2993,19 +3055,85 @@ def _md5(path):
         h.update(f.read())
     return h.hexdigest()
 
-def _chat(messages, n_predict, extra=None):
-    data = {
-        "model": MODEL,
-        "messages": messages,
-        "n_predict": n_predict,
-        "cache_prompt": True,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    data.update(SAMPLING)
+def _model_headers():
+    headers = {"Content-Type": "application/json"}
+    if WIRE == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
+        if API_KEY:
+            headers["x-api-key"] = API_KEY
+    elif API_KEY:
+        headers["Authorization"] = "Bearer " + API_KEY
+    return headers
+
+
+def _request_payload(messages, n_predict, extra=None):
+    """Build the request body for the configured wire format."""
+    if WIRE == "anthropic":
+        # The Messages API takes the system prompt as a top-level
+        # field rather than a message, budgets output with max_tokens,
+        # and rejects llama.cpp/OpenAI extension fields -- send only
+        # what it accepts.
+        system = "\n".join(str(m.get("content") or "") for m in messages
+                           if m.get("role") == "system")
+        data = {
+            "model": MODEL,
+            "messages": [m for m in messages if m.get("role") != "system"],
+            "max_tokens": max(1, int(n_predict)),
+            "temperature": SAMPLING["temperature"],
+        }
+        if system:
+            data["system"] = system
+    elif WIRE == "llama":
+        data = {
+            "model": MODEL,
+            "messages": messages,
+            "n_predict": n_predict,
+            "cache_prompt": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        data.update(SAMPLING)
+    else:
+        # Standard OpenAI chat completions (openai / deepseek /
+        # openrouter presets): hosted APIs reject or ignore llama.cpp
+        # extensions, so only portable fields go out -- the token
+        # budget travels as max_tokens.
+        data = {
+            "model": MODEL,
+            "messages": messages,
+            "max_tokens": max(1, int(n_predict)),
+            "temperature": SAMPLING["temperature"],
+            "top_p": SAMPLING["top_p"],
+        }
     if extra:
         data.update(extra)
+    return data
+
+
+_ANTHROPIC_FINISH = {"end_turn": "stop", "stop_sequence": "stop",
+                     "max_tokens": "length", "tool_use": "tool_calls",
+                     "pause_turn": "stop", "refusal": "stop"}
+
+
+def _response_text(d):
+    """(content, finish_reason) from a provider response body, in the
+    OpenAI spellings the run loop already understands."""
+    if WIRE == "anthropic":
+        text = "".join(block.get("text", "")
+                       for block in d.get("content", [])
+                       if isinstance(block, dict)
+                       and block.get("type") == "text")
+        stop = d.get("stop_reason")
+        return text, _ANTHROPIC_FINISH.get(stop, stop)
+    choice = d["choices"][0]
+    return choice["message"].get("content") or "", choice.get("finish_reason")
+
+
+def _chat(messages, n_predict, extra=None):
+    if PROVIDER_ERROR:
+        raise RuntimeError("model provider misconfigured: " + PROVIDER_ERROR)
+    data = _request_payload(messages, n_predict, extra)
     req = urllib.request.Request(CHAT_URL, data=json.dumps(data).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=_model_headers())
     started = time.monotonic()
     try:
         with _within(_timeout("llm")):
@@ -3015,8 +3143,8 @@ def _chat(messages, n_predict, extra=None):
         global _llm_ms
         _llm_ms += (time.monotonic() - started) * 1000
     latency = time.monotonic() - started
-    choice = d["choices"][0]
-    return choice["message"].get("content") or "", choice.get("finish_reason"), latency
+    text, finish_reason = _response_text(d)
+    return text, finish_reason, latency
 
 def call_qwen(task, steps=(), last_result="", note="", n_predict=None):
     # Bound both messages together, including the system prompt and any retry note.
@@ -4556,12 +4684,34 @@ def run_loop(task, max_iters=None):
                  + ' '.join(last_result.splitlines())[:300])
 
 
+def _config_problems():
+    """Provider validation for --check-config: what is missing for the
+    selected preset to be usable at all. Never includes the key."""
+    problems = []
+    if PROVIDER_ERROR:
+        problems.append(PROVIDER_ERROR)
+    if _preset["key_required"] and not API_KEY:
+        problems.append("CU_MODEL_API_KEY is not set (required for "
+                        "provider %r)" % PROVIDER)
+    if not MODEL:
+        problems.append("CU_MODEL is not set (provider %r has no "
+                        "default model)" % PROVIDER)
+    return problems
+
+
 def _check_config():
     """Print the effective configuration and exit (needs no desktop,
-    no model server)."""
+    no model server). The API key is reported as set/not-set only --
+    its value never prints. Exit status is 1 when _config_problems()
+    finds the configuration unusable."""
+    problems = _config_problems()
     cfg = {
+        "model_provider": PROVIDER,
+        "model_wire": WIRE,
         "model_server": SERVER,
         "model": MODEL,
+        "chat_url": CHAT_URL,
+        "model_api_key": ("set (value redacted)" if API_KEY else "not set"),
         "vision_server": VISION_SERVER,
         "cua_bin": os.environ.get("CUA_BIN", "(built-in default)"),
         "cua_root": os.environ.get("CUA_ROOT", "/tmp/cua"),
@@ -4572,9 +4722,10 @@ def _check_config():
         "runbook_pack": os.environ.get("CU_RUNBOOK_PACK", "(none)"),
         "global_deadline_s": os.environ.get("EXEC_DEADLINE_S", "480"),
         "max_iters": os.environ.get("MAX_ITERS", "10"),
+        "config_problems": problems,
     }
     print(json.dumps(cfg, indent=2))
-    return 0
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

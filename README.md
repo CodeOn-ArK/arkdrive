@@ -47,6 +47,30 @@ python3 src/cu_executor.py --dry-run "<task>"   # actions logged, nothing dispat
 touch /tmp/cu-executor.kill                      # kill switch: halts a live run cleanly
 ```
 
+## Works with
+
+**Executor-loop models** — set `CU_MODEL_PROVIDER` and go (full
+details in [docs/DRIVERS.md](docs/DRIVERS.md)):
+
+| Preset | Endpoint | API key |
+|---|---|---|
+| `llama` (default) | your local llama.cpp server | — |
+| `openai` | api.openai.com | `CU_MODEL_API_KEY` |
+| `deepseek` | api.deepseek.com | `CU_MODEL_API_KEY` |
+| `openrouter` | openrouter.ai/api | `CU_MODEL_API_KEY` |
+| `anthropic` | api.anthropic.com (translated inside the executor) | `CU_MODEL_API_KEY` |
+
+Any other OpenAI-compatible endpoint works via `CU_MODEL_SERVER` +
+`CU_MODEL`. Keys come from the environment only — never config
+files, never logs.
+
+**Agentic drivers** — an external coding agent can skip the executor
+loop and drive the same tool layer (`cua` / `cua-lane`) directly.
+**Codex** is proven (flagship card, Doom, Blender — see the
+benchmarks); **Claude Code** and any shell-capable, image-viewing
+agent follow the contract in [docs/DRIVERS.md](docs/DRIVERS.md).
+Agents: start from [AGENTS.md](AGENTS.md).
+
 ## Benchmarks (Nov 8, 2026 — short version)
 
 Same cards, same machine, one row per driving model. Full results,
@@ -76,9 +100,10 @@ arkdrive/
 ├── tools/        check_deps.py · audit_report.py
 ├── bench/        cards.json · run_bench.py · RESULTS.md · fixtures/ · results/
 ├── tests/        test_smoke.py · test_core.py · trio2_reference.py
-├── docs/         ARCHITECTURE · SAFETY · RUNBOOK_PACKS · HARDENING
+├── docs/         ARCHITECTURE · SAFETY · RUNBOOK_PACKS · HARDENING · DRIVERS
 ├── runbooks/     example task-family pack (fictional data)
 ├── wiki/         sources for the GitHub wiki pages
+├── AGENTS.md     pointers for external coding agents
 ├── install.sh
 ├── LICENSE       MIT
 └── CHANGELOG.md
@@ -92,6 +117,9 @@ arkdrive/
   receipts, micro-agents, sensors
 - [docs/SAFETY.md](docs/SAFETY.md) — dry-run, audit log, kill switch,
   human-in-the-loop points
+- [docs/DRIVERS.md](docs/DRIVERS.md) — model provider presets, and the
+  contract for external agents (Codex, Claude Code, generic) driving
+  the tool layer directly
 - [docs/RUNBOOK_PACKS.md](docs/RUNBOOK_PACKS.md) — tailoring the executor
   to a task family
 - [docs/HARDENING.md](docs/HARDENING.md) — how this executor was hardened

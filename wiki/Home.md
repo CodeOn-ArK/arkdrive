@@ -23,6 +23,10 @@ quality and the model's quality are never confused.
 - **[Hardening-Story](Hardening-Story)** — how the executor was hardened:
   125 adversarial review passes, ~250 defects, one structural rebuild,
   and the rules that came out of it.
+- **[Compatibility](Compatibility)** — who can drive ArkDrive: executor
+  model presets (llama / OpenAI / DeepSeek / OpenRouter / Anthropic)
+  and external coding agents (Codex proven; Claude Code and generic
+  agents by contract).
 
 ## In the repo
 
