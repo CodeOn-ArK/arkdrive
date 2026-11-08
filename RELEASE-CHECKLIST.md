@@ -5,12 +5,8 @@ is why the release prep stopped here. The code is ready to flip.
 
 ## Decisions (owner)
 
-- [ ] **License.** Working default in `LICENSE` is **MIT** with a
-      placeholder copyright holder. Alternatives from the plan:
-      Apache-2.0 (patent grant, standard for infra tools), AGPL-3.0
-      (copyleft; protects the project, scares some adopters),
-      source-available/BSL (not open source). Pick one, set the
-      copyright holder line.
+- [x] **License.** DECIDED Nov 8, 2026: **MIT**, copyright holder
+      **Saheb Panda** (filled in `LICENSE`).
 - [ ] **Name.** Candidates from the plan: **FlightDeck**,
       **GroundTruth**, **Rung**, **Deadreckon**, **Veranda** — or
       another name entirely. Before adopting: check PyPI + GitHub for
