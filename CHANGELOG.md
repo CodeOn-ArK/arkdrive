@@ -1,6 +1,46 @@
 # Changelog
 
-## v0.1.0 — 2026-11-08 (pre-release; not yet published)
+## v1.0.0 — 2026-11-09
+
+First full release. The executor core is unchanged from v0.1.0. What
+is new is benchmark evidence for how an external agentic driver
+should be briefed, measured on a local GUI task.
+
+### Added
+- Benchmark suite (`bench/`): the 10 fixed task cards, the runner,
+  and the per-model results, extended in this release with two A/B
+  profile benches (a local GUI task and a nested-desktop Virtuoso
+  task), each shipping both driver prompts, a runner note, and its
+  results file.
+- Lean driver profile for agentic drivers (Codex and peers):
+  text-first observation (OCR, window titles, app state) instead of
+  a screenshot at every step, a one-line-per-step state ledger
+  instead of re-reading full history, batched scripted bursts for
+  predictable stretches, and state-based verification, with a full
+  screenshot kept at the final gate. It ships as bench prompts, a
+  runner note, and results under `bench/`. It is not integrated
+  into the executor core.
+
+### Measured
+- Local GUI A/B, same task and same machine, Codex driving both
+  profiles: the lean profile used 52,372 tokens vs 120,557 for the
+  standard screenshot-driven profile (56.6% fewer) and finished in
+  159 s vs 223 s (28.7% faster).
+- Accuracy: the lean run's saved file was byte-exact. The standard
+  run failed on one extra trailing newline that its
+  screenshot-per-step verification never caught, while still
+  reporting success. One run per profile on one small task, so the
+  percentages are directional; the defect class here is one that
+  screenshots cannot see.
+
+### Known limitations
+- The Virtuoso (nested-desktop) A/B is staged but has not run: both
+  runs are blocked on USC scf02 server access (SSH key authorization
+  broke over Nov 8 to 9). The prompts are committed and the bench
+  will run when access is restored.
+- All v0.1.0 known limitations still apply.
+
+## v0.1.0 — 2026-11-08
 
 First packaged form of the executor, de-coupled from its original
 single-machine deployment and prepared for public release.
