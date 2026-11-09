@@ -1,0 +1,25 @@
+You are driving the desktop on this machine (DISPLAY=:0) with the cua toolset and screenshots (use image input to see).
+
+TASK, local bench, standard profile. Working directory: /home/ark/ab-bench/ (create the folder first if it does not exist).
+
+1. Open the GNOME Text Editor (gnome-text-editor).
+2. Create a new document containing EXACTLY these 10 lines and nothing else. Press Enter after each line, including the last one:
+ArkDrive local bench
+profile comparison run
+line three: observe
+line four: act
+line five: verify
+line six: ledger
+line seven: batch
+line eight: state
+line nine: tokens
+line ten: done
+3. Save the document as /home/ark/ab-bench/result.txt
+4. Open Files (Nautilus), navigate to /home/ark/ab-bench, create a subfolder named "verified", and move result.txt into it.
+5. Close both apps.
+
+PROFILE RULES (standard): drive by screenshots. Take a screenshot before and after every GUI action so you can see the current state and verify each step visually. One GUI action per turn. Verify the save by the editor showing the saved filename, and verify the move by seeing result.txt inside the verified folder in Files.
+
+When everything is done, end with exactly this summary block:
+ACTIONS: <the number of GUI input actions you performed (cua clicks, key presses, type actions)>
+RESULT: <one line: the final state as you verified it>
