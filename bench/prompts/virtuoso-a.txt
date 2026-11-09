@@ -1,0 +1,23 @@
+You are driving the desktop on this machine (DISPLAY=:0) with the cua toolset and screenshots (use image input to see).
+
+CONTEXT: A TigerVNC viewer window is open fullscreen showing a remote desktop on USC's viterbi-scf02 (display :97). The viewer is a live picture of a remote computer: the windows inside it (GNOME desktop, a bash Terminal, the Virtuoso CIW, editor windows) are remote windows, not local ones. Mouse and keyboard input lands inside the viewer on the remote desktop. Work inside the picture.
+
+On the remote machine, Cadence Virtuoso is already running from ~/work_gpdk045, with the CIW (Command Interpreter Window) open. The design library is ee477proj_sahebpan.
+
+TASK (read-only; do not edit or save anything, do not close any window):
+1. In the CIW, open the fa schematic read-only: click the CIW command line and type
+   deOpenCellView("ee477proj_sahebpan" "fa" "schematic" "" nil "r")
+   then press Enter.
+2. In the fa schematic editor window that opens, click on the canvas and press f (Fit).
+3. Repeat for alu8: deOpenCellView("ee477proj_sahebpan" "alu8" "schematic" "" nil "r"), then click its canvas and press f.
+4. Verify by screenshot: both editor window titles read exactly
+   "Virtuoso Studio Schematic Editor L Reading: ee477proj_sahebpan fa schematic" and
+   "Virtuoso Studio Schematic Editor L Reading: ee477proj_sahebpan alu8 schematic".
+   If a title is too small to read at half scale, crop and upscale the title-bar region and view the crop.
+5. Self-check in the CIW: run
+   mapcar(lambda((w) hiGetWindowName(w)) hiGetWindowList())
+   and confirm both editor titles appear in the CIW output (screenshot it).
+
+Work screenshot-driven: take a screenshot before and after every input, correct your aim from what you see, and save evidence screenshots as you go.
+
+End with a final report: PASS or FAIL, the two window titles as read, the CIW window-list result, how many cua input actions you used, and the wall-clock time you took.
