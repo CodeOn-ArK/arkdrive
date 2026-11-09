@@ -1,0 +1,30 @@
+You are driving the desktop on this machine (DISPLAY=:0) with the cua toolset, screenshots when needed, and a shell.
+
+TASK, local bench, lean profile. Working directory: /home/ark/ab-bench/ (create the folder first if it does not exist).
+
+1. Open the GNOME Text Editor (gnome-text-editor).
+2. Create a new document containing EXACTLY these 10 lines and nothing else (the text ends with a newline after the last line):
+ArkDrive local bench
+profile comparison run
+line three: observe
+line four: act
+line five: verify
+line six: ledger
+line seven: batch
+line eight: state
+line nine: tokens
+line ten: done
+3. Save the document as /home/ark/ab-bench/result.txt
+4. Open Files (Nautilus), navigate to /home/ark/ab-bench, create a subfolder named "verified", and move result.txt into it.
+5. Close both apps.
+
+PROFILE RULES (lean): spend as few observations and turns as possible while staying accurate.
+- Text before vision: use OCR on cropped captures (tesseract), window titles (wmctrl), and other text channels wherever they can settle a question. Full screenshots ONLY when text cannot settle it, and once at the very end as the final verification gate.
+- Crop: when you do capture the screen, crop to the active window or the region that changed, never the full desktop.
+- Ledger: keep a state ledger as you go, one line per completed step recording what is now true (for example "editor open, empty doc"). Consult the ledger instead of re-observing state you already established.
+- Batch predictable stretches into single bursts with no intermediate screenshots: enter the whole document text in ONE action (a single type of the full text, or one paste), and do the Files work (create folder, cut, navigate, paste) as one planned key-sequence burst. Verify the end state of each burst once.
+- Verify by state, not by picture: window titles, the editor's saved indicator, and the Files folder listing state. Do not take a screenshot after every click.
+
+When everything is done, end with exactly this summary block:
+ACTIONS: <the number of GUI input actions you performed (cua clicks, key presses, type actions)>
+RESULT: <one line: the final state as you verified it>
