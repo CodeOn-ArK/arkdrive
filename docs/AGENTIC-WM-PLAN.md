@@ -438,6 +438,8 @@ A WM cannot infer the business meaning of a changed canvas. Nor does independent
 2. Trusted automation vs hostile-code containment. Decide whether arbitrary code and real credentials must be supported immediately. Recommendation: trusted applications and restricted working mounts first; stronger UID/sandbox isolation before broader access.
 3. First-release compatibility bar. Decide whether the parallelism proof may use Xvfb/XTEST or must already include rejecting surfaces and GPU-heavy Blender. Recommendation: prove concurrency first, run evdev/GPU spikes immediately, and require qualification before claiming full workload compatibility.
 
+**Decisions taken (ArK, Nov 9, 2026): all three approved as recommended.** (1) One session per agent/application group is the execution domain. (2) Trusted automation first; hostile-code containment later. (3) The first release may prove parallelism on Xvfb/XTEST, with the evdev and GPU spikes run in parallel, and qualification required before claiming full workload compatibility. Phase 0 proceeds on this basis.
+
 First milestone (observable and narrow): two agents independently create and rename folders while the human types elsewhere; a modal breaks AT-SPI in one session; takeover pauses only that session. Publish recordings, receipts, failures, timing breakdowns, and token counts together.
 
 ## Amendment — driver model policy (ArK, Nov 9, 2026)
