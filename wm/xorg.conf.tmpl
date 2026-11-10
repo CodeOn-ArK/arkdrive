@@ -1,0 +1,53 @@
+Section "ServerFlags"
+    Option "AutoAddDevices" "false"
+    Option "AutoEnableDevices" "false"
+    Option "AutoAddGPU" "false"
+    Option "DontVTSwitch" "true"
+    Option "DontZap" "true"
+EndSection
+
+Section "InputDevice"
+    Identifier "kbd"
+    Driver "evdev"
+    Option "Device" "@KBD@"
+    Option "CoreKeyboard" "true"
+EndSection
+
+Section "InputDevice"
+    Identifier "ptr"
+    Driver "evdev"
+    Option "Device" "@PTR@"
+    Option "CorePointer" "true"
+EndSection
+
+Section "Device"
+    Identifier "dev0"
+    Driver "dummy"
+    VideoRam 256000
+EndSection
+
+Section "Monitor"
+    Identifier "mon0"
+    HorizSync 5.0 - 1000.0
+    VertRefresh 5.0 - 200.0
+    Modeline "1280x800" 83.50 1280 1352 1480 1680 800 803 809 831 -hsync +vsync
+    Option "DPMS" "false"
+EndSection
+
+Section "Screen"
+    Identifier "scr0"
+    Device "dev0"
+    Monitor "mon0"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1280x800"
+    EndSubSection
+EndSection
+
+Section "ServerLayout"
+    Identifier "lay0"
+    Screen "scr0"
+    InputDevice "kbd" "CoreKeyboard"
+    InputDevice "ptr" "CorePointer"
+EndSection
