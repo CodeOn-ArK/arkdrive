@@ -336,10 +336,10 @@ class RPCTests(SandboxCase):
                                               "match": {"title": "Rename exact"}}))
         self.assertIsNone(self.worker.predicate({"kind": "dialog_present", "match": {"type": "dialog"}}))
 
-    def test_act_rejects_without_journal_intent(self):
+    def test_malformed_act_rejects_without_journal_intent(self):
         before = self.worker.journal.path.read_bytes()
         result = self.call("window.act", {"action_id": "w2"})
-        self.assertEqual(result["error"]["data"], {"reason": "backend_unsupported", "detail": "act path arrives at W2"})
+        self.assertEqual(result["error"]["data"], {"reason": "invalid_params"})
         self.assertEqual(before, self.worker.journal.path.read_bytes())
         self.assertEqual(self.call("action.get", {"action_id": "w2"})["result"]["status"], "not_found")
 
@@ -477,6 +477,8 @@ class XEventTests(unittest.TestCase):
                 data = {"x": source["x"], "y": 4}
             elif cls is w.request.GetInputFocus:
                 data = {"focus": source["focus"]}
+            elif cls is w.request.QueryTree:
+                data = {"children": [10]}
             else:
                 atom = args["property"]
                 value = (8, b"Main") if atom == xs.atoms["_NET_WM_NAME"] else (

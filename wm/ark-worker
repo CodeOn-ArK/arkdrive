@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""W1 session worker: state evidence only. No input or capture path exists.
+"""Session worker: state evidence and journaled W2 XTEST batches.
 
 X replies after connection setup are deferred and pumped by the selector loop.
 The few python-xlib private members used by AsyncX are isolated there; they
@@ -36,6 +36,9 @@ import PIL
 
 
 WM = Path(__file__).resolve().parent
+sys.path.insert(0, str(WM))
+from worker_act import ActError, Engine, canonical, leaves, predicate_schema, recover_receipt
+from worker_xtest import XTestTransport
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
 STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
 PAGE = struct.Struct("<4sI16sQIIQ16s")
@@ -47,7 +50,7 @@ ATOM_NAMES = ("_NET_SUPPORTING_WM_CHECK", "WM_S0", "_NET_CLIENT_LIST",
               "_NET_ACTIVE_WINDOW", "_NET_WM_NAME", "WM_NAME", "WM_CLASS",
               "WM_TRANSIENT_FOR", "WM_CLIENT_LEADER", "_NET_WM_STATE",
               "_NET_WM_STATE_MODAL", "_NET_WM_WINDOW_TYPE",
-              "_NET_WM_WINDOW_TYPE_DIALOG", "_NET_WM_PID")
+              "_NET_WM_WINDOW_TYPE_DIALOG", "_NET_WM_PID", "_NET_CLOSE_WINDOW", "_NET_RESTACK_WINDOW")
 
 
 def utc():
@@ -78,6 +81,33 @@ def marked(pid, state, sid):
                 os.fsencode(f"ARK_SESSION_ID={sid}")}.issubset(env)
     except OSError:
         return False
+
+
+class AdoptedOpenbox:
+    """Popen-shaped lifecycle for an earlier generation's surviving WM."""
+    def __init__(self, pid, starttime):
+        self.pid, self.starttime = pid, starttime
+
+    def poll(self):
+        return None if proc_identity(self.pid) == self.starttime else 0
+
+    def send_signal(self, sig):
+        if self.poll() is None:
+            try:
+                os.kill(self.pid, sig)
+            except ProcessLookupError:
+                pass
+
+    def terminate(self):
+        self.send_signal(signal.SIGTERM)
+
+    def kill(self):
+        self.send_signal(signal.SIGKILL)
+
+    def wait(self):
+        if self.poll() is None:
+            wait_pid(self.pid, 2)
+        return self.poll()
 
 
 def verify_x_binding(r):
@@ -215,9 +245,56 @@ class Journal:
     def close(self):
         self.stream.close()
 
+    def validate(self):
+        # Used only for owner-authorized storage recovery, never per input.
+        # A writable disk does not repair a torn JSONL tail.
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+        with self.path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.endswith("\n") or not isinstance(json.loads(line), dict):
+                    raise ValueError("journal_unavailable")
+
+    def unresolved(self):
+        """Recover admission blockers across generations, without replaying input."""
+        actions, reconciled, proven = {}, set(), set()
+        paths = sorted(self.path.parent.glob("*.jsonl"), key=lambda p: p.stat().st_mtime_ns)
+        for path in paths:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    row = json.loads(line)
+                    if row.get("session") != self.session:
+                        continue
+                    kind = row.get("type")
+                    key = (row.get("generation"), row.get("action_id"))
+                    if kind == "intent":
+                        actions[key] = {"intent": row, "armed": [], "receipt": None}
+                    elif kind == "step_armed" and key in actions:
+                        actions[key]["armed"].append(row["step_id"])
+                    elif kind == "receipt" and key in actions:
+                        actions[key]["receipt"] = row["receipt"]
+                    elif kind in ("reconciled", "reconciliation"):
+                        source = (row.get("action_generation", row["generation"]), row["action_id"])
+                        if kind == "reconciled":
+                            reconciled.add(source)
+                        else:
+                            proven.add((*source, row["step_id"]))
+        pending = []
+        # Stable journal order breaks ties between intents with the same timestamp.
+        for key, action in sorted(actions.items(), key=lambda item: item[1]["intent"]["ts"]):
+            if key in reconciled:
+                continue
+            receipt = action["receipt"]
+            if receipt is None:
+                receipt = recover_receipt(action["intent"], action["armed"])
+            for effect in receipt["pending_effects"]:
+                if effect["action_id"] == key[1] and (*key, effect["step_id"]) not in proven:
+                    pending.append(dict(effect, generation=key[0]))
+        return pending
+
     @staticmethod
     def action(path, action_id):
-        intent, receipt = None, None
+        intent, receipt, armed, reconciliations = None, None, [], []
         try:
             with path.open(encoding="utf-8") as stream:
                 for line in stream:
@@ -227,17 +304,23 @@ class Journal:
                             intent = row
                         elif row.get("type") == "receipt":
                             receipt = row.get("receipt", row)
+                        elif row.get("type") == "step_armed":
+                            armed.append(row["step_id"])
+                        elif row.get("type") == "reconciliation":
+                            reconciliations.append(row)
         except FileNotFoundError:
             raise RPCError("history_expired")
         except (OSError, ValueError):
+            if intent is not None:
+                unknown = recover_receipt(intent, armed)
+                unknown["reason"] = "journal_unavailable"
+                return {"status": "final", "receipt": unknown, "history_complete": False}
             raise RPCError("journal_unavailable")
         if intent is None:
             return {"status": "not_found", "action_id": action_id}
         if receipt is not None:
-            return {"status": "final", "receipt": receipt}
-        return {"status": "final", "receipt": {"action_id": action_id,
-                "dispatch_status": "unknown", "effect": {"status": "unknown"},
-                "reason": "worker_fault"}}
+            return {"status": "final", "receipt": receipt, "reconciliation": reconciliations}
+        return {"status": "final", "receipt": recover_receipt(intent, armed)}
 
 
 class StateCache:
@@ -246,6 +329,7 @@ class StateCache:
         self.session, self.generation = session, generation
         self.rev, self.next_window = 1, 1
         self.windows, self.removed = {}, {}
+        self.stacking = []  # Client XIDs, bottom to top.
         self.tombstones = {}
         self.focus, self.modal, self.pointer = None, [], None
         self.screen = None
@@ -437,6 +521,8 @@ class XState:
         self.incarnations = {}
         self.selected_windows, self.uncovered = set(), set()
         self.focus_xid, self.input_focus = 0, 0
+        self.ancestors, self.ignored = {}, set()
+        self.root_order = []
         self.initialised, self.wm_ready = False, False
         self.phase = "versions"
         for name in ("XTEST", "DAMAGE", "XFIXES", "XInputExtension"):
@@ -487,14 +573,28 @@ class XState:
                 checks[key] = value
                 if len(checks) != 3:
                     return
-                if (checks["selection"] or checks["check"] or
-                        checks["attributes"]["all_event_masks"] & X.SubstructureRedirectMask):
-                    raise RuntimeError("wm_already_running")
+                present = (checks["selection"] or checks["check"] or
+                           checks["attributes"]["all_event_masks"] & X.SubstructureRedirectMask)
+                if present:
+                    own = self.w.recorded_openbox()
+                    if own is None or own.poll() is not None:
+                        raise RuntimeError("wm_already_running")
+                    # Openbox's WM-check/selection windows have no _NET_WM_PID.
+                    # The validated process identity and root redirect ownership
+                    # are sufficient: two live WMs cannot own this root.
+                    self.w.openbox = own
+                    launch(False)
+                else:
+                    launch(True)
+            def launch(spawn):
                 self.root.change_attributes(event_mask=X.SubstructureNotifyMask | X.PropertyChangeMask
                                             | X.StructureNotifyMask | X.PointerMotionMask)
                 # Version negotiation has completed before this first XI use.
                 self.root.xinput_select_events([(xinput.AllMasterDevices, xinput.MotionMask)])
-                self.w.start_openbox()
+                if spawn:
+                    self.w.start_openbox()
+                else:
+                    self.w.read_openbox_version()
                 self.phase = "wm_wait"
                 self.check_wm()
             self.ax.ask(request.GetSelectionOwner, lambda d: checked("selection", xid(d["owner"])),
@@ -506,6 +606,12 @@ class XState:
             self.derive()
             self.w.cache.baseline()
             self.initialised = True
+            self.phase = "channel_setup"
+            self.w.act = Engine(self.w, XTestTransport(self.w))
+        if self.phase == "channel_setup" and self.w.act.t.initialised and not self.ax.pending:
+            self.phase = "channel_test"
+            self.w.act.start_selftest()
+        if self.phase == "channel_test" and self.w.act.selftest is None:
             self.phase = "ready"
             self.w.ready()
 
@@ -530,7 +636,8 @@ class XState:
             self.refresh(wid)
 
     def root_tree(self, data):
-        for child in data["children"]:
+        self.root_order = [xid(child) for child in data["children"]]
+        for child in self.root_order:
             self.refresh(xid(child))
 
     def client_list(self, data):
@@ -549,12 +656,22 @@ class XState:
             self.focus_xid = self.input_focus
 
     def refresh(self, wid):
-        if not wid or wid == self.root.id:
+        if not wid or wid == self.root.id or wid in getattr(self, "ignored", set()):
             return
         if wid in self.refreshing:
             self.again.add(wid)
             return
         self.refreshing.add(wid)
+        def finished():
+            self.refreshing.discard(wid)
+            if wid in self.again:
+                self.again.remove(wid)
+                self.refresh(wid)
+        self.read_window(wid, finished)
+
+    def read_window(self, wid, complete):
+        # An independent snapshot: callers wait for this request group only,
+        # never for event-driven refreshes or their repeated `again` samples.
         if wid not in self.selected_windows:
             # Select before sampling: changes between GetProperty and event
             # selection must not escape the cache's event coverage.
@@ -567,21 +684,220 @@ class XState:
         names = ("attributes", "geometry", "position", "_NET_WM_NAME", "WM_NAME", "WM_CLASS",
                  "WM_TRANSIENT_FOR", "WM_CLIENT_LEADER", "_NET_WM_STATE",
                  "_NET_WM_WINDOW_TYPE", "_NET_WM_PID")
-        def got(name, data):
-            values[name] = data
-            if len(values) == len(names):
-                self.refreshing.discard(wid)
+        ancestry_done = not hasattr(self, "ancestors")
+        def finish():
+            if len(values) == len(names) and ancestry_done:
                 if self.incarnations.get(wid, 0) == incarnation:
                     self.snapshot(wid, values)
-                if wid in self.again:
-                    self.again.remove(wid)
-                    self.refresh(wid)
+                complete()
+        def got(name, data):
+            values[name] = data
+            finish()
         self.ax.ask(request.GetWindowAttributes, lambda d: got("attributes", d), optional=True, window=wid)
         self.ax.ask(request.GetGeometry, lambda d: got("geometry", d), optional=True, drawable=wid)
         self.ax.ask(request.TranslateCoords, lambda d: got("position", d), optional=True,
                     src_wid=wid, dst_wid=self.root, src_x=0, src_y=0)
+        # Root hit tests see WM frames. Retain the actual parent chain rather
+        # than assuming that matching desktop geometry proves ownership.
+        if hasattr(self, "ancestors"):
+            def ancestry(node, chain):
+                def parent(d):
+                    nonlocal ancestry_done
+                    if not d:
+                        ancestry_done = True
+                        finish()
+                        return
+                    p = xid(d["parent"])
+                    if p and p != self.root.id and p not in chain and len(chain) < 8:
+                        chain.append(p)
+                        ancestry(p, chain)
+                    else:
+                        self.ancestors[wid] = tuple(chain)
+                        ancestry_done = True
+                        finish()
+                self.ax.ask(request.QueryTree, parent, optional=True, window=node)
+            ancestry(wid, [])
         for name in names[3:]:
             self.property(wid, name, lambda d, n=name: got(n, d))
+
+    def sample(self, predicate, target, complete):
+        """Refresh predicate dependencies without reconciling the session.
+
+        Discover IDs and probe classifiers on possible candidates. Appearance
+        evidence does not depend on a new client's geometry or frame ancestry;
+        other predicates retain full snapshots of named/target/focus windows.
+        Every callback belongs to this finite sample, even during event churn.
+        """
+        cancelled = False
+        pending = 1
+        selected, sampled, probed = set(), set(), set()
+        classifiers, invalid = {}, set()
+        cache = self.w.cache
+        predicates = leaves(predicate)
+        appearance = any(p["kind"] in ("window_present", "dialog_present") for p in predicates)
+        handles = {h for p in predicates for h in (p.get("window"), p.get("handle"), p.get("parent"))
+                   if isinstance(h, str)}
+        if target:
+            handles.add(target)
+
+        def done():
+            nonlocal pending
+            pending -= 1
+            if pending == 0 and not cancelled:
+                self.derive()
+                cache.commit()
+                result = {"complete": not invalid and not bool(sampled & self.uncovered)}
+                if appearance:
+                    result.update(classifiers=classifiers, focus_xid=self.focus_xid or self.input_focus)
+                complete(result)
+
+        def ask(cls, callback, **args):
+            nonlocal pending
+            pending += 1
+            def got(data):
+                if not cancelled:
+                    callback(data)
+                done()
+            self.ax.ask(cls, got, **args)
+
+        def prop(wid, name, callback):
+            ask(request.GetProperty, callback, optional=True, window=wid,
+                property=self.atoms[name], type=X.AnyPropertyType, delete=False,
+                long_offset=0, long_length=16384)
+
+        def select(wid):
+            nonlocal pending
+            if not wid or wid == self.root.id or wid in selected or wid in getattr(self, "ignored", set()):
+                return
+            selected.add(wid)
+            if appearance and wid not in cache.windows:
+                # A new client's frame/geometry/ancestry is not a dependency
+                # of an appearance predicate. Its mapped classifiers suffice.
+                probe(wid, {})
+                return
+            sampled.add(wid)
+            pending += 1
+            self.read_window(wid, done)
+
+        def probe(wid, match):
+            # Titles can change without an event, so the cached old title must
+            # never exclude a candidate. Read only the requested classifiers.
+            names = set()
+            incarnation = self.incarnations.get(wid, 0)
+            if appearance:
+                names.update(("attributes", "_NET_WM_NAME", "WM_NAME", "WM_CLASS", "_NET_WM_WINDOW_TYPE"))
+                if any(p["kind"].startswith("dialog") for p in predicates):
+                    names.update(("WM_TRANSIENT_FOR", "_NET_WM_STATE"))
+            if "title" in match or "title_re" in match:
+                names.update(("_NET_WM_NAME", "WM_NAME"))
+            if "class" in match:
+                names.add("WM_CLASS")
+            if "type" in match:
+                names.update(("attributes", "_NET_WM_WINDOW_TYPE"))
+            if not names:
+                select(wid)
+                return
+            values = {}
+            def got(name, data):
+                values[name] = data
+                if len(values) != len(names):
+                    return
+                if self.incarnations.get(wid, 0) != incarnation:
+                    invalid.add(wid)
+                    return
+                if any(d and d.get("bytes_after", 0) for d in values.values()):
+                    invalid.add(wid)
+                    if not appearance or wid in cache.windows:
+                        sampled.add(wid)
+                        self.uncovered.add(wid)
+                    return
+                def text(name):
+                    return bytes(prop_values(values.get(name))).decode("utf-8", "replace").rstrip("\0")
+                candidate = {"title": text("_NET_WM_NAME") or text("WM_NAME"),
+                             "class": text("WM_CLASS").split("\0")[-1],
+                             "type": "popup" if (values.get("attributes") or {}).get("override_redirect") else
+                             "dialog" if self.atoms["_NET_WM_WINDOW_TYPE_DIALOG"] in
+                             prop_values(values.get("_NET_WM_WINDOW_TYPE")) else "normal"}
+                if appearance:
+                    attributes = values.get("attributes")
+                    if not attributes:
+                        cache.remove(wid)
+                        return
+                    if attributes["win_class"] == X.InputOnly:
+                        return
+                    if wid not in self.clients and not attributes["override_redirect"] and wid not in cache.windows:
+                        return  # WM frames/check windows are not client arrivals.
+                    transient = list(prop_values(values.get("WM_TRANSIENT_FOR")))
+                    old = cache.windows.get(wid, {})
+                    candidate.update(xid=wid, mapped=attributes["map_state"] != X.IsUnmapped,
+                                     transient_for=(int(transient[0]) if transient else None) if
+                                     "WM_TRANSIENT_FOR" in names else old.get("transient_for"),
+                                     is_modal=self.atoms["_NET_WM_STATE_MODAL"] in
+                                     prop_values(values.get("_NET_WM_STATE")) if
+                                     "_NET_WM_STATE" in names else old.get("is_modal", False))
+                    classifiers[wid] = candidate
+                    # Commit fresh classifiers of known windows, including
+                    # nonmatches, so unrelated title changes remain visible.
+                    old = cache.windows.get(wid)
+                    if old:
+                        cache.upsert(wid, dict(old, **candidate))
+                    return
+                if Engine.matches(candidate, match):
+                    select(wid)
+                else:
+                    # Apply fresh negative classifiers too: absence predicates
+                    # must not see an old cached match that has disappeared.
+                    old = cache.windows.get(wid)
+                    if old:
+                        fields = {"title" if k == "title_re" else k for k in match}
+                        cache.upsert(wid, dict(old, **{k: candidate[k] for k in fields}))
+            for name in sorted(names):
+                if name == "attributes":
+                    ask(request.GetWindowAttributes, lambda d: got("attributes", d), optional=True, window=wid)
+                else:
+                    prop(wid, name, lambda d, n=name: got(n, d))
+
+        def discover(ids):
+            ids = set(cache.windows) | set(ids)
+            for i, p in enumerate(predicates):
+                if p.get("kind") in ("pointer_at",) or p.get("window") or p.get("handle"):
+                    continue
+                if p.get("kind") not in ("window_present", "window_absent", "window_focused", "focus_is",
+                                         "dialog_present", "dialog_absent"):
+                    continue
+                for wid in ids:
+                    if (wid, i) in probed or wid in getattr(self, "ignored", set()) or wid == self.root.id:
+                        continue
+                    probed.add((wid, i))
+                    probe(wid, p.get("match", {}))
+
+        def discovered(data):
+            self.clients = {int(v) for v in prop_values(data)}
+            discover(self.clients)
+        prop(self.root, "_NET_CLIENT_LIST", discovered)
+        def tree(data):
+            self.root_order = [xid(v) for v in data["children"]]
+            discover(self.root_order)
+        ask(request.QueryTree, tree, window=self.root)
+        def focus(data):
+            self.active(data)
+            select(self.focus_xid)
+        prop(self.root, "_NET_ACTIVE_WINDOW", focus)
+        def input_focus(data):
+            self.got_focus(data)
+            select(self.input_focus)
+        ask(request.GetInputFocus, input_focus)
+        def pointer(data):
+            cache.set("pointer", {"x": data["root_x"], "y": data["root_y"]})
+        ask(request.QueryPointer, pointer, window=self.root)
+        for wid, win in list(cache.windows.items()):
+            if win["handle"] in handles:
+                select(wid)
+        done()
+        def cancel():
+            nonlocal cancelled
+            cancelled = True
+        return cancel
 
     def snapshot(self, wid, values):
         a, g, p = (values[n] for n in ("attributes", "geometry", "position"))
@@ -625,6 +941,12 @@ class XState:
 
     def derive(self):
         cache = self.w.cache
+        # QueryTree is bottom to top; managed clients inherit their frame's
+        # root position, while override-redirect windows appear directly.
+        order = {wid: i for i, wid in enumerate(getattr(self, "root_order", []))}
+        ancestors = getattr(self, "ancestors", {})
+        cache.set("stacking", sorted(cache.windows, key=lambda wid: max(
+            order.get(node, -1) for node in (wid, *ancestors.get(wid, ())))))
         # Resolve transient chains to the parent's family, including popups.
         for _ in range(len(cache.windows)):
             changed = False
@@ -650,8 +972,12 @@ class XState:
         return 1
 
     def events(self, events):
+        if getattr(self.w, "act", None):
+            self.w.act.t.events(events)
         for e in events:
             wid = xid(getattr(e, "window", 0))
+            if wid in getattr(self, "ignored", set()):
+                continue
             if e.type == X.PropertyNotify:
                 if wid == self.root.id:
                     if e.atom == self.atoms["_NET_SUPPORTING_WM_CHECK"]:
@@ -664,6 +990,8 @@ class XState:
                 elif e.atom in self.atoms.values():
                     self.refresh(wid)
             elif e.type in (X.MapNotify, X.UnmapNotify, X.ConfigureNotify, X.ReparentNotify):
+                self.w.cache.changed.add("stacking")
+                self.ax.ask(request.QueryTree, self.root_tree, window=self.root)
                 if wid == self.root.id:
                     self.ax.ask(request.GetGeometry, self.screen, drawable=self.root)
                 else:
@@ -680,8 +1008,7 @@ class XState:
             elif e.type == X.MotionNotify:
                 self.w.cache.set("pointer", {"x": e.root_x, "y": e.root_y})
             elif e.type == ge.GenericEventCode:
-                # python-xlib 0.33 leaves XI raw payloads as bytes. W1 uses
-                # core events only; generic-event decoding belongs to W2.
+                # Raw payloads have already been handed to the ack consumer.
                 continue
         self.derive()
 
@@ -708,6 +1035,8 @@ class Worker:
         self.started = time.monotonic()
         self.timings = {"providers_ms": 0, "selftest_ms": 0}
         self.cache = StateCache(self.sid, generation)
+        self.act = None
+        self.setup_action_profile()
         self.journal = Journal(state / "acts" / (generation + ".jsonl"), self.sid, generation)
         self.counters = dict.fromkeys(("batches", "steps", "verified", "not_observed", "contradicted",
                                       "unknown", "retries", "route_changes", "resync_drift", "false_closes"), 0)
@@ -734,13 +1063,23 @@ class Worker:
     def elapsed(self):
         return int((time.monotonic() - self.started) * 1000)
 
+    def setup_action_profile(self):
+        # W2 fixed development profile. No route learning or app classifier.
+        self.profile_data = {"schema": 1, "backend": self.record.get("profile"),
+                             "keymap": "server", "locale": "C.UTF-8", "wm": "openbox",
+                             "input": {"inter_key_delay_us": 0},
+                             "shortcuts": {"select_all": ["Control_L", "a"]}}
+        self.profile_hash = hashlib.sha256(canonical(self.profile_data).encode()).hexdigest()
+        self.development_flags = FLAGS
+
     def providers(self):
         return {name: {"state": "unavailable", "reason": "not_implemented",
                        "sample_rev": None, "age_ms": None, "coverage": "none"}
                 for name in ("atspi", "ocr", "tree", "pixels")}
 
     def channels(self):
-        return {"xtest": {"state": "untested", "keyboard": False, "pointer": False},
+        return {"xtest": dict(self.act.channel) if getattr(self, "act", None) else
+                          {"state": "untested", "keyboard": "untested", "pointer": "untested"},
                 "evdev": {"state": "down", "grab": False, "reason":
                           "not_implemented" if self.record["profile"] == "xorg" else "backend_unsupported"},
                 "paste": {"state": "unavailable", "reason": "not_implemented"},
@@ -752,9 +1091,15 @@ class Worker:
                 **(self.x.versions if self.x else {})}
 
     def health(self):
+        act = getattr(self, "act", None)
+        pending = act.pending_effects[0] if act and act.pending_effects else None
+        reason = (act.fence_reason or act.reconciliation_reason()) if act else None
         return {"worker": {"pid": os.getpid(), "generation": self.generation,
-                           "state": "stopping" if self.stopping else "ready",
-                           "fence_reason": None},
+                           "state": "stopping" if self.stopping else "fenced" if act and act.fence_reason else
+                                    "awaiting_reconciliation" if pending else "ready",
+                           "fence_reason": reason,
+                           "pending_action_id": pending["action_id"] if pending else None,
+                           "pending_action_generation": pending.get("generation", self.generation) if pending else None},
                 "session": {"id": self.sid, "profile": self.record["profile"],
                             "display": f':{self.record["display"]}'},
                 "rev": self.cache.rev, "control": self.cache.control,
@@ -762,7 +1107,10 @@ class Worker:
                 "capture": {"mode": "unavailable", "reason": "not_implemented", **self.screen},
                 "coverage": self.coverage(), "counters": dict(self.counters),
                 "versions": self.versions(), "development_flags": FLAGS,
-                "human_transport": "unavailable", "awaiting_reconciliation": False}
+                "profile_hash": getattr(self, "profile_hash", None),
+                "human_transport": "unavailable", "awaiting_reconciliation": bool(act and act.pending_effects),
+                "pending_effects": act.pending_effects if act else [],
+                "lease_suspended": bool(act and act.lease_state.get(self.lease, {}).get("suspended"))}
 
     def coverage(self):
         covered = self.covered()
@@ -784,6 +1132,43 @@ class Worker:
                     stream.write("[Settings]\ngtk-cursor-blink=false\ngtk-enable-animations=false\n")
             except FileExistsError:
                 pass
+        self.read_openbox_version()
+        with (self.sd / "logs/openbox.log").open("ab") as log:
+            self.openbox = subprocess.Popen(["/usr/bin/openbox", "--sm-disable", "--config-file",
+                                             str(WM / "openbox-rc.xml")],
+                                            env=session_env(self.record, self.state),
+                                            cwd=self.record["home"], stdout=log, stderr=log)
+        # Persist before baseline/self-test: a kill during startup must also
+        # leave enough identity to adopt the surviving WM on the next start.
+        identity = {"wm_pid": self.openbox.pid, "wm_starttime": proc_identity(self.openbox.pid)}
+        temp = self.sd / "openbox.json.tmp"
+        with temp.open("w") as stream:
+            json.dump(identity, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(self.sd / "openbox.json")
+
+    def recorded_openbox(self):
+        try:
+            identity_path = self.sd / "openbox.json"
+            if not identity_path.exists():
+                identity_path = self.sd / "worker.json"
+            identity = json.loads(identity_path.read_text())
+            pid, stamp = identity["wm_pid"], identity["wm_starttime"]
+            if type(pid) is not int or pid <= 0 or not stamp or proc_identity(pid) != stamp:
+                return None
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            env = set(Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+            if (args != [b"/usr/bin/openbox", b"--sm-disable", b"--config-file", os.fsencode(WM / "openbox-rc.xml")]
+                    or not marked(pid, self.state, self.sid)
+                    or os.fsencode(f'DISPLAY=:{self.record["display"]}') not in env
+                    or proc_identity(pid) != stamp):
+                return None
+            return AdoptedOpenbox(pid, stamp)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def read_openbox_version(self):
         # Package metadata is local and read only; never execute openbox just
         # to get a version (it can write caches before printing --version).
         self.openbox_version = None
@@ -795,11 +1180,6 @@ class Worker:
                     break
         except (OSError, StopIteration):
             pass
-        with (self.sd / "logs/openbox.log").open("ab") as log:
-            self.openbox = subprocess.Popen(["/usr/bin/openbox", "--sm-disable", "--config-file",
-                                             str(WM / "openbox-rc.xml")],
-                                            env=session_env(self.record, self.state),
-                                            cwd=self.record["home"], stdout=log, stderr=log)
 
     def ready(self):
         self.poll_control(force=True)
@@ -818,6 +1198,7 @@ class Worker:
         self.listener.setblocking(False)
         self.selector.register(self.listener, selectors.EVENT_READ, "listener")
         metadata = {"pid": os.getpid(), "generation": self.generation,
+                    "wm_pid": self.openbox.pid, "wm_starttime": proc_identity(self.openbox.pid),
                     "socket": str(self.socket_path), "started_at": utc()}
         temp = self.sd / "worker.json.tmp"
         with temp.open("w") as stream:
@@ -844,7 +1225,7 @@ class Worker:
         now = time.monotonic()
         if not force and now < self.control_due:
             return
-        self.control_due = now + 0.05
+        self.control_due = now + (0.005 if getattr(self, "act", None) and self.act.active else 0.05)
         try:
             info = (self.sd / "control").stat()
             if info.st_size != 64 or (info.st_dev, info.st_ino) != self.control_identity:
@@ -869,8 +1250,16 @@ class Worker:
             control = {"state": "paused", "epoch": None, "reason": str(exc)}
         previous = self.cache.control
         self.cache.set("control", control)
+        if getattr(self, "act", None):
+            self.act.control_changed(previous, control)
         if previous is not None:
-            self.journal.append("control", previous=previous, **control)
+            if getattr(self, "act", None):
+                try:
+                    self.act.durable("control", previous=previous, **control)
+                except ActError:
+                    pass
+            else:
+                self.journal.append("control", previous=previous, **control)
 
     def accept(self):
         sock, _ = self.listener.accept()
@@ -969,7 +1358,13 @@ class Worker:
                 return  # No side effects for JSON-RPC notifications in W1.
             method = msg["method"]
             if method == "window.act":
-                raise RPCError("backend_unsupported", "act path arrives at W2")
+                if not hasattr(self, "profile_hash"):
+                    self.setup_action_profile()
+                if not getattr(self, "act", None):
+                    # Startup is not published until the real channel is tested.
+                    self.act = Engine(self, None)
+                self.act.submit(peer, ident, params)
+                return
             self.validate_params(method, params)
             if method in ("window.observe", "window.wait", "session.done"):
                 self.require_lease(peer, params)
@@ -983,10 +1378,13 @@ class Worker:
                     raise RPCError("invalid_params")
                 self.lease, self.lease_peer = secrets.token_hex(16), peer
                 self.lease_until = None
+                if getattr(self, "act", None):
+                    self.act.attach(self.lease, peer, params.get("budget", {}))
                 self.journal.append("attach", client=params["client"], name=params["name"],
                                     lease_hash=hashlib.sha256(self.lease.encode()).hexdigest()[:32])
                 result = {"lease": self.lease, "session": self.sid, "generation": self.generation,
                           "profile": self.record["profile"], "rev": self.cache.rev, "screen": self.screen,
+                          "control_epoch": (self.cache.control or {}).get("epoch"),
                           "channels": self.channels(), "limits": {"steps": 8, "deadline_ms": 10000}}
             elif method == "window.observe":
                 self.observe(peer, ident, params)
@@ -1000,11 +1398,17 @@ class Worker:
                     raise RPCError("invalid_params")
                 if not isinstance(params.get("action_id"), str):
                     raise RPCError("invalid_params")
-                result = Journal.action(self.state / "acts" / (gen + ".jsonl"), params["action_id"])
+                result = self.act.get(gen, params["action_id"]) if getattr(self, "act", None) else None
+                if result is None:
+                    result = Journal.action(self.state / "acts" / (gen + ".jsonl"), params["action_id"])
             elif method == "session.done":
                 if params.get("status") not in ("success", "failed", "blocked") or not isinstance(params.get("summary"), str):
                     raise RPCError("invalid_params")
-                self.journal.append("done", status=params["status"], summary=params["summary"])
+                if getattr(self, "act", None):
+                    self.act.durable("done", status=params["status"], summary=params["summary"])
+                    self.act.lease_state[self.lease]["done"] = True
+                else:
+                    self.journal.append("done", status=params["status"], summary=params["summary"])
                 self.lease = self.lease_peer = self.lease_until = None
                 result = {}
             else:
@@ -1014,6 +1418,9 @@ class Worker:
             self.respond(peer, ident, exc=RPCError("parse_error", code=-32700))
         except RPCError as exc:
             self.respond(peer, ident, exc=exc)
+        except ActError as exc:
+            self.respond(peer, ident, exc=RPCError(exc.reason, exc.detail,
+                         code=-32602 if exc.reason in ("invalid_params", "invalid_request", "invalid_expectation") else -32000))
 
     def validate_params(self, method, params):
         keys = {
@@ -1099,9 +1506,21 @@ class Worker:
         elif not self.covered():
             peer.waits.append({"kind": "observe", "id": ident, "params": params, "deadline": deadline})
         else:
-            self.respond(peer, ident, self.observation(params))
+            result = self.observation(params)
+            self.observed(peer, params, result)
+            self.respond(peer, ident, result)
+
+    def observed(self, peer, params, result):
+        if getattr(self, "act", None):
+            self.act.observed(peer, params, result)
 
     def predicate(self, expect):
+        if getattr(self, "act", None):
+            try:
+                predicate_schema(expect)
+                return self.act.evaluate(expect)
+            except ActError as exc:
+                raise RPCError(exc.reason, exc.detail, code=-32602)
         kind = expect.get("kind")
         supported = ("window_present", "window_absent", "window_focused", "dialog_present", "dialog_absent")
         if kind not in supported:
@@ -1185,6 +1604,8 @@ class Worker:
                         continue
                     result = self.wait_result(item["params"], satisfied, expired)
                 peer.waits.remove(item)
+                if item["kind"] == "observe":
+                    self.observed(peer, item["params"], result)
                 self.respond(peer, item["id"], result)
 
     def ingest(self):
@@ -1205,6 +1626,12 @@ class Worker:
             while True:
                 if self.stopping:
                     if self.stop_deadline is None:
+                        if self.act and not self.act.stopping_tick():
+                            self.ingest()
+                            self.x.ax.flush()
+                            self.x.inp_ax.flush()
+                            self.selector.select(0.001)
+                            continue
                         self.begin_stop()
                     if self.openbox is None or self.openbox.poll() is not None:
                         break
@@ -1220,11 +1647,15 @@ class Worker:
                     self.x.reconcile()
                 self.expire_lease()
                 self.pending()
+                if self.act:
+                    self.act.tick()
                 if not self.published and self.elapsed() > 10000:
                     raise RuntimeError("worker_start_timeout")
                 self.x.ax.flush()
                 self.x.inp_ax.flush()
                 timeout = max(0, min(0.05, self.control_due - time.monotonic()))
+                if self.act and (self.act.active or self.act.queue or self.act.selftest):
+                    timeout = min(timeout, 0.001)
                 if self.x.ax.pending or self.x.inp_ax.pending:
                     timeout = min(timeout, 0.01)
                 for peer in self.peers:
@@ -1441,6 +1872,10 @@ def command(args):
         with mmap.mmap(stream.fileno(), 64) as page:
             previous = decode_control(page[:], metadata["generation"])
             epoch = previous["epoch"] + 1
+            # Clear-fence is explicit owner authority, carried with a fresh
+            # epoch. It never opens unresolved-effect admission by itself.
+            flags = (previous["flags"] | 1) if getattr(args, "clear_fence", False) else (previous["flags"] & ~1)
+            control_store(page, 36, flags, 32)
             transition_control(page, STATES[args.state], epoch)
             page.flush()
         os.fsync(stream.fileno())
@@ -1466,6 +1901,7 @@ def main():
     parser.add_argument("command", choices=("start", "stop", "status", "control"))
     parser.add_argument("--session", required=True)
     parser.add_argument("--state", choices=("agent", "paused", "human"))
+    parser.add_argument("--clear-fence", action="store_true")
     for flag in ("daemon", "state", "generation", "record"):
         parser.add_argument("--_" + flag, action="store_true" if flag == "daemon" else "store",
                             help=argparse.SUPPRESS)
@@ -1475,6 +1911,8 @@ def main():
         args = parser.parse_args()
         if args.command == "control" and args.state is None:
             raise RuntimeError("invalid_arguments: control requires --state")
+        if args.clear_fence and (args.command != "control" or args.state != "agent"):
+            raise RuntimeError("invalid_arguments: clear-fence requires control --state agent")
         result, code = command(args)
     except Exception as exc:
         result = {"session": args.session if args else None, "state": "failed", "error": str(exc)}
