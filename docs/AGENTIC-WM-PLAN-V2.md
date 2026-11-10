@@ -964,3 +964,9 @@ Primary documentation checked Nov 9, 2026 (carried from v1). Sources establish u
 - **P5-S9:** [RAUC successful/failed boot confirmation](https://rauc.readthedocs.io/en/latest/using.html).
 - **P5-S10:** [systemd service readiness/watchdogs](https://www.freedesktop.org/software/systemd/man/systemd.service.html); [device/resource controls](https://www.freedesktop.org/software/systemd/man/systemd.resource-control.html); [execution namespaces and device visibility](https://www.freedesktop.org/software/systemd/man/systemd.exec.html). Implementation must use directives available in the pinned Debian systemd, not assume the latest online manual's entire feature set.
 
+
+---
+
+## Schedule directive (ArK, Nov 9, 2026) — overrides the staged calendar
+
+ArK rejected the date-staged schedule above. The plan's technical content, gates, and critical-path ORDER stand, but nothing waits for a calendar date: work proceeds continuously, item after item at a stretch, pausing around midnight (no work pushed through the middle of the night). Pass/fail gates still decide whether an item is done; they no longer decide WHEN the next item starts. The §7.3 date-bound sign-offs are superseded by this directive, except cost visibility: API/driver spend is reported per run, uncapped unless ArK sets a cap.
