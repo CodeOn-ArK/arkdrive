@@ -245,6 +245,22 @@ C6 (host F2 untouched) runs with W2 and again at W5. The paired Thunar
 D1/F3 runs are the Phase 1 milestone: two sessions, two drivers,
 create + rename, filesystem oracle, host untouched.
 
+## 7a. Clarifications from the W1 build (Raj, Nov 10, 2026)
+
+- **Worker restart** creates a new generation in the same session;
+  applications keep running [F §2.4]. This supersedes [G]'s
+  retire-the-session-on-restart for v0. Control authority survives a
+  rebind: an existing control page keeps its state (PAUSED/HUMAN are
+  never silently reopened) with the epoch advanced.
+- **X identity at bind** cannot use the X process's /proc environ: the
+  xorg profile's Xorg is root-owned (sudo launch), so its environ is
+  unreadable. The implemented check is `verify_x_binding`: the display's
+  Unix X socket, the profile's X command name and exact `:display`
+  argument in the process cmdline, the pid in `/tmp/.X<display>-lock`,
+  plus /proc start-time snapshot and recheck before connecting. The
+  session's own processes (worker, children, helper) still verify by
+  markers as before.
+
 ## 8. Open items carried, not decided here
 
 - [F §9]: sessiond HOME reuse across recycled session ids; the session

@@ -1,0 +1,1488 @@
+#!/usr/bin/python3
+"""W1 session worker: state evidence only. No input or capture path exists.
+
+X replies after connection setup are deferred and pumped by the selector loop.
+The few python-xlib private members used by AsyncX are isolated there; they
+avoid ReplyRequest.reply(), which would otherwise block the owner loop.
+"""
+
+import argparse
+from contextlib import contextmanager
+import ctypes
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import mmap
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import selectors
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import traceback
+
+from Xlib import X, display, error
+from Xlib.ext import damage, ge, xfixes, xinput, xtest
+from Xlib.protocol import request
+import Xlib
+import PIL
+
+
+WM = Path(__file__).resolve().parent
+# Discovery of sessiond STATE uses the account database, never inherited HOME.
+STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
+PAGE = struct.Struct("<4sI16sQIIQ16s")
+STATES = {"agent": 0, "quiescing": 1, "human": 2, "paused": 3}
+MAX_FRAME = 256 * 1024
+FLAGS = {"development_same_uid": True, "helper_identity": "root",
+         "profile_signature": "unsigned", "audit_mode": "jsonl"}
+ATOM_NAMES = ("_NET_SUPPORTING_WM_CHECK", "WM_S0", "_NET_CLIENT_LIST",
+              "_NET_ACTIVE_WINDOW", "_NET_WM_NAME", "WM_NAME", "WM_CLASS",
+              "WM_TRANSIENT_FOR", "WM_CLIENT_LEADER", "_NET_WM_STATE",
+              "_NET_WM_STATE_MODAL", "_NET_WM_WINDOW_TYPE",
+              "_NET_WM_WINDOW_TYPE_DIALOG", "_NET_WM_PID")
+
+
+def utc():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+
+
+def frame(value):
+    payload = json_bytes(value)
+    return struct.pack("!I", len(payload)) + payload
+
+
+def proc_identity(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] == "Z" else fields[19]
+    except (OSError, IndexError):
+        return None
+
+
+def marked(pid, state, sid):
+    try:
+        env = set(Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+        return {os.fsencode(f"ARK_SESSIOND={state}"),
+                os.fsencode(f"ARK_SESSION_ID={sid}")}.issubset(env)
+    except OSError:
+        return False
+
+
+def verify_x_binding(r):
+    # Xorg is root-owned (sessiond launches it through sudo). Its environ
+    # and fd links need not be readable by us; cmdline, stat and the X lock
+    # are ownership-independent evidence tying the registry PID to display.
+    number, pid = r["display"], r["pid_x"]
+    if not Path(f"/tmp/.X11-unix/X{number}").is_socket():
+        raise RuntimeError("x_socket_missing")
+    try:
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        expected = "Xorg" if r["profile"] == "xorg" else "Xvfb"
+        matches = (Path(os.fsdecode(args[0])).name == expected
+                   and os.fsencode(f":{number}") in args[1:]
+                   and int(Path(f"/tmp/.X{number}-lock").read_text()) == pid)
+    except (OSError, ValueError):
+        matches = False
+    if not matches:
+        raise RuntimeError("x_identity_mismatch")
+
+
+@contextmanager
+def registry(state):
+    # No mkdir: this worker binds an existing built session only.
+    with (state / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield json.loads((state / "sessions.json").read_text())
+
+
+def session_record(records, sid, state):
+    if not re.fullmatch(r"s[1-9][0-9]*", sid) or sid not in records:
+        raise RuntimeError("unknown_session")
+    r = dict(records[sid])
+    if r["session"] != sid or type(r["display"]) is not int or not 91 <= r["display"] <= 120:
+        raise RuntimeError("display_out_of_range")
+    if r["profile"] not in ("xvfb", "xorg"):
+        raise RuntimeError("backend_unsupported")
+    r["_x_starttime"] = proc_identity(r["pid_x"])
+    if not r["_x_starttime"]:
+        raise RuntimeError("x_server_dead")
+    sd = state / "run" / sid
+    if Path(r["session_dir"]).resolve() != sd.resolve():
+        raise RuntimeError("session_path_mismatch")
+    for key, name in (("home", "home"), ("runtime_dir", "runtime")):
+        if Path(r[key]).resolve() != (sd / name).resolve() or not Path(r[key]).is_dir():
+            raise RuntimeError("session_path_mismatch")
+    for key in ("bus_address", "atspi_address"):
+        if not isinstance(r.get(key), str) or not r[key].startswith("unix:"):
+            raise RuntimeError("session_bus_missing")
+    verify_x_binding(r)
+    return r
+
+
+def session_env(r, state):
+    # Deliberately allowlist; inherited host buses, HOME, DISPLAY, XAUTHORITY,
+    # SESSION_MANAGER and desktop activation variables never reach children.
+    return {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8", "DISPLAY": f':{r["display"]}',
+            "HOME": r["home"], "XDG_RUNTIME_DIR": r["runtime_dir"],
+            "DBUS_SESSION_BUS_ADDRESS": r["bus_address"],
+            "AT_SPI_BUS_ADDRESS": r["atspi_address"],
+            "ARK_SESSIOND": str(state), "ARK_SESSION_ID": r["session"]}
+
+
+def encode_control(generation, epoch=1, state=0, flags=0, lease_hash=bytes(16)):
+    return PAGE.pack(b"ARKC", 1, bytes.fromhex(generation), epoch, state, flags, 0, lease_hash)
+
+
+def decode_control(data, generation=None):
+    if len(data) != PAGE.size:
+        raise ValueError("invalid_control_size")
+    magic, version, gen, epoch, state, flags, permit, lease = PAGE.unpack(data)
+    if magic != b"ARKC" or version != 1 or state not in STATES.values() or not epoch or permit:
+        raise ValueError("malformed_control")
+    if generation is not None and gen.hex() != generation:
+        raise ValueError("stale_generation")
+    return {"generation": gen.hex(), "epoch": epoch, "state": state,
+            "flags": flags, "permit_deadline_ns": permit, "lease_hash": lease.hex()}
+
+
+def control_store(page, offset, value, bits):
+    # Aligned native integer store into the shared mapping (ArK2 is LE).
+    if sys.byteorder != "little":
+        raise RuntimeError("unsupported_control_endian")
+    scalar = (ctypes.c_uint64 if bits == 64 else ctypes.c_uint32).from_buffer(page, offset)
+    scalar.value = value
+    del scalar
+
+
+def transition_control(page, state, epoch, store=control_store):
+    # Closing: state first. Opening: epoch first. Never rewrite a live page
+    # using a 64-byte memcpy, which could expose AGENT with the old epoch.
+    if state == STATES["agent"]:
+        store(page, 24, epoch, 64)
+        store(page, 32, state, 32)
+    else:
+        store(page, 32, state, 32)
+        store(page, 24, epoch, 64)
+
+
+def initialise_control(path, generation):
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        with path.open("r+b") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            old = decode_control(stream.read())
+            with mmap.mmap(stream.fileno(), 64) as page:
+                # Close before changing identity; preserve owner pause/takeover.
+                control_store(page, 32, STATES["quiescing"], 32)
+                page[8:24] = bytes.fromhex(generation)
+                page[36:64] = bytes(28)
+                transition_control(page, old["state"], old["epoch"] + 1)
+                page.flush()
+            os.fsync(stream.fileno())
+    else:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encode_control(generation))
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+class Journal:
+    def __init__(self, path, session, generation):
+        self.path, self.session, self.generation = path, session, generation
+        self.stream = path.open("a", encoding="utf-8")
+
+    def append(self, kind, **fields):
+        value = {"ts": utc(), "type": kind, "session": self.session,
+                 "generation": self.generation, **fields}
+        self.stream.write(json_bytes(value).decode() + "\n")
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+
+    def close(self):
+        self.stream.close()
+
+    @staticmethod
+    def action(path, action_id):
+        intent, receipt = None, None
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    row = json.loads(line)
+                    if row.get("action_id", row.get("receipt", {}).get("action_id")) == action_id:
+                        if row.get("type") == "intent":
+                            intent = row
+                        elif row.get("type") == "receipt":
+                            receipt = row.get("receipt", row)
+        except FileNotFoundError:
+            raise RPCError("history_expired")
+        except (OSError, ValueError):
+            raise RPCError("journal_unavailable")
+        if intent is None:
+            return {"status": "not_found", "action_id": action_id}
+        if receipt is not None:
+            return {"status": "final", "receipt": receipt}
+        return {"status": "final", "receipt": {"action_id": action_id,
+                "dispatch_status": "unknown", "effect": {"status": "unknown"},
+                "reason": "worker_fault"}}
+
+
+class StateCache:
+    """Immutable JSON metadata and per-facet revisions; no X calls here."""
+    def __init__(self, session, generation):
+        self.session, self.generation = session, generation
+        self.rev, self.next_window = 1, 1
+        self.windows, self.removed = {}, {}
+        self.tombstones = {}
+        self.focus, self.modal, self.pointer = None, [], None
+        self.screen = None
+        self.control = None
+        self.facets = {"windows": 1, "focus": 1, "modal": 1, "control": 1, "pointer": 1}
+        self.changed = set()
+        self.upserts = set()
+        self.last_window = {}
+
+    def handle(self, xid):
+        return self.windows.get(xid, {}).get("handle")
+
+    def upsert(self, xid, value):
+        old = self.windows.get(xid)
+        value = dict(value)
+        if old is None:
+            value["handle"] = f"{self.session}/g{self.generation[:8]}/w{self.next_window}"
+            self.next_window += 1
+        else:
+            value["handle"] = old["handle"]
+        if value == old:
+            return
+        self.windows[xid] = value
+        self.upserts.add(xid)
+        if old is None or old.get("geometry") != value.get("geometry"):
+            self.changed.add("geometry[" + value["handle"] + "]")
+        self.changed.add("windows")
+
+    def remove(self, xid):
+        old = self.windows.pop(xid, None)
+        if old:
+            self.removed[old["handle"]] = self.rev + 1
+            self.tombstones[old["handle"]] = old
+            self.changed.add("windows")
+            self.upserts.discard(xid)
+
+    def set(self, name, value):
+        if getattr(self, name) != value:
+            setattr(self, name, value)
+            self.changed.add(name)
+
+    def commit(self, event_batch=False):
+        if not self.changed and not event_batch:
+            return
+        self.rev += 1
+        for facet in self.changed:
+            self.facets[facet] = self.rev
+        for xid in self.upserts:
+            self.last_window[xid] = self.rev
+        self.changed.clear()
+        self.upserts.clear()
+
+    def baseline(self):
+        self.rev = 1
+        self.facets = dict.fromkeys(self.facets, 1)
+        self.last_window = dict.fromkeys(self.windows, 1)
+        self.removed.clear()
+        self.tombstones.clear()
+        self.changed.clear()
+        self.upserts.clear()
+
+    def selected(self, scope):
+        if not isinstance(scope, dict) or any(k not in ("kind", "window", "handle") for k in scope):
+            raise RPCError("invalid_params")
+        kind = scope.get("kind", "session")
+        if kind not in ("session", "window", "family"):
+            raise RPCError("invalid_params")
+        if kind == "session":
+            if "window" in scope or "handle" in scope:
+                raise RPCError("invalid_params")
+            return list(self.windows.values())
+        handle = scope.get("window", scope.get("handle"))
+        if not isinstance(handle, str) or not handle.startswith(
+                f"{self.session}/g{self.generation[:8]}/"):
+            raise RPCError("stale_generation")
+        target = next((w for w in self.windows.values() if w["handle"] == handle), None)
+        if target is None:
+            target = self.tombstones.get(handle)
+            if target is None:
+                raise RPCError("target_not_found")
+        if kind == "window":
+            return [w for w in self.windows.values() if w["handle"] == handle]
+        if kind == "family":
+            return [w for w in self.windows.values() if w["family"] == target["family"]]
+        raise RPCError("invalid_params")
+
+    def observe(self, scope, since, covered=True):
+        windows = self.selected(scope)
+        known = type(since) is int and 1 <= since <= self.rev
+        # Integer comparisons only. Conservative across scopes: a change in
+        # another window can yield an empty delta, never a false unchanged.
+        unchanged = known and covered and max(self.facets.values()) <= since
+        full = not known
+        result = {"rev": self.rev, "generation": self.generation,
+                  "unchanged": bool(unchanged), "full": full}
+        if not covered:
+            result.update(unchanged=None, resync_required=True)
+        if not unchanged:
+            selected = {w["handle"] for w in windows}
+            kind = scope.get("kind", "session")
+            target_handle = scope.get("window", scope.get("handle"))
+            target = next((w for w in self.windows.values() if w["handle"] == target_handle),
+                          self.tombstones.get(target_handle))
+            removed = [h for h, rev in self.removed.items() if (full or rev > since) and
+                       (kind == "session" or (kind == "window" and h == target_handle) or
+                        (kind == "family" and target and self.tombstones[h]["family"] == target["family"]))]
+            result["state"] = {
+                "windows": [dict(w, geometry_rev=self.facets.get("geometry[" + w["handle"] + "]", 1))
+                            for xid, w in self.windows.items() if w["handle"] in selected
+                            and (full or self.last_window.get(xid, 1) > since)],
+                "removed": removed,
+                "focus": self.focus, "modal": self.modal, "pointer": self.pointer,
+                "control": self.control, "screen": self.screen}
+        return result
+
+
+class RPCError(Exception):
+    def __init__(self, reason, detail=None, code=-32000):
+        self.reason, self.detail, self.code = reason, detail, code
+        super().__init__(reason)
+
+
+class AsyncX:
+    """python-xlib nonblocking reply pump (0.33); no reply()/sync() calls."""
+    def __init__(self, connection, fatal):
+        self.connection, self.fatal = connection, fatal
+        self.pending = []
+        connection.set_error_handler(self.on_error)
+
+    def on_error(self, exc, req):
+        # Xlib swallows handler exceptions, so report to the owner explicitly.
+        self.fatal.append(exc)
+
+    def ask(self, cls, callback, *, optional=False, **args):
+        req = cls(display=self.connection.display, defer=True, **args)
+        self.pending.append((req, callback, optional))
+
+    def pump(self):
+        events = []
+        while self.connection.pending_events():
+            events.append(self.connection.next_event())
+        pending, self.pending = self.pending, []
+        for req, callback, optional in pending:
+            if req._error is not None:
+                if optional and isinstance(req._error, (error.BadWindow, error.BadDrawable)):
+                    callback(None)
+                else:
+                    raise req._error
+            elif req._data is not None:
+                callback(req._data)
+            else:
+                self.pending.append((req, callback, optional))
+        return events
+
+    def flush(self):
+        self.connection.flush()  # python-xlib flush uses select(timeout=0).
+
+
+def xid(value):
+    return value.id if hasattr(value, "id") else int(value or 0)
+
+
+def prop_values(reply):
+    # Low-level GetProperty retains (format, data); Window.get_property()
+    # normally unwraps this, but also blocks waiting for the reply.
+    return reply["value"][1] if reply and reply.get("property_type") else []
+
+
+class XState:
+    def __init__(self, worker):
+        self.w = worker
+        if type(worker.record["display"]) is not int or not 91 <= worker.record["display"] <= 120:
+            raise RuntimeError("display_out_of_range")
+        if worker.record.get("_x_starttime"):
+            if proc_identity(worker.record["pid_x"]) != worker.record["_x_starttime"]:
+                raise RuntimeError("x_identity_mismatch")
+            verify_x_binding(worker.record)
+        # These explicit names cannot fall back to the host DISPLAY. The
+        # initial X protocol handshake is inside python-xlib's constructor.
+        self.ev = display.Display(f':{worker.record["display"]}')
+        self.ax = AsyncX(self.ev, worker.x_errors)
+        self.inp = display.Display(f':{worker.record["display"]}')
+        self.inp.set_error_handler(self.ax.on_error)
+        self.ev.display.socket.setblocking(False)
+        self.inp.display.socket.setblocking(False)
+        self.root = self.ev.screen().root
+        self.atoms, self.versions = {}, {}
+        self.clients, self.refreshing, self.again = set(), set(), set()
+        self.incarnations = {}
+        self.selected_windows, self.uncovered = set(), set()
+        self.focus_xid, self.input_focus = 0, 0
+        self.initialised, self.wm_ready = False, False
+        self.phase = "versions"
+        for name in ("XTEST", "DAMAGE", "XFIXES", "XInputExtension"):
+            if not self.ev.has_extension(name):
+                raise RuntimeError("missing_extension:" + name)
+        for name, cls, major, minor in (
+                ("XInputExtension", xinput.XIQueryVersion, 2, 2),
+                ("DAMAGE", damage.QueryVersion, 1, 1),
+                ("XFIXES", xfixes.QueryVersion, 4, 0),
+                ("XTEST", xtest.GetVersion, 2, 2)):
+            self.ax.ask(cls, lambda d, n=name: self.version(n, d),
+                        opcode=self.ev.display.get_extension_major(name),
+                        major_version=major, minor_version=minor)
+        # Negotiate on inp too before its reserved XTEST use in W2.
+        self.inp_ax = AsyncX(self.inp, worker.x_errors)
+        self.inp_ax.ask(xtest.GetVersion, lambda d: None,
+                         opcode=self.inp.display.get_extension_major("XTEST"),
+                         major_version=2, minor_version=2)
+        for name in ATOM_NAMES:
+            self.ax.ask(request.InternAtom, lambda d, n=name: self.atoms.__setitem__(n, d["atom"]),
+                        only_if_exists=False, name=name)
+        self.ax.ask(request.GetGeometry, self.screen, drawable=self.root)
+
+    def screen(self, data):
+        formats = self.ev.display.info.pixmap_formats
+        if data["depth"] != 24 or not any(f.depth == 24 and f.bits_per_pixel == 32 for f in formats):
+            raise RuntimeError("unsupported_visual")
+        self.w.screen = {"w": data["width"], "h": data["height"]}
+        self.w.cache.set("screen", dict(self.w.screen))
+
+    def version(self, name, data):
+        version = (data["major_version"], data["minor_version"])
+        if name == "XInputExtension" and version < (2, 2):
+            raise RuntimeError("missing_extension:XInputExtension>=2.2")
+        self.versions[name] = ".".join(map(str, version))
+
+    def property(self, window, name, callback):
+        self.ax.ask(request.GetProperty, callback, optional=True, window=window,
+                    property=self.atoms[name], type=X.AnyPropertyType, delete=False,
+                    long_offset=0, long_length=16384)
+
+    def advance(self):
+        if self.phase == "versions" and not self.ax.pending and not self.inp_ax.pending:
+            self.phase = "wm_check"
+            self.w.timings["x_ms"] = self.w.elapsed()
+            checks = {}
+            def checked(key, value):
+                checks[key] = value
+                if len(checks) != 3:
+                    return
+                if (checks["selection"] or checks["check"] or
+                        checks["attributes"]["all_event_masks"] & X.SubstructureRedirectMask):
+                    raise RuntimeError("wm_already_running")
+                self.root.change_attributes(event_mask=X.SubstructureNotifyMask | X.PropertyChangeMask
+                                            | X.StructureNotifyMask | X.PointerMotionMask)
+                # Version negotiation has completed before this first XI use.
+                self.root.xinput_select_events([(xinput.AllMasterDevices, xinput.MotionMask)])
+                self.w.start_openbox()
+                self.phase = "wm_wait"
+                self.check_wm()
+            self.ax.ask(request.GetSelectionOwner, lambda d: checked("selection", xid(d["owner"])),
+                        selection=self.atoms["WM_S0"])
+            self.property(self.root, "_NET_SUPPORTING_WM_CHECK",
+                          lambda d: checked("check", list(prop_values(d))))
+            self.ax.ask(request.GetWindowAttributes, lambda d: checked("attributes", d), window=self.root)
+        if self.phase == "initial" and not self.ax.pending and not self.refreshing:
+            self.derive()
+            self.w.cache.baseline()
+            self.initialised = True
+            self.phase = "ready"
+            self.w.ready()
+
+    def check_wm(self):
+        def checked(data):
+            if not prop_values(data) or self.wm_ready:
+                return
+            self.wm_ready = True
+            self.w.timings["wm_ms"] = self.w.elapsed() - self.w.timings["x_ms"]
+            self.phase = "initial"
+            self.reconcile()
+        self.property(self.root, "_NET_SUPPORTING_WM_CHECK", checked)
+
+    def reconcile(self):
+        self.property(self.root, "_NET_CLIENT_LIST", self.client_list)
+        self.property(self.root, "_NET_ACTIVE_WINDOW", self.active)
+        self.ax.ask(request.GetInputFocus, self.got_focus)
+        self.ax.ask(request.GetGeometry, self.screen, drawable=self.root)
+        self.ax.ask(request.QueryTree, self.root_tree, window=self.root)
+        self.w.watchdog = time.monotonic() + 5
+        for wid in list(self.w.cache.windows):
+            self.refresh(wid)
+
+    def root_tree(self, data):
+        for child in data["children"]:
+            self.refresh(xid(child))
+
+    def client_list(self, data):
+        previous = self.clients
+        self.clients = {int(v) for v in prop_values(data)}
+        for wid in self.clients | previous:
+            self.refresh(wid)
+
+    def active(self, data):
+        values = prop_values(data)
+        self.focus_xid = int(values[0]) if len(values) else self.input_focus
+
+    def got_focus(self, data):
+        self.input_focus = xid(data["focus"])
+        if not self.focus_xid:
+            self.focus_xid = self.input_focus
+
+    def refresh(self, wid):
+        if not wid or wid == self.root.id:
+            return
+        if wid in self.refreshing:
+            self.again.add(wid)
+            return
+        self.refreshing.add(wid)
+        if wid not in self.selected_windows:
+            # Select before sampling: changes between GetProperty and event
+            # selection must not escape the cache's event coverage.
+            self.ev.create_resource_object("window", wid).change_attributes(
+                event_mask=X.PropertyChangeMask | X.StructureNotifyMask | X.SubstructureNotifyMask | X.FocusChangeMask,
+                onerror=self.window_select_error)
+            self.selected_windows.add(wid)
+        incarnation = self.incarnations.get(wid, 0)
+        values = {}
+        names = ("attributes", "geometry", "position", "_NET_WM_NAME", "WM_NAME", "WM_CLASS",
+                 "WM_TRANSIENT_FOR", "WM_CLIENT_LEADER", "_NET_WM_STATE",
+                 "_NET_WM_WINDOW_TYPE", "_NET_WM_PID")
+        def got(name, data):
+            values[name] = data
+            if len(values) == len(names):
+                self.refreshing.discard(wid)
+                if self.incarnations.get(wid, 0) == incarnation:
+                    self.snapshot(wid, values)
+                if wid in self.again:
+                    self.again.remove(wid)
+                    self.refresh(wid)
+        self.ax.ask(request.GetWindowAttributes, lambda d: got("attributes", d), optional=True, window=wid)
+        self.ax.ask(request.GetGeometry, lambda d: got("geometry", d), optional=True, drawable=wid)
+        self.ax.ask(request.TranslateCoords, lambda d: got("position", d), optional=True,
+                    src_wid=wid, dst_wid=self.root, src_x=0, src_y=0)
+        for name in names[3:]:
+            self.property(wid, name, lambda d, n=name: got(n, d))
+
+    def snapshot(self, wid, values):
+        a, g, p = (values[n] for n in ("attributes", "geometry", "position"))
+        if not a or not g or not p:
+            self.w.cache.remove(wid)
+            return
+        popup = bool(a["override_redirect"])
+        if (a["win_class"] == X.InputOnly or
+                (wid not in self.clients and not popup and wid not in self.w.cache.windows) or
+                (popup and a["map_state"] == X.IsUnmapped and wid not in self.w.cache.windows)):
+            return
+        if any(data and data.get("bytes_after", 0) for data in values.values()):
+            self.uncovered.add(wid)
+        else:
+            self.uncovered.discard(wid)
+        def nums(name):
+            return list(prop_values(values[name]))
+        def first(name):
+            seq = nums(name)
+            return int(seq[0]) if seq else None
+        def text(name):
+            val = prop_values(values[name])
+            return bytes(val).decode("utf-8", "replace").rstrip("\0") if len(val) else ""
+        classes = text("WM_CLASS").split("\0")
+        transient = first("WM_TRANSIENT_FOR")
+        leader = first("WM_CLIENT_LEADER")
+        pid = first("_NET_WM_PID")
+        old = self.w.cache.windows.get(wid, {})
+        fallback = old.get("family")
+        focused = self.w.cache.windows.get(self.focus_xid)
+        family = (f"x:{transient}" if transient else f"x:{leader}" if leader else
+                  f"pid:{pid}" if pid else (focused["family"] if popup and focused else fallback or f"x:{wid}"))
+        self.w.cache.upsert(wid, {"xid": wid, "family": family,
+            "app": classes[-1] if classes else "", "title": text("_NET_WM_NAME") or text("WM_NAME"),
+            "class": classes[-1] if classes else "", "instance": classes[0] if classes else "",
+            "geometry": {"x": p["x"], "y": p["y"], "w": g["width"], "h": g["height"]},
+            "mapped": a["map_state"] != X.IsUnmapped, "type": "popup" if popup else
+                "dialog" if self.atoms["_NET_WM_WINDOW_TYPE_DIALOG"] in nums("_NET_WM_WINDOW_TYPE") else "normal",
+            "transient_for": transient, "leader": leader,
+            "is_modal": self.atoms["_NET_WM_STATE_MODAL"] in nums("_NET_WM_STATE")})
+
+    def derive(self):
+        cache = self.w.cache
+        # Resolve transient chains to the parent's family, including popups.
+        for _ in range(len(cache.windows)):
+            changed = False
+            for wid, win in list(cache.windows.items()):
+                parent = cache.windows.get(win["transient_for"])
+                if parent and parent["family"] != win["family"]:
+                    cache.upsert(wid, dict(win, family=parent["family"]))
+                    changed = True
+            if not changed:
+                break
+        focus = cache.windows.get(self.focus_xid) or cache.windows.get(self.input_focus)
+        cache.set("focus", focus["handle"] if focus else None)
+        family = focus["family"] if focus else None
+        cache.set("modal", [w["handle"] for w in cache.windows.values() if w["mapped"]
+                  and w["family"] == family and (w["is_modal"] or
+                  (w["transient_for"] and w["type"] == "dialog"))])
+
+    def window_select_error(self, exc, req):
+        # Selecting a client destroyed between snapshot and request is an
+        # expected lifecycle race. All other asynchronous X errors are fatal.
+        if not isinstance(exc, error.BadWindow):
+            self.w.x_errors.append(exc)
+        return 1
+
+    def events(self, events):
+        for e in events:
+            wid = xid(getattr(e, "window", 0))
+            if e.type == X.PropertyNotify:
+                if wid == self.root.id:
+                    if e.atom == self.atoms["_NET_SUPPORTING_WM_CHECK"]:
+                        if not self.wm_ready:
+                            self.check_wm()
+                    elif e.atom == self.atoms["_NET_CLIENT_LIST"]:
+                        self.property(self.root, "_NET_CLIENT_LIST", self.client_list)
+                    elif e.atom == self.atoms["_NET_ACTIVE_WINDOW"]:
+                        self.property(self.root, "_NET_ACTIVE_WINDOW", self.active)
+                elif e.atom in self.atoms.values():
+                    self.refresh(wid)
+            elif e.type in (X.MapNotify, X.UnmapNotify, X.ConfigureNotify, X.ReparentNotify):
+                if wid == self.root.id:
+                    self.ax.ask(request.GetGeometry, self.screen, drawable=self.root)
+                else:
+                    self.refresh(wid)
+            elif e.type == X.DestroyNotify:
+                self.incarnations[wid] = self.incarnations.get(wid, 0) + 1
+                self.selected_windows.discard(wid)
+                self.uncovered.discard(wid)
+                self.w.cache.remove(wid)
+                self.clients.discard(wid)
+            elif e.type in (X.FocusIn, X.FocusOut):
+                self.ax.ask(request.GetInputFocus, self.got_focus)
+                self.property(self.root, "_NET_ACTIVE_WINDOW", self.active)
+            elif e.type == X.MotionNotify:
+                self.w.cache.set("pointer", {"x": e.root_x, "y": e.root_y})
+            elif e.type == ge.GenericEventCode:
+                # python-xlib 0.33 leaves XI raw payloads as bytes. W1 uses
+                # core events only; generic-event decoding belongs to W2.
+                continue
+        self.derive()
+
+    def close(self):
+        self.inp.close()
+        self.ev.close()
+
+
+class Peer:
+    def __init__(self, sock):
+        self.sock = sock
+        self.incoming, self.outgoing = bytearray(), bytearray()
+        self.waits = []
+
+
+class Worker:
+    def __init__(self, state, record, generation, ready_fd):
+        self.state, self.record, self.generation = state, record, generation
+        self.sid = record["session"]
+        self.sd = Path(record["session_dir"])
+        self.socket_path = self.sd / "driver/act.sock"
+        self.ready_fd = ready_fd
+        self.selector = selectors.DefaultSelector()
+        self.started = time.monotonic()
+        self.timings = {"providers_ms": 0, "selftest_ms": 0}
+        self.cache = StateCache(self.sid, generation)
+        self.journal = Journal(state / "acts" / (generation + ".jsonl"), self.sid, generation)
+        self.counters = dict.fromkeys(("batches", "steps", "verified", "not_observed", "contradicted",
+                                      "unknown", "retries", "route_changes", "resync_drift", "false_closes"), 0)
+        self.x_errors, self.screen = [], {}
+        self.openbox_version = None
+        self.x, self.openbox, self.listener = None, None, None
+        self.socket_bound = False
+        self.peers = set()
+        self.lease, self.lease_peer, self.lease_until = None, None, None
+        self.stopping, self.published = False, False
+        self.stop_reason, self.stop_deadline = "requested", None
+        self.watchdog, self.control_due = 0, 0
+        self.control_raw = None
+        self.control_file = (self.sd / "control").open("rb")
+        info = os.fstat(self.control_file.fileno())
+        self.control_identity = (info.st_dev, info.st_ino)
+        self.control_page = mmap.mmap(self.control_file.fileno(), 64, access=mmap.ACCESS_READ)
+        self.wake_r, self.wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.selector.register(self.wake_r, selectors.EVENT_READ, "signal")
+        signal.set_wakeup_fd(self.wake_w)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda signum, stack: setattr(self, "stopping", True))
+
+    def elapsed(self):
+        return int((time.monotonic() - self.started) * 1000)
+
+    def providers(self):
+        return {name: {"state": "unavailable", "reason": "not_implemented",
+                       "sample_rev": None, "age_ms": None, "coverage": "none"}
+                for name in ("atspi", "ocr", "tree", "pixels")}
+
+    def channels(self):
+        return {"xtest": {"state": "untested", "keyboard": False, "pointer": False},
+                "evdev": {"state": "down", "grab": False, "reason":
+                          "not_implemented" if self.record["profile"] == "xorg" else "backend_unsupported"},
+                "paste": {"state": "unavailable", "reason": "not_implemented"},
+                "atspi": {"state": "unavailable", "reason": "not_implemented"}}
+
+    def versions(self):
+        return {"python": sys.version.split()[0], "python_xlib": ".".join(map(str, Xlib.__version__)),
+                "pillow": PIL.__version__, "openbox": self.openbox_version,
+                **(self.x.versions if self.x else {})}
+
+    def health(self):
+        return {"worker": {"pid": os.getpid(), "generation": self.generation,
+                           "state": "stopping" if self.stopping else "ready",
+                           "fence_reason": None},
+                "session": {"id": self.sid, "profile": self.record["profile"],
+                            "display": f':{self.record["display"]}'},
+                "rev": self.cache.rev, "control": self.cache.control,
+                "channels": self.channels(), "providers": self.providers(),
+                "capture": {"mode": "unavailable", "reason": "not_implemented", **self.screen},
+                "coverage": self.coverage(), "counters": dict(self.counters),
+                "versions": self.versions(), "development_flags": FLAGS,
+                "human_transport": "unavailable", "awaiting_reconciliation": False}
+
+    def coverage(self):
+        covered = self.covered()
+        reason = None if covered else ("metadata_truncated" if self.x and self.x.uncovered else "refresh_pending")
+        return {"state": {"complete": covered, "sample_rev": self.cache.rev,
+                          "reason": reason},
+                **{n: {"complete": False, "reason": "not_implemented"} for n in ("tree", "ocr", "pixels")}}
+
+    def covered(self):
+        return bool(self.x and self.x.initialised and not self.x.ax.pending
+                    and not self.x.refreshing and not self.x.uncovered and time.monotonic() < self.watchdog)
+
+    def start_openbox(self):
+        for version in ("gtk-3.0", "gtk-4.0"):
+            settings = Path(self.record["home"]) / ".config" / version / "settings.ini"
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with settings.open("x") as stream:
+                    stream.write("[Settings]\ngtk-cursor-blink=false\ngtk-enable-animations=false\n")
+            except FileExistsError:
+                pass
+        # Package metadata is local and read only; never execute openbox just
+        # to get a version (it can write caches before printing --version).
+        self.openbox_version = None
+        try:
+            for package in Path("/var/lib/dpkg/status").read_text().split("\n\n"):
+                if package.startswith("Package: openbox\n"):
+                    self.openbox_version = next(line[9:] for line in package.splitlines()
+                                                if line.startswith("Version: "))
+                    break
+        except (OSError, StopIteration):
+            pass
+        with (self.sd / "logs/openbox.log").open("ab") as log:
+            self.openbox = subprocess.Popen(["/usr/bin/openbox", "--sm-disable", "--config-file",
+                                             str(WM / "openbox-rc.xml")],
+                                            env=session_env(self.record, self.state),
+                                            cwd=self.record["home"], stdout=log, stderr=log)
+
+    def ready(self):
+        self.poll_control(force=True)
+        self.cache.baseline()
+        self.socket_path.parent.mkdir(mode=0o700, exist_ok=True)
+        self.socket_path.unlink(missing_ok=True)
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        previous = os.umask(0o177)
+        try:
+            self.listener.bind(str(self.socket_path))
+            self.socket_bound = True
+        finally:
+            os.umask(previous)
+        self.socket_path.chmod(0o600)
+        self.listener.listen(16)
+        self.listener.setblocking(False)
+        self.selector.register(self.listener, selectors.EVENT_READ, "listener")
+        metadata = {"pid": os.getpid(), "generation": self.generation,
+                    "socket": str(self.socket_path), "started_at": utc()}
+        temp = self.sd / "worker.json.tmp"
+        with temp.open("w") as stream:
+            json.dump(metadata, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(self.sd / "worker.json")
+        self.published = True
+        self.journal.append("worker_start", profile=self.record["profile"],
+                            display=f':{self.record["display"]}', pid=os.getpid(),
+                            versions=self.versions(), development_flags=FLAGS)
+        self.timings["total_ms"] = self.elapsed()
+        self.notify({"session": self.sid, "generation": self.generation,
+                     "profile": self.record["profile"], "socket": str(self.socket_path),
+                     "state": "ready", "channels": self.channels(), "timings": self.timings})
+
+    def notify(self, value):
+        if self.ready_fd is not None:
+            os.write(self.ready_fd, json_bytes(value) + b"\n")
+            os.close(self.ready_fd)
+            self.ready_fd = None
+
+    def poll_control(self, force=False):
+        now = time.monotonic()
+        if not force and now < self.control_due:
+            return
+        self.control_due = now + 0.05
+        try:
+            info = (self.sd / "control").stat()
+            if info.st_size != 64 or (info.st_dev, info.st_ino) != self.control_identity:
+                raw = b""
+            else:
+                # The read-only mapping is held for the generation. Use pread
+                # for W1 polling so truncation cannot SIGBUS the daemon before
+                # it can report the malformed page as a closed control gate.
+                raw = os.pread(self.control_file.fileno(), 64, 0)
+                if raw != os.pread(self.control_file.fileno(), 64, 0):
+                    raw = b""
+        except OSError:
+            raw = b""
+        if raw == self.control_raw:
+            return
+        self.control_raw = raw
+        try:
+            value = decode_control(raw, self.generation)
+            state = next(k for k, v in STATES.items() if v == value["state"])
+            control = {"state": state, "epoch": value["epoch"], "flags": value["flags"]}
+        except ValueError as exc:
+            control = {"state": "paused", "epoch": None, "reason": str(exc)}
+        previous = self.cache.control
+        self.cache.set("control", control)
+        if previous is not None:
+            self.journal.append("control", previous=previous, **control)
+
+    def accept(self):
+        sock, _ = self.listener.accept()
+        _, uid, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid != os.getuid():
+            sock.close()
+            return
+        sock.setblocking(False)
+        peer = Peer(sock)
+        self.peers.add(peer)
+        self.selector.register(sock, selectors.EVENT_READ, peer)
+
+    def disconnect(self, peer):
+        if peer is self.lease_peer:
+            self.lease_peer = None
+            self.lease_until = time.monotonic() + 5
+        self.peers.discard(peer)
+        self.selector.unregister(peer.sock)
+        peer.sock.close()
+
+    def respond(self, peer, ident, result=None, exc=None):
+        if peer not in self.peers:
+            return
+        value = {"jsonrpc": "2.0", "id": ident}
+        if exc:
+            value["error"] = {"code": exc.code, "message": exc.reason,
+                              "data": {"reason": exc.reason}}
+            if exc.detail:
+                value["error"]["data"]["detail"] = exc.detail
+        else:
+            value["result"] = result
+        peer.outgoing.extend(frame(value))
+        if len(peer.outgoing) > MAX_FRAME * 8:
+            self.disconnect(peer)
+        else:
+            self.selector.modify(peer.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, peer)
+
+    def io(self, peer, mask):
+        try:
+            if mask & selectors.EVENT_WRITE and peer.outgoing:
+                sent = peer.sock.send(peer.outgoing)
+                del peer.outgoing[:sent]
+                if not peer.outgoing:
+                    self.selector.modify(peer.sock, selectors.EVENT_READ, peer)
+            if mask & selectors.EVENT_READ:
+                data = peer.sock.recv(65536)
+                if not data:
+                    self.disconnect(peer)
+                    return
+                peer.incoming.extend(data)
+                while len(peer.incoming) >= 4:
+                    size = struct.unpack("!I", peer.incoming[:4])[0]
+                    if not 0 < size <= MAX_FRAME:
+                        self.disconnect(peer)
+                        return
+                    if len(peer.incoming) < size + 4:
+                        break
+                    payload = bytes(peer.incoming[4:size + 4])
+                    del peer.incoming[:size + 4]
+                    self.ingest()
+                    self.message(peer, payload)
+        except BlockingIOError:
+            pass
+        except (BrokenPipeError, ConnectionResetError):
+            if peer in self.peers:
+                self.disconnect(peer)
+
+    def require_lease(self, peer, params):
+        if params.get("generation", self.generation) != self.generation:
+            raise RPCError("stale_generation")
+        if params.get("session", self.sid) != self.sid:
+            raise RPCError("invalid_params")
+        if peer is not self.lease_peer or not self.lease or params.get("lease") != self.lease:
+            raise RPCError("invalid_lease")
+
+    def expire_lease(self):
+        if self.lease_peer is None and self.lease_until is not None and time.monotonic() >= self.lease_until:
+            self.lease = self.lease_until = None
+
+    def message(self, peer, payload):
+        ident = None
+        try:
+            def invalid_constant(value):
+                raise ValueError("nonfinite JSON")
+            msg = json.loads(payload, parse_constant=invalid_constant)
+            if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+                raise RPCError("invalid_request", code=-32600)
+            ident = msg.get("id")
+            if ident is not None and type(ident) not in (int, str):
+                ident = None
+                raise RPCError("invalid_request", code=-32600)
+            params = msg.get("params", {})
+            if not isinstance(params, dict):
+                raise RPCError("invalid_params", code=-32602)
+            if "id" not in msg:
+                return  # No side effects for JSON-RPC notifications in W1.
+            method = msg["method"]
+            if method == "window.act":
+                raise RPCError("backend_unsupported", "act path arrives at W2")
+            self.validate_params(method, params)
+            if method in ("window.observe", "window.wait", "session.done"):
+                self.require_lease(peer, params)
+            if method == "system.info":
+                result = self.health()
+            elif method == "session.attach":
+                self.expire_lease()
+                if self.lease:
+                    raise RPCError("lease_held")
+                if params.get("client") not in ("codex", "api") or not isinstance(params.get("name"), str):
+                    raise RPCError("invalid_params")
+                self.lease, self.lease_peer = secrets.token_hex(16), peer
+                self.lease_until = None
+                self.journal.append("attach", client=params["client"], name=params["name"],
+                                    lease_hash=hashlib.sha256(self.lease.encode()).hexdigest()[:32])
+                result = {"lease": self.lease, "session": self.sid, "generation": self.generation,
+                          "profile": self.record["profile"], "rev": self.cache.rev, "screen": self.screen,
+                          "channels": self.channels(), "limits": {"steps": 8, "deadline_ms": 10000}}
+            elif method == "window.observe":
+                self.observe(peer, ident, params)
+                return
+            elif method == "window.wait":
+                self.wait(peer, ident, params)
+                return
+            elif method == "action.get":
+                gen = params.get("generation", self.generation)
+                if not isinstance(gen, str) or not re.fullmatch("[0-9a-f]{32}", gen):
+                    raise RPCError("invalid_params")
+                if not isinstance(params.get("action_id"), str):
+                    raise RPCError("invalid_params")
+                result = Journal.action(self.state / "acts" / (gen + ".jsonl"), params["action_id"])
+            elif method == "session.done":
+                if params.get("status") not in ("success", "failed", "blocked") or not isinstance(params.get("summary"), str):
+                    raise RPCError("invalid_params")
+                self.journal.append("done", status=params["status"], summary=params["summary"])
+                self.lease = self.lease_peer = self.lease_until = None
+                result = {}
+            else:
+                raise RPCError("method_not_found", code=-32601)
+            self.respond(peer, ident, result)
+        except (UnicodeError, ValueError, RecursionError):
+            self.respond(peer, ident, exc=RPCError("parse_error", code=-32700))
+        except RPCError as exc:
+            self.respond(peer, ident, exc=exc)
+
+    def validate_params(self, method, params):
+        keys = {
+            "session.attach": {"client", "name", "budget"},
+            "system.info": set(),
+            "window.observe": {"lease", "scope", "since_rev", "channels", "region", "ignore_regions", "budget", "cursor"},
+            "window.wait": {"lease", "expect", "predicate", "since_rev"},
+            "action.get": {"action_id"},
+            "session.done": {"lease", "status", "summary"}}
+        if method not in keys:
+            raise RPCError("method_not_found", code=-32601)
+        if set(params) - keys[method] - {"session", "generation", "deadline_ms"}:
+            raise RPCError("invalid_params", code=-32602)
+        if params.get("session", self.sid) != self.sid:
+            raise RPCError("invalid_params")
+        if method != "action.get" and params.get("generation", self.generation) != self.generation:
+            raise RPCError("stale_generation")
+        if "deadline_ms" in params:
+            self.deadline(params, 2000, 1, 30000 if method == "window.wait" else 10000)
+        def strings(value, depth=0):
+            if depth > 32:
+                raise RPCError("invalid_params")
+            if isinstance(value, str) and "\0" in value:
+                raise RPCError("invalid_params")
+            if isinstance(value, dict):
+                for key, val in value.items():
+                    strings(key, depth + 1)
+                    strings(val, depth + 1)
+            elif isinstance(value, list):
+                for val in value:
+                    strings(val, depth + 1)
+        strings(params)
+        if "since_rev" in params and params["since_rev"] is not None and (
+                type(params["since_rev"]) is not int or params["since_rev"] < 0):
+            raise RPCError("invalid_params")
+        if "budget" in params:
+            budget = params["budget"]
+            allowed = {"acts"} if method == "session.attach" else {"nodes", "bytes"}
+            if (not isinstance(budget, dict) or set(budget) - allowed or
+                    any(type(v) is not int or v < 0 for v in budget.values())):
+                raise RPCError("invalid_params")
+
+    @staticmethod
+    def deadline(params, default, low, high):
+        ms = params.get("deadline_ms", default)
+        if type(ms) is not int or not low <= ms <= high:
+            raise RPCError("invalid_params")
+        return time.monotonic() + ms / 1000
+
+    def observation(self, params):
+        channels = params.get("channels", ["auto"])
+        state_only = channels in (["auto"], ["state"])
+        result = self.cache.observe(params.get("scope", {"kind": "session"}), params.get("since_rev"), self.covered())
+        result.update(providers=self.providers(), coverage=self.coverage(),
+                      channels_used=["state"], settled=self.covered())
+        # An uncovered requested channel cannot be claimed unchanged.
+        if not state_only:
+            result.update(unchanged=None, resync_required=True)
+        return result
+
+    def observe(self, peer, ident, params):
+        deadline = self.deadline(params, 2000, 50, 10000)
+        channels = params.get("channels", ["auto"])
+        if (not isinstance(channels, list) or not channels or
+                any(c not in ("auto", "state", "tree", "ocr", "pixels") for c in channels) or
+                ("auto" in channels and channels != ["auto"])):
+            raise RPCError("invalid_params")
+        since = params.get("since_rev")
+        if since is not None and (type(since) is not int or since < 0):
+            raise RPCError("invalid_params")
+        self.cache.selected(params.get("scope", {"kind": "session"}))
+        if len(peer.waits) >= 8:
+            raise RPCError("queue_full")
+        full = since is None or since < 1 or since > self.cache.rev
+        if full:
+            pending = {"kind": "observe", "id": ident, "params": params,
+                       "deadline": deadline, "pointer_pending": True}
+            peer.waits.append(pending)
+            def pointer(data):
+                self.cache.set("pointer", {"x": data["root_x"], "y": data["root_y"]})
+                pending["pointer_pending"] = False
+            self.x.ax.ask(request.QueryPointer, pointer, window=self.x.root)
+        elif not self.covered():
+            peer.waits.append({"kind": "observe", "id": ident, "params": params, "deadline": deadline})
+        else:
+            self.respond(peer, ident, self.observation(params))
+
+    def predicate(self, expect):
+        kind = expect.get("kind")
+        supported = ("window_present", "window_absent", "window_focused", "dialog_present", "dialog_absent")
+        if kind not in supported:
+            if kind in ("text_equals", "text_contains", "node_present", "node_absent", "node_state",
+                        "item_present", "item_absent", "ocr_text", "ocr_text_present", "ocr_text_absent",
+                        "frame_matches", "visual_review", "region_changed", "region_stable", "tree", "ocr", "pixels"):
+                return None
+            raise RPCError("invalid_predicate")
+        match = expect.get("match", {})
+        if not isinstance(match, dict) or any(k not in ("title", "title_re", "class", "type") for k in match):
+            raise RPCError("invalid_params")
+        if any(not isinstance(v, str) or len(v) > 512 for v in match.values()):
+            raise RPCError("invalid_params")
+        pattern = match.get("title_re")
+        if pattern is not None:
+            try:
+                regex = re.compile(pattern)
+            except re.error:
+                raise RPCError("invalid_params")
+        if not self.covered():
+            return None
+        wins = [w for w in self.cache.windows.values() if w["mapped"]]
+        if "window" in expect:
+            handle = expect["window"]
+            if not isinstance(handle, str) or not handle.startswith(f"{self.sid}/g{self.generation[:8]}/"):
+                raise RPCError("stale_generation")
+            wins = [w for w in wins if w["handle"] == handle]
+        for key, val in match.items():
+            wins = [w for w in wins if (bool(regex.search(w["title"])) if key == "title_re" else w[key] == val)]
+        if kind.startswith("dialog_"):
+            # X state proves only the exact window classifier, never the
+            # deferred Thunar semantic rename classifier.
+            if not match or not ("title" in match or "class" in match):
+                return None
+            wins = [w for w in wins if w["type"] == "dialog" or w["is_modal"] or w["transient_for"]]
+            if "parent" in expect:
+                parent = next((w for w in self.cache.windows.values() if w["handle"] == expect["parent"]), None)
+                if parent is None:
+                    raise RPCError("target_not_found")
+                wins = [w for w in wins if w["family"] == parent["family"]]
+        if kind == "window_focused":
+            return any(w["handle"] == self.cache.focus for w in wins)
+        return not wins if kind.endswith("absent") else bool(wins)
+
+    def wait(self, peer, ident, params):
+        deadline = self.deadline(params, 5000, 1, 30000)
+        expect = params.get("expect", params.get("predicate"))
+        if not isinstance(expect, dict):
+            raise RPCError("invalid_params")
+        satisfied = self.predicate(expect)
+        if satisfied is True or (satisfied is None and self.covered()):
+            self.respond(peer, ident, self.wait_result(params, satisfied))
+        elif len(peer.waits) >= 8:
+            raise RPCError("queue_full")
+        else:
+            peer.waits.append({"kind": "wait", "id": ident, "params": params, "deadline": deadline})
+
+    def wait_result(self, params, satisfied, timeout=False):
+        return {"satisfied": satisfied, "rev": self.cache.rev,
+                "evidence": [{"kind": "state", "rev": self.cache.rev}] if satisfied else [],
+                "state_delta": self.cache.observe({"kind": "session"}, params.get("since_rev"), self.covered()),
+                "reason": "provider_degraded" if satisfied is None else "timeout" if timeout else None}
+
+    def pending(self):
+        for peer in list(self.peers):
+            for item in list(peer.waits):
+                expired = time.monotonic() >= item["deadline"]
+                try:
+                    self.require_lease(peer, item["params"])
+                except RPCError as exc:
+                    peer.waits.remove(item)
+                    self.respond(peer, item["id"], exc=exc)
+                    continue
+                if item["kind"] == "observe":
+                    if not expired and (not self.covered() or item.get("pointer_pending")):
+                        continue
+                    result = self.observation(item["params"])
+                else:
+                    satisfied = self.predicate(item["params"].get("expect", item["params"].get("predicate")))
+                    if not expired and satisfied is not True and not (satisfied is None and self.covered()):
+                        continue
+                    result = self.wait_result(item["params"], satisfied, expired)
+                peer.waits.remove(item)
+                self.respond(peer, item["id"], result)
+
+    def ingest(self):
+        events = self.x.ax.pump()
+        self.x.inp_ax.pump()
+        if self.x_errors:
+            raise RuntimeError("worker_fault: " + str(self.x_errors[0]))
+        self.x.events(events)
+        self.poll_control()
+        self.cache.commit(bool(events))
+
+    def run(self):
+        failure = None
+        try:
+            self.x = XState(self)
+            self.selector.register(self.x.ev.fileno(), selectors.EVENT_READ, "ev")
+            self.selector.register(self.x.inp.fileno(), selectors.EVENT_READ, "inp")
+            while True:
+                if self.stopping:
+                    if self.stop_deadline is None:
+                        self.begin_stop()
+                    if self.openbox is None or self.openbox.poll() is not None:
+                        break
+                    if time.monotonic() >= self.stop_deadline:
+                        self.openbox.kill()
+                    self.selector.select(0.02)
+                    continue
+                self.ingest()
+                self.x.advance()
+                if self.openbox and self.openbox.poll() is not None:
+                    raise RuntimeError("worker_fault: openbox exited")
+                if self.x.initialised and time.monotonic() >= self.watchdog:
+                    self.x.reconcile()
+                self.expire_lease()
+                self.pending()
+                if not self.published and self.elapsed() > 10000:
+                    raise RuntimeError("worker_start_timeout")
+                self.x.ax.flush()
+                self.x.inp_ax.flush()
+                timeout = max(0, min(0.05, self.control_due - time.monotonic()))
+                if self.x.ax.pending or self.x.inp_ax.pending:
+                    timeout = min(timeout, 0.01)
+                for peer in self.peers:
+                    for item in peer.waits:
+                        timeout = min(timeout, max(0, item["deadline"] - time.monotonic()))
+                for key, mask in self.selector.select(timeout):
+                    if key.data == "signal":
+                        try:
+                            os.read(self.wake_r, 4096)
+                        except BlockingIOError:
+                            pass
+                    elif key.data == "listener":
+                        self.accept()
+                    elif isinstance(key.data, Peer):
+                        self.io(key.data, mask)
+        except Exception as exc:
+            failure = str(exc)
+            self.stop_reason = "worker_fault"
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            self.cleanup(failure)
+        return 1 if failure else 0
+
+    def begin_stop(self):
+        self.stop_deadline = time.monotonic() + 2
+        if self.listener:
+            try:
+                self.selector.unregister(self.listener)
+            except KeyError:
+                pass
+            self.listener.close()
+        for peer in list(self.peers):
+            self.disconnect(peer)
+        # Registered FDs remain available even if an X connection is broken
+        # and its fileno() can no longer be queried during failure cleanup.
+        for key in list(self.selector.get_map().values()):
+            if key.data in ("ev", "inp"):
+                self.selector.unregister(key.fd)
+        try:
+            self.selector.unregister(self.wake_r)
+        except KeyError:
+            pass
+        if self.openbox and self.openbox.poll() is None:
+            self.openbox.terminate()
+
+    def cleanup(self, failure):
+        # Reap our child before touching selector/X resources: either may
+        # already be broken on this path. Never report failed-start early.
+        if self.openbox:
+            if self.openbox.poll() is None:
+                self.openbox.terminate()
+                if not wait_pid(self.openbox.pid, 2):
+                    self.openbox.kill()
+            self.openbox.wait()
+        if self.stop_deadline is None:
+            self.begin_stop()
+        try:
+            self.journal.append("worker_stop", reason=self.stop_reason, error=failure)
+        finally:
+            self.journal.close()
+            if self.socket_bound:
+                self.socket_path.unlink(missing_ok=True)
+            if self.published:
+                (self.sd / "worker.json").unlink(missing_ok=True)
+            self.control_page.close()
+            self.control_file.close()
+            if self.x:
+                self.x.close()
+            signal.set_wakeup_fd(-1)
+            self.selector.close()
+            os.close(self.wake_r)
+            os.close(self.wake_w)
+            if self.ready_fd is not None:
+                self.notify({"session": self.sid, "state": "failed",
+                             "error": failure or "worker_stopped"})
+
+
+def worker_metadata(sd, state, sid):
+    try:
+        data = json.loads((sd / "worker.json").read_text())
+        pid = data["pid"]
+        if proc_identity(pid) and marked(pid, state, sid):
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if data["generation"].encode() in args and b"--_daemon" in args:
+                return data
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
+def rpc_call(path, method, params=None, timeout=3):
+    # CLI only; the daemon's sockets are always nonblocking.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(str(path))
+        sock.sendall(frame({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}))
+        def read(size):
+            value = bytearray()
+            while len(value) < size:
+                chunk = sock.recv(size - len(value))
+                if not chunk:
+                    raise RuntimeError("worker_disconnected")
+                value.extend(chunk)
+            return value
+        size = struct.unpack("!I", read(4))[0]
+        if not 0 < size <= MAX_FRAME:
+            raise RuntimeError("invalid_frame")
+        response = json.loads(read(size))
+        if "error" in response:
+            raise RuntimeError(response["error"]["data"]["reason"])
+        return response["result"]
+
+
+def wait_pid(pid, seconds):
+    with selectors.DefaultSelector() as sel:
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return True
+        try:
+            sel.register(fd, selectors.EVENT_READ)
+            return bool(sel.select(seconds))
+        finally:
+            os.close(fd)
+
+
+def start(state, sid):
+    with registry(state) as records:
+        record = session_record(records, sid, state)
+        sd = Path(record["session_dir"])
+        if worker_metadata(sd, state, sid):
+            raise RuntimeError("worker_already_running")
+        generation = secrets.token_hex(16)
+        (state / "acts").mkdir(mode=0o700, exist_ok=True)
+        (sd / "logs").mkdir(exist_ok=True)
+        (state / "acts" / (generation + ".jsonl")).touch(mode=0o600, exist_ok=False)
+        initialise_control(sd / "control", generation)
+        ready_r, ready_w = os.pipe()
+        try:
+            with (sd / "logs/worker.log").open("ab") as log:
+                # Popen's exec is the daemon re-exec: markers are present in
+                # /proc/environ from birth, before either X connection opens.
+                child = subprocess.Popen([sys.executable, str(WM / "ark-worker"), "start",
+                    "--session", sid, "--_daemon", "--_state", str(state),
+                    "--_generation", generation, "--_ready-fd", str(ready_w),
+                    "--_record", json.dumps(record)], env=session_env(record, state),
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                    start_new_session=True, pass_fds=(ready_w,))
+        finally:
+            os.close(ready_w)
+        startup_failed = True
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(ready_r, selectors.EVENT_READ)
+                if not sel.select(15):
+                    raise RuntimeError("worker_start_timeout")
+                data = os.read(ready_r, 65536)
+            if not data:
+                raise RuntimeError("worker_fault: see SD/logs/worker.log")
+            result = json.loads(data)
+            startup_failed = result.get("state") != "ready"
+            return result
+        finally:
+            os.close(ready_r)
+            if startup_failed:
+                # The daemon owns a fresh session/process group; Openbox
+                # inherits it. Cover even daemon death/forced timeout where
+                # its finally block cannot run, without sweeping session apps.
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                wait_pid(child.pid, 4)
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+
+
+def command(args):
+    state = STATE
+    if args._daemon:
+        state = Path(args._state)
+        record = json.loads(args._record)
+        if record["session"] != args.session or not marked(os.getpid(), state, args.session):
+            raise RuntimeError("invalid_daemon_context")
+        worker = Worker(state, record, args._generation, args._ready_fd)
+        return None, worker.run()
+    if args.command == "start":
+        result = start(state, args.session)
+        return result, 0 if result.get("state") == "ready" else 1
+    with registry(state) as records:
+        if args.session not in records:
+            raise RuntimeError("unknown_session")
+        record = records[args.session]
+        sd = Path(record["session_dir"])
+        metadata = worker_metadata(sd, state, args.session)
+        if not metadata:
+            if args.command == "stop":
+                (sd / "driver/act.sock").unlink(missing_ok=True)
+                (sd / "worker.json").unlink(missing_ok=True)
+                return {"session": args.session, "state": "stopped", "ok": True}, 0
+            raise RuntimeError("worker_not_running")
+    if args.command == "status":
+        return rpc_call(metadata["socket"], "system.info"), 0
+    if args.command == "stop":
+        os.kill(metadata["pid"], signal.SIGTERM)
+        if not wait_pid(metadata["pid"], 5):
+            raise RuntimeError("worker_stop_timeout")
+        return {"session": args.session, "state": "stopped", "ok": True}, 0
+    with (sd / "control").open("r+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        with mmap.mmap(stream.fileno(), 64) as page:
+            previous = decode_control(page[:], metadata["generation"])
+            epoch = previous["epoch"] + 1
+            transition_control(page, STATES[args.state], epoch)
+            page.flush()
+        os.fsync(stream.fileno())
+        # Keep the writer lock through acknowledgement: each CLI transition
+        # must be observed and fsynced by the sole journal writer.
+        until = time.monotonic() + 3
+        with selectors.DefaultSelector() as sel:
+            while time.monotonic() < until:
+                health = rpc_call(metadata["socket"], "system.info")
+                if health["control"]["epoch"] == epoch and health["control"]["state"] == args.state:
+                    return {"session": args.session, "state": args.state, "control_epoch": epoch}, 0
+                sel.select(0.01)
+        raise RuntimeError("control_ack_timeout")
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise RuntimeError("invalid_arguments: " + message)
+
+
+def main():
+    parser = Parser(description=__doc__)
+    parser.add_argument("command", choices=("start", "stop", "status", "control"))
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--state", choices=("agent", "paused", "human"))
+    for flag in ("daemon", "state", "generation", "record"):
+        parser.add_argument("--_" + flag, action="store_true" if flag == "daemon" else "store",
+                            help=argparse.SUPPRESS)
+    parser.add_argument("--_ready-fd", type=int, help=argparse.SUPPRESS)
+    args = None
+    try:
+        args = parser.parse_args()
+        if args.command == "control" and args.state is None:
+            raise RuntimeError("invalid_arguments: control requires --state")
+        result, code = command(args)
+    except Exception as exc:
+        result = {"session": args.session if args else None, "state": "failed", "error": str(exc)}
+        code = 1
+    if result is not None:
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
