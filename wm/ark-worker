@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Session worker: state evidence and journaled W2 XTEST batches.
+"""Session worker: state, pixels and journaled XTEST batches.
 
 X replies after connection setup are deferred and pumped by the selector loop.
 The few python-xlib private members used by AsyncX are isolated there; they
@@ -32,13 +32,13 @@ from Xlib import X, display, error
 from Xlib.ext import damage, ge, xfixes, xinput, xtest
 from Xlib.protocol import request
 import Xlib
-import PIL
 
 
 WM = Path(__file__).resolve().parent
 sys.path.insert(0, str(WM))
 from worker_act import ActError, Engine, canonical, leaves, predicate_schema, recover_receipt
 from worker_xtest import XTestTransport
+from worker_pixels import Pixels, Shadow, intersect, bbox
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
 STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
 PAGE = struct.Struct("<4sI16sQIIQ16s")
@@ -416,12 +416,14 @@ class StateCache:
             return [w for w in self.windows.values() if w["family"] == target["family"]]
         raise RPCError("invalid_params")
 
-    def observe(self, scope, since, covered=True):
+    def observe(self, scope, since, covered=True, pixel_tiles=None):
         windows = self.selected(scope)
         known = type(since) is int and 1 <= since <= self.rev
         # Integer comparisons only. Conservative across scopes: a change in
         # another window can yield an empty delta, never a false unchanged.
-        unchanged = known and covered and max(self.facets.values()) <= since
+        unchanged = known and covered and max((rev for facet, rev in self.facets.items()
+                if not facet.startswith("pixels[") or pixel_tiles is None or
+                int(facet[7:-1]) in pixel_tiles), default=1) <= since
         full = not known
         result = {"rev": self.rev, "generation": self.generation,
                   "unchanged": bool(unchanged), "full": full}
@@ -552,6 +554,13 @@ class XState:
             raise RuntimeError("unsupported_visual")
         self.w.screen = {"w": data["width"], "h": data["height"]}
         self.w.cache.set("screen", dict(self.w.screen))
+        pixels = getattr(self.w, "pixels", None)
+        if pixels is None or (pixels.shadow.w, pixels.shadow.h) != (data["width"], data["height"]):
+            if pixels:
+                pixels.shadow.close()
+            path = self.w.sd / "fb/Xvfb_screen0" if self.w.record["profile"] == "xvfb" else None
+            self.w.pixels = Pixels(self.w, Shadow(data["width"], data["height"], path,
+                                                 self.ev.display.info.image_byte_order))
 
     def version(self, name, data):
         version = (data["major_version"], data["minor_version"])
@@ -567,6 +576,8 @@ class XState:
     def advance(self):
         if self.phase == "versions" and not self.ax.pending and not self.inp_ax.pending:
             self.phase = "wm_check"
+            # DAMAGE's version reply must be consumed before DamageCreate.
+            self.damage_id = self.root.damage_create(damage.DamageReportRawRectangles)
             self.w.timings["x_ms"] = self.w.elapsed()
             checks = {}
             def checked(key, value):
@@ -604,6 +615,8 @@ class XState:
             self.ax.ask(request.GetWindowAttributes, lambda d: checked("attributes", d), window=self.root)
         if self.phase == "initial" and not self.ax.pending and not self.refreshing:
             self.derive()
+            if not self.w.settle_pixels():
+                return
             self.w.cache.baseline()
             self.initialised = True
             self.phase = "channel_setup"
@@ -974,11 +987,24 @@ class XState:
     def events(self, events):
         if getattr(self.w, "act", None):
             self.w.act.t.events(events)
+        damage_rects = []
+        notified = set()
         for e in events:
+            # python-xlib registers a per-connection clone of DamageNotify,
+            # not a subclass: isinstance against the imported class misses
+            # real wire events. Match this server's negotiated event code.
+            if (getattr(self.w, "pixels", None) is not None
+                    and e.type == self.ev.extension_event.DamageNotify):
+                area = e.area
+                damage_rects.append(dict(x=area.x, y=area.y, w=area.width, h=area.height))
+                continue
             wid = xid(getattr(e, "window", 0))
             if wid in getattr(self, "ignored", set()):
                 continue
             if e.type == X.PropertyNotify:
+                notified.add("windows")
+                if wid == self.root.id and e.atom == self.atoms["_NET_ACTIVE_WINDOW"]:
+                    notified.add("focus")
                 if wid == self.root.id:
                     if e.atom == self.atoms["_NET_SUPPORTING_WM_CHECK"]:
                         if not self.wm_ready:
@@ -990,6 +1016,7 @@ class XState:
                 elif e.atom in self.atoms.values():
                     self.refresh(wid)
             elif e.type in (X.MapNotify, X.UnmapNotify, X.ConfigureNotify, X.ReparentNotify):
+                notified.add("windows")
                 self.w.cache.changed.add("stacking")
                 self.ax.ask(request.QueryTree, self.root_tree, window=self.root)
                 if wid == self.root.id:
@@ -997,12 +1024,14 @@ class XState:
                 else:
                     self.refresh(wid)
             elif e.type == X.DestroyNotify:
+                notified.add("windows")
                 self.incarnations[wid] = self.incarnations.get(wid, 0) + 1
                 self.selected_windows.discard(wid)
                 self.uncovered.discard(wid)
                 self.w.cache.remove(wid)
                 self.clients.discard(wid)
             elif e.type in (X.FocusIn, X.FocusOut):
+                notified.add("focus")
                 self.ax.ask(request.GetInputFocus, self.got_focus)
                 self.property(self.root, "_NET_ACTIVE_WINDOW", self.active)
             elif e.type == X.MotionNotify:
@@ -1010,6 +1039,13 @@ class XState:
             elif e.type == ge.GenericEventCode:
                 # Raw payloads have already been handed to the ack consumer.
                 continue
+        if damage_rects and getattr(self.w, "pixels", None):
+            self.w.pixels.mark(damage_rects)
+        if getattr(self.w, "resync_baseline", None) is not None:
+            self.w.resync_notified.update(notified)
+            if getattr(self.w, "pixels", None):
+                for rect in damage_rects:
+                    self.w.resync_damage.update(self.w.pixels.tiles(rect))
         self.derive()
 
     def close(self):
@@ -1036,6 +1072,8 @@ class Worker:
         self.timings = {"providers_ms": 0, "selftest_ms": 0}
         self.cache = StateCache(self.sid, generation)
         self.act = None
+        self.pixels = None
+        self.resync_baseline = None
         self.setup_action_profile()
         self.journal = Journal(state / "acts" / (generation + ".jsonl"), self.sid, generation)
         self.counters = dict.fromkeys(("batches", "steps", "verified", "not_observed", "contradicted",
@@ -1073,9 +1111,49 @@ class Worker:
         self.development_flags = FLAGS
 
     def providers(self):
-        return {name: {"state": "unavailable", "reason": "not_implemented",
+        result = {name: {"state": "unavailable", "reason": "not_implemented",
                        "sample_rev": None, "age_ms": None, "coverage": "none"}
                 for name in ("atspi", "ocr", "tree", "pixels")}
+        pixels = getattr(self, "pixels", None)
+        if pixels:
+            result["pixels"] = {"state": "degraded" if pixels.failure else "healthy",
+                                "sample_rev": self.cache.rev, "coverage": "screen",
+                                "reason": pixels.failure, "age_ms": 0}
+        return result
+
+    def settle_pixels(self):
+        pixels = getattr(self, "pixels", None)
+        return pixels is None or pixels.settle()
+
+    def watchdog_start(self):
+        if getattr(self, "resync_baseline", None) is not None or not self.settle_pixels():
+            return
+        self.resync_baseline = (self.cache.rev, dict(self.cache.windows), self.cache.focus)
+        self.resync_notified, self.resync_damage = set(), set()
+        if getattr(self, "pixels", None):
+            self.resync_hashes = list(self.pixels.hashes)
+            self.pixels.mark([self.pixels.bounds])
+        self.x.reconcile()
+
+    def watchdog_finish(self):
+        baseline = getattr(self, "resync_baseline", None)
+        if baseline is None or self.x.ax.pending or self.x.refreshing:
+            return
+        if not self.settle_pixels():
+            return
+        rev, windows, focus = baseline
+        # Normal ingested events already account for their own changes. Count
+        # only disagreements found by the independent periodic refresh.
+        state_drift = (windows != self.cache.windows and "windows" not in self.resync_notified or
+                       focus != self.cache.focus and "focus" not in self.resync_notified)
+        pixel_drift = getattr(self, "pixels", None) and any(
+            old != new and tile not in self.resync_damage
+            for tile, (old, new) in enumerate(zip(self.resync_hashes, self.pixels.hashes)))
+        if state_drift or pixel_drift:
+            if self.cache.rev == rev:
+                self.cache.commit(True)
+            self.counters["resync_drift"] += 1
+        self.resync_baseline = None
 
     def channels(self):
         return {"xtest": dict(self.act.channel) if getattr(self, "act", None) else
@@ -1087,7 +1165,7 @@ class Worker:
 
     def versions(self):
         return {"python": sys.version.split()[0], "python_xlib": ".".join(map(str, Xlib.__version__)),
-                "pillow": PIL.__version__, "openbox": self.openbox_version,
+                "openbox": self.openbox_version,
                 **(self.x.versions if self.x else {})}
 
     def health(self):
@@ -1104,7 +1182,8 @@ class Worker:
                             "display": f':{self.record["display"]}'},
                 "rev": self.cache.rev, "control": self.cache.control,
                 "channels": self.channels(), "providers": self.providers(),
-                "capture": {"mode": "unavailable", "reason": "not_implemented", **self.screen},
+                "capture": ({"mode": self.pixels.shadow.mode, **self.screen} if getattr(self, "pixels", None)
+                            else {"mode": "unavailable", "reason": "not_implemented", **self.screen}),
                 "coverage": self.coverage(), "counters": dict(self.counters),
                 "versions": self.versions(), "development_flags": FLAGS,
                 "profile_hash": getattr(self, "profile_hash", None),
@@ -1117,7 +1196,10 @@ class Worker:
         reason = None if covered else ("metadata_truncated" if self.x and self.x.uncovered else "refresh_pending")
         return {"state": {"complete": covered, "sample_rev": self.cache.rev,
                           "reason": reason},
-                **{n: {"complete": False, "reason": "not_implemented"} for n in ("tree", "ocr", "pixels")}}
+                **{n: {"complete": False, "reason": "not_implemented"} for n in ("tree", "ocr")},
+                "pixels": {"complete": bool(getattr(self, "pixels", None) and not self.pixels.failure
+                                               and not self.pixels.pending and not self.pixels.dirty),
+                           "reason": self.pixels.failure if getattr(self, "pixels", None) else "not_implemented"}}
 
     def covered(self):
         return bool(self.x and self.x.initialised and not self.x.ax.pending
@@ -1358,6 +1440,12 @@ class Worker:
                 return  # No side effects for JSON-RPC notifications in W1.
             method = msg["method"]
             if method == "window.act":
+                if not self.settle_pixels():
+                    if len(peer.waits) >= 8:
+                        raise RPCError("queue_full")
+                    peer.waits.append({"kind": "rpc", "id": ident, "params": params, "payload": payload,
+                                       "deadline": time.monotonic() + 2})
+                    return
                 if not hasattr(self, "profile_hash"):
                     self.setup_action_profile()
                 if not getattr(self, "act", None):
@@ -1368,6 +1456,12 @@ class Worker:
             self.validate_params(method, params)
             if method in ("window.observe", "window.wait", "session.done"):
                 self.require_lease(peer, params)
+            if method in ("system.info", "session.attach", "action.get") and not self.settle_pixels():
+                if len(peer.waits) >= 8:
+                    raise RPCError("queue_full")
+                peer.waits.append({"kind": "rpc", "id": ident, "params": params, "payload": payload,
+                                   "deadline": time.monotonic() + 2})
+                return
             if method == "system.info":
                 result = self.health()
             elif method == "session.attach":
@@ -1426,7 +1520,7 @@ class Worker:
         keys = {
             "session.attach": {"client", "name", "budget"},
             "system.info": set(),
-            "window.observe": {"lease", "scope", "since_rev", "channels", "region", "ignore_regions", "budget", "cursor"},
+            "window.observe": {"lease", "scope", "since_rev", "channels", "region", "ignore_regions", "budget", "cursor", "scale"},
             "window.wait": {"lease", "expect", "predicate", "since_rev"},
             "action.get": {"action_id"},
             "session.done": {"lease", "status", "summary"}}
@@ -1471,13 +1565,42 @@ class Worker:
         return time.monotonic() + ms / 1000
 
     def observation(self, params):
+        if not self.settle_pixels():
+            raise ActError("provider_degraded", "capture_pending")
         channels = params.get("channels", ["auto"])
-        state_only = channels in (["auto"], ["state"])
-        result = self.cache.observe(params.get("scope", {"kind": "session"}), params.get("since_rev"), self.covered())
+        scope, since = params.get("scope", {"kind": "session"}), params.get("since_rev")
+        pixels = getattr(self, "pixels", None)
+        rect, wins = pixels.region(params) if pixels else (None, [])
+        tiles = pixels.tiles(rect) if pixels else None
+        ignores = params.get("ignore_regions", [])
+        if not isinstance(ignores, list) or len(ignores) > 4:
+            raise ActError("invalid_params")
+        for raw in ignores:
+            ignored, _ = pixels.region(dict(params, region=raw)) if pixels else (None, [])
+            if pixels:
+                tiles -= {t for t in tiles if intersect(pixels.rects[t], ignored) == pixels.rects[t]}
+        result = self.cache.observe(scope, since, self.covered(), tiles)
         result.update(providers=self.providers(), coverage=self.coverage(),
                       channels_used=["state"], settled=self.covered())
-        # An uncovered requested channel cannot be claimed unchanged.
-        if not state_only:
+        if pixels:
+            delta = pixels.delta(rect, None if result["full"] else since)
+            if delta:
+                delta["tiles"] = [t for t in delta["tiles"] if t in tiles]
+                delta["bbox"] = bbox(intersect(pixels.rects[t], rect) for t in delta["tiles"])
+                if delta["tiles"]:
+                    delta["windows"] = []
+                    for win in wins:
+                        region = intersect(win["geometry"], rect)
+                        changed = [t for t in delta["tiles"] if t in pixels.tiles(region)] if win["mapped"] else []
+                        if changed:
+                            delta["windows"].append(dict(window=win["handle"], tiles=changed,
+                                bbox=bbox(intersect(pixels.rects[t], region) for t in changed)))
+                    result["pixels_changed"] = delta
+            # Explicit pixels requests yield at most one frame, even if cached.
+            if "pixels" in channels and not result["unchanged"]:
+                result["frames"] = [pixels.frame(rect, wins, params.get("scale"))]
+                result["channels_used"].append("pixels")
+        if any(c in ("tree", "ocr") or c == "pixels" and pixels is None for c in channels):
             result.update(unchanged=None, resync_required=True)
         return result
 
@@ -1503,7 +1626,7 @@ class Worker:
                 self.cache.set("pointer", {"x": data["root_x"], "y": data["root_y"]})
                 pending["pointer_pending"] = False
             self.x.ax.ask(request.QueryPointer, pointer, window=self.x.root)
-        elif not self.covered():
+        elif not self.covered() or not self.settle_pixels():
             peer.waits.append({"kind": "observe", "id": ident, "params": params, "deadline": deadline})
         else:
             result = self.observation(params)
@@ -1571,7 +1694,7 @@ class Worker:
         if not isinstance(expect, dict):
             raise RPCError("invalid_params")
         satisfied = self.predicate(expect)
-        if satisfied is True or (satisfied is None and self.covered()):
+        if (satisfied is True or (satisfied is None and self.covered())) and self.settle_pixels():
             self.respond(peer, ident, self.wait_result(params, satisfied))
         elif len(peer.waits) >= 8:
             raise RPCError("queue_full")
@@ -1579,6 +1702,8 @@ class Worker:
             peer.waits.append({"kind": "wait", "id": ident, "params": params, "deadline": deadline})
 
     def wait_result(self, params, satisfied, timeout=False):
+        if not self.settle_pixels():
+            raise ActError("provider_degraded", "capture_pending")
         return {"satisfied": satisfied, "rev": self.cache.rev,
                 "evidence": [{"kind": "state", "rev": self.cache.rev}] if satisfied else [],
                 "state_delta": self.cache.observe({"kind": "session"}, params.get("since_rev"), self.covered()),
@@ -1589,20 +1714,28 @@ class Worker:
             for item in list(peer.waits):
                 expired = time.monotonic() >= item["deadline"]
                 try:
+                    if not self.settle_pixels():
+                        if expired:
+                            raise RPCError("provider_degraded", "capture_pending")
+                        continue
+                    if item["kind"] == "rpc":
+                        peer.waits.remove(item)
+                        self.message(peer, item["payload"])
+                        continue
                     self.require_lease(peer, item["params"])
-                except RPCError as exc:
+                    if item["kind"] == "observe":
+                        if not expired and (not self.covered() or item.get("pointer_pending")):
+                            continue
+                        result = self.observation(item["params"])
+                    else:
+                        satisfied = self.predicate(item["params"].get("expect", item["params"].get("predicate")))
+                        if not expired and satisfied is not True and not (satisfied is None and self.covered()):
+                            continue
+                        result = self.wait_result(item["params"], satisfied, expired)
+                except (RPCError, ActError) as exc:
                     peer.waits.remove(item)
-                    self.respond(peer, item["id"], exc=exc)
+                    self.respond(peer, item["id"], exc=exc if isinstance(exc, RPCError) else RPCError(exc.reason, exc.detail))
                     continue
-                if item["kind"] == "observe":
-                    if not expired and (not self.covered() or item.get("pointer_pending")):
-                        continue
-                    result = self.observation(item["params"])
-                else:
-                    satisfied = self.predicate(item["params"].get("expect", item["params"].get("predicate")))
-                    if not expired and satisfied is not True and not (satisfied is None and self.covered()):
-                        continue
-                    result = self.wait_result(item["params"], satisfied, expired)
                 peer.waits.remove(item)
                 if item["kind"] == "observe":
                     self.observed(peer, item["params"], result)
@@ -1644,7 +1777,8 @@ class Worker:
                 if self.openbox and self.openbox.poll() is not None:
                     raise RuntimeError("worker_fault: openbox exited")
                 if self.x.initialised and time.monotonic() >= self.watchdog:
-                    self.x.reconcile()
+                    self.watchdog_start()
+                self.watchdog_finish()
                 self.expire_lease()
                 self.pending()
                 if self.act:
@@ -1661,7 +1795,13 @@ class Worker:
                 for peer in self.peers:
                     for item in peer.waits:
                         timeout = min(timeout, max(0, item["deadline"] - time.monotonic()))
-                for key, mask in self.selector.select(timeout):
+                ready = self.selector.select(timeout)
+                # Drain readable X notifications before servicing driver RPCs
+                # from the same readiness batch. An idle observe must not race
+                # ahead of already-delivered DAMAGE on the sibling socket.
+                if any(key.data in ("ev", "inp") for key, mask in ready):
+                    self.ingest()
+                for key, mask in ready:
                     if key.data == "signal":
                         try:
                             os.read(self.wake_r, 4096)
@@ -1722,6 +1862,8 @@ class Worker:
                 (self.sd / "worker.json").unlink(missing_ok=True)
             self.control_page.close()
             self.control_file.close()
+            if getattr(self, "pixels", None):
+                self.pixels.shadow.close()
             if self.x:
                 self.x.close()
             signal.set_wakeup_fd(-1)

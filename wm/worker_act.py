@@ -177,7 +177,7 @@ class Engine:
         except OSError:
             self.boot_id = None
         digest = hashlib.sha256()
-        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "openbox-rc.xml"):
+        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_pixels.py", "openbox-rc.xml"):
             digest.update(name.encode() + Path(__file__).with_name(name).read_bytes())
         self.build_id = digest.hexdigest()
         try:
@@ -284,6 +284,8 @@ class Engine:
                 raise ActError("invalid_params")
             ids.add(s["id"])
             integer(s.setdefault("timeout_ms", 1500), 50, 5000)
+            if "allow_stale_pixels" in s and type(s["allow_stale_pixels"]) is not bool:
+                raise ActError("invalid_params")
             s.setdefault("require", {})
             closed(s["require"], ("focus", "modal", "ref", "window", "geometry", "pointer", "modal_role", "selected_ref", "editable_ref", "text_equals"))
             for f in ("focus", "window"):
@@ -525,7 +527,7 @@ class Engine:
                 raise ActError("stale_generation")
         return next((v for v in self.w.cache.windows.values() if v["handle"] == handle and v["mapped"]), None)
 
-    def point(self, raw):
+    def point(self, raw, base=None):
         if not isinstance(raw, dict):
             raise ActError("invalid_request")
         if "point" in raw:
@@ -538,7 +540,9 @@ class Engine:
         if type(x) is not int or type(y) is not int:
             raise ActError("invalid_request")
         space = raw.get("space", "desktop")
-        if space != "desktop":
+        if space != "desktop" and getattr(self.w, "pixels", None):
+            x, y = self.w.pixels.desktop_point(raw, base)
+        elif space != "desktop":
             if not isinstance(space, str) or not space.startswith("window:"):
                 raise ActError("transform_stale")
             win = self.window(space[7:])
@@ -551,7 +555,7 @@ class Engine:
             raise ActError("invalid_request")
         return {"x": x, "y": y}
 
-    def resolve(self, s):
+    def resolve(self, s, base=None):
         target, intent = s.get("target"), s["intent"]
         if contains_ref(target) or contains_ref(s["require"]):
             raise ActError("provider_degraded")
@@ -565,7 +569,7 @@ class Engine:
             raise ActError("target_not_found")
         at = intent.get("from") if intent["kind"] == "drag" else intent.get("at")
         at = at or ((target or {}).get("point") if isinstance(target, dict) else None)
-        point = self.point(at) if at is not None else None
+        point = self.point(at, base) if at is not None else None
         if pointer and point is None:
             raise ActError("invalid_request")
         if pointer and handle is None:
@@ -591,7 +595,9 @@ class Engine:
                 g = win["geometry"]
                 if win["mapped"] and g["x"] <= point["x"] < g["x"] + g["w"] and g["y"] <= point["y"] < g["y"] + g["h"]:
                     facets.append("geometry[" + win["handle"] + "]")
-            # W2 guards geometry/stacking; W3 adds the pixel tile dependency.
+            if getattr(self.w, "pixels", None) and not s.get("allow_stale_pixels", False):
+                facets.extend(self.w.pixels.facet(t) for t in self.w.pixels.tiles(
+                    dict(x=point["x"], y=point["y"], w=1, h=1)))
             for value in (s.get("target"), s["intent"].get("at"), s["intent"].get("from")):
                 if isinstance(value, dict):
                     raw = value.get("point", value)
@@ -738,6 +744,9 @@ class Engine:
         if not cleanup:
             self.gate(a)
             while not self.w.covered():
+                self.gate(a)
+                yield
+            while not self.w.settle_pixels():
                 self.gate(a)
                 yield
             # Targeted macros may span multiple flush/ack groups. A focus or
@@ -929,7 +938,9 @@ class Engine:
     def dispatch(self, a, s, r, handle, point):
         intent, k = s["intent"], s["intent"]["kind"]
         # Resolve the entire macro before positioning/focusing/arming it.
-        end = self.point(intent["to"]) if k == "drag" else None
+        end = self.point(intent["to"], r["rev"]["base"]) if k == "drag" else None
+        if end is not None:
+            self.guards(a, s, r["rev"]["base"], handle, end)
         codes = self.mapped_keys(intent["keys"]) if k == "key" else []
         mods = self.mapped_keys(intent.get("modifiers", []))
         text = None
@@ -1113,6 +1124,9 @@ class Engine:
                 elif exc.reason != "timeout":
                     # Verification remains read-only under a fence too.
                     yield from self.release(a, r)
+            if not self.w.settle_pixels():
+                yield
+                continue
             value = self.evaluate(p, sampled)
             old_focus = r["focus"].get("confirmed", r["focus"]["before"])
             dispatch_rev = r["rev"]["dispatched"]
@@ -1191,7 +1205,10 @@ class Engine:
                         yield
                     if s.get("risk"):
                         raise ActError("confirm_required")
-                    handle, point = self.resolve(s)
+                    while not self.w.settle_pixels():
+                        self.gate(a)
+                        yield
+                    handle, point = self.resolve(s, base)
                     self.guards(a, s, base, handle, point)
                     r["target_resolved"] = r["target"] = handle
                     expect = self.expectation(s, handle, point)
@@ -1301,6 +1318,11 @@ class Engine:
             if self.w.cache.rev != rev:
                 rev, quiet = self.w.cache.rev, self.clock() + 0.04
             yield
+        while not self.w.settle_pixels():
+            yield
+        pixels = getattr(self.w, "pixels", None)
+        if pixels:
+            pixels.receipt_frames(receipt)
         receipt["state_delta"] = self.w.cache.observe({"kind": "session"}, p["base_rev"], self.w.covered())
         receipt["state_delta"]["settled"] = self.clock() >= quiet
         self.finish(a, stop_reason, stopping)

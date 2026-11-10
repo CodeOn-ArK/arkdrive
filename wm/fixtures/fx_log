@@ -10,6 +10,7 @@ With --slow-ms, receipt is logged immediately and GTK dispatch is delayed.
 
 import argparse
 import json
+import random
 from pathlib import Path
 import signal
 import time
@@ -55,6 +56,9 @@ class Fixture:
         self.log = (Path.home() / "fx-log.jsonl").open("a", buffering=1)
         self.popup_armed = args.popup_after is not None
         self.clicks = 0
+        self.label_changes = 0
+        self.random = random.Random(args.seed)
+        self.paint_records = []
         self.window = Gtk.Window(title=args.tag)
         self.window.set_default_size(480, 360)
         self.window.connect("destroy", Gtk.main_quit)
@@ -84,6 +88,9 @@ class Fixture:
             GLib.timeout_add(100, self.repaint)
         self.window.show_all()
         self.entry.grab_focus()
+        self.window.get_frame_clock().connect("after-paint", self.after_paint)
+        if args.label_changes:
+            self.schedule_label()
 
     def write(self, kind, **fields):
         self.log.write(json.dumps({"kind": kind, "tag": self.args.tag,
@@ -98,7 +105,7 @@ class Fixture:
         self.label.set_text(f"Clicks: {self.clicks}")
         self.items.add(Gtk.Label(label=text, xalign=0))
         self.items.show_all()
-        self.write("clicked", count=self.clicks, text=text)
+        self.write("clicked", count=self.clicks, text=text, label=self.label.get_text())
 
     def input_event(self, event, _data):
         if event.type not in INPUT_TYPES:
@@ -141,7 +148,33 @@ class Fixture:
         self.write("popup")
         return GLib.SOURCE_REMOVE
 
+    def after_paint(self, _clock):
+        records, self.paint_records = self.paint_records, []
+        if records:
+            # The painted oracle follows a server round trip, rather than
+            # merely timestamping a GTK invalidation that has not drawn yet.
+            self.window.get_display().sync()
+        for kind, fields in records:
+            self.write(kind, **fields)
+
+    def schedule_label(self):
+        GLib.timeout_add(self.random.randint(self.args.label_min_ms, self.args.label_max_ms), self.change_label)
+
+    def change_label(self):
+        self.label_changes += 1
+        text = f"Timed label: {self.label_changes:06d}"
+        self.label.set_text(text)
+        requested_ns = time.monotonic_ns()
+        self.write("label_changed", count=self.label_changes, text=text)
+        self.paint_records.append(("label_painted", dict(count=self.label_changes, text=text, requested_ns=requested_ns)))
+        if self.label_changes < self.args.label_changes:
+            self.schedule_label()
+        return GLib.SOURCE_REMOVE
+
     def repaint(self):
+        requested_ns = time.monotonic_ns()
+        self.write("repaint_requested")
+        self.paint_records.append(("repaint", dict(requested_ns=requested_ns)))
         self.window.queue_draw()
         return GLib.SOURCE_CONTINUE
 
@@ -160,7 +193,14 @@ def main():
     parser.add_argument("--hang", action="store_true")
     parser.add_argument("--popup-after", type=nonnegative, metavar="N")
     parser.add_argument("--repaint", action="store_true")
-    fixture = Fixture(parser.parse_args())
+    parser.add_argument("--label-changes", type=nonnegative, default=0, metavar="N")
+    parser.add_argument("--label-min-ms", type=nonnegative, default=80)
+    parser.add_argument("--label-max-ms", type=nonnegative, default=160)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    if not 1 <= args.label_min_ms <= args.label_max_ms:
+        parser.error("label intervals require 1 <= min <= max")
+    fixture = Fixture(args)
     try:
         Gtk.main()
     finally:
