@@ -283,7 +283,10 @@ def start_xorg(record, records, timings):
     os.mkfifo(fifo)
     helper = spawn(record, ["python3", WM / "mkdevs.py", "--fifo", fifo,
                     "--devices-json", directory / "devices.json", "--name-prefix",
-                    f'ArkDrive {record["session"]}'], "mkdevs.log", root=True)
+                    f'ArkDrive {record["session"]}',
+                    "--event-socket", directory / "input.sock",
+                    "--owner-uid", str(os.getuid()),
+                    "--control", directory / "control"], "mkdevs.log", root=True)
     raw = wait_file(directory / "devices.json", 10, helper, record, "mkdevs_pid")
     record["mkdevs_pid"] = int((directory / "devices.json.pid").read_text())
     record["devices"] = json.loads(raw)
@@ -350,14 +353,16 @@ def start_session(profile):
                 (directory / name).mkdir(parents=True, exist_ok=True)
             (directory / "runtime").chmod(0o700)
             # Session ids may be reused after stop; discard old helper outputs.
-            for name in ("devices.json", "devices.json.pid", "xorg.pid", "cmd.fifo"):
+            for name in ("devices.json", "devices.json.pid", "xorg.pid", "cmd.fifo", "input.sock"):
                 path = directory / name
                 if path.exists():
                     path.unlink()
             display_start = time.monotonic()
             if profile == "xvfb":
+                (directory / "fb").mkdir(exist_ok=True)
                 process = spawn(record, ["Xvfb", f':{record["display"]}', "-screen", "0",
-                                        "1920x1080x24", "-nolisten", "tcp"], "xvfb.log")
+                                        "1920x1080x24", "-nolisten", "tcp",
+                                        "-fbdir", directory / "fb"], "xvfb.log")
                 record["pid_x"] = process.pid
                 wait_display(record, process)
             else:

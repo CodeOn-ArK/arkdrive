@@ -1,0 +1,171 @@
+#!/usr/bin/python3
+"""GTK3 delivery oracle. Append JSON lines to $HOME/fx-log.jsonl.
+
+Input records precede dispatch, including rejected events. `keycode` is GDK's
+hardware key code; unavailable fields (e.g. key-event root coords) are null.
+`time` is the GDK event timestamp in milliseconds; `monotonic_ns` timestamps
+the log write. `source_device` is exactly get_source_device().get_name().
+With --slow-ms, receipt is logged immediately and GTK dispatch is delayed.
+"""
+
+import argparse
+import json
+from pathlib import Path
+import signal
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, GLibUnix, Gtk
+
+
+INPUT_TYPES = {
+    Gdk.EventType.KEY_PRESS, Gdk.EventType.KEY_RELEASE,
+    Gdk.EventType.BUTTON_PRESS, Gdk.EventType.DOUBLE_BUTTON_PRESS,
+    Gdk.EventType.TRIPLE_BUTTON_PRESS, Gdk.EventType.BUTTON_RELEASE,
+    Gdk.EventType.MOTION_NOTIFY, Gdk.EventType.SCROLL,
+    Gdk.EventType.ENTER_NOTIFY, Gdk.EventType.LEAVE_NOTIFY,
+    Gdk.EventType.FOCUS_CHANGE, Gdk.EventType.PROXIMITY_IN,
+    Gdk.EventType.PROXIMITY_OUT, Gdk.EventType.TOUCH_BEGIN,
+    Gdk.EventType.TOUCH_UPDATE, Gdk.EventType.TOUCH_END,
+    Gdk.EventType.TOUCH_CANCEL, Gdk.EventType.TOUCHPAD_SWIPE,
+    Gdk.EventType.TOUCHPAD_PINCH, Gdk.EventType.PAD_BUTTON_PRESS,
+    Gdk.EventType.PAD_BUTTON_RELEASE, Gdk.EventType.PAD_RING,
+    Gdk.EventType.PAD_STRIP, Gdk.EventType.PAD_GROUP_MODE,
+}
+POPUP_INPUT_TYPES = INPUT_TYPES - {
+    Gdk.EventType.FOCUS_CHANGE, Gdk.EventType.ENTER_NOTIFY,
+    Gdk.EventType.LEAVE_NOTIFY, Gdk.EventType.PROXIMITY_IN,
+    Gdk.EventType.PROXIMITY_OUT,
+}
+
+
+def nonnegative(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return number
+
+
+class Fixture:
+    def __init__(self, args):
+        self.args = args
+        self.log = (Path.home() / "fx-log.jsonl").open("a", buffering=1)
+        self.popup_armed = args.popup_after is not None
+        self.clicks = 0
+        self.window = Gtk.Window(title=args.tag)
+        self.window.set_default_size(480, 360)
+        self.window.connect("destroy", Gtk.main_quit)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_border_width(16)
+        self.window.add(box)
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text("Type here")
+        self.entry.connect("changed", self.text_changed)
+        self.button = Gtk.Button(label="Add to list")
+        self.button.connect("clicked", self.clicked)
+        self.label = Gtk.Label(label="Clicks: 0", xalign=0)
+        self.items = Gtk.ListBox()
+        for text in ("Alpha", "Bravo", "Charlie"):
+            self.items.add(Gtk.Label(label=text, xalign=0))
+        for widget in (self.entry, self.button, self.label, self.items):
+            box.pack_start(widget, False, False, 0)
+        # One interception point logs each GDK event once, before GTK handlers.
+        for widget in (self.window, box, self.entry, self.button, self.label,
+                       self.items, *self.items.get_children()):
+            widget.add_events(Gdk.EventMask.ALL_EVENTS_MASK)
+        Gdk.event_handler_set(self.input_event, None)
+        if args.hang:
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.hang)
+        if args.repaint:
+            Gtk.Settings.get_default().set_property("gtk-cursor-blink", False)
+            GLib.timeout_add(100, self.repaint)
+        self.window.show_all()
+        self.entry.grab_focus()
+
+    def write(self, kind, **fields):
+        self.log.write(json.dumps({"kind": kind, "tag": self.args.tag,
+                                   "monotonic_ns": time.monotonic_ns(), **fields}) + "\n")
+
+    def text_changed(self, entry):
+        self.write("text_changed", text=entry.get_text())
+
+    def clicked(self, _button):
+        self.clicks += 1
+        text = self.entry.get_text()
+        self.label.set_text(f"Clicks: {self.clicks}")
+        self.items.add(Gtk.Label(label=text, xalign=0))
+        self.items.show_all()
+        self.write("clicked", count=self.clicks, text=text)
+
+    def input_event(self, event, _data):
+        if event.type not in INPUT_TYPES:
+            Gtk.main_do_event(event)
+            return
+        device = event.get_source_device()
+        source = device.get_name() if device is not None else None
+        rejected = bool(self.args.reject_xtest and source and "XTEST" in source)
+        has_key, keycode = event.get_keycode()
+        has_button, button = event.get_button()
+        has_root, root_x, root_y = event.get_root_coords()
+        self.write("input", event=event.type.value_nick,
+                   keycode=keycode if has_key else None,
+                   button=button if has_button else None,
+                   root_x=root_x if has_root else None,
+                   root_y=root_y if has_root else None,
+                   time=event.get_time(), source_device=source,
+                   rejected=rejected)
+        if rejected:
+            return
+        if self.popup_armed and event.type in POPUP_INPUT_TYPES:
+            self.popup_armed = False
+            GLib.timeout_add(self.args.popup_after, self.popup)
+        if self.args.slow_ms:
+            GLib.timeout_add(self.args.slow_ms, self.dispatch, event.copy())
+        else:
+            Gtk.main_do_event(event)
+
+    @staticmethod
+    def dispatch(event):
+        Gtk.main_do_event(event)
+        return GLib.SOURCE_REMOVE
+
+    def popup(self):
+        dialog = Gtk.MessageDialog(transient_for=self.window, modal=True,
+                                   buttons=Gtk.ButtonsType.OK, text="Unexpected popup")
+        dialog.set_title(f"{self.args.tag} popup")
+        dialog.connect("response", lambda window, _response: window.destroy())
+        dialog.show_all()
+        self.write("popup")
+        return GLib.SOURCE_REMOVE
+
+    def repaint(self):
+        self.window.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def hang(self):
+        self.write("hang", signal="SIGUSR1")
+        # SIGTERM retains its default action so sessiond can still tear us down.
+        while True:
+            signal.pause()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tag", default="fx_log")
+    parser.add_argument("--reject-xtest", action="store_true")
+    parser.add_argument("--slow-ms", type=nonnegative, default=0)
+    parser.add_argument("--hang", action="store_true")
+    parser.add_argument("--popup-after", type=nonnegative, metavar="N")
+    parser.add_argument("--repaint", action="store_true")
+    fixture = Fixture(parser.parse_args())
+    try:
+        Gtk.main()
+    finally:
+        fixture.log.close()
+
+
+if __name__ == "__main__":
+    main()

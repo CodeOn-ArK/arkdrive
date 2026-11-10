@@ -10,6 +10,7 @@ Section "InputDevice"
     Identifier "kbd"
     Driver "evdev"
     Option "Device" "@KBD@"
+    Option "GrabDevice" "true"
     Option "CoreKeyboard" "true"
 EndSection
 
@@ -17,6 +18,7 @@ Section "InputDevice"
     Identifier "ptr"
     Driver "evdev"
     Option "Device" "@PTR@"
+    Option "GrabDevice" "true"
     Option "CorePointer" "true"
 EndSection
 

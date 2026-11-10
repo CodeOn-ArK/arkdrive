@@ -116,6 +116,9 @@ later without the adapter changing [F §5.1].
   payload returns the stored reply and never rewrites; changed payload is
   an error [G]. The helper refuses key code 99 outright and the worker
   rejects `Sys_Req`/`Print` chords on the evdev route [F §4.8].
+  (Naming, corrected at W0: the launch argument is `--owner-uid`
+  [F §2.3/S2]; [G]'s `--broker-uid` named the same value, sessiond's own
+  uid passed before sudo.)
 - **R10 — Runtime choices from [F]'s design-time checks (P):** python-xlib
   with XI 2.2 negotiated explicitly and `DamageQueryVersion` before
   `DamageCreate`; pyatspi 2.58.1 child; tesseract via ctypes (tesserocr is

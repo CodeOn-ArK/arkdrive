@@ -8,6 +8,9 @@ import glob
 import json
 import os
 from pathlib import Path
+import selectors
+import socket
+import threading
 import time
 
 
@@ -21,6 +24,79 @@ EV_SYN, EV_KEY, EV_REL = 0, 1, 2
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0, 1, 6, 8
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 BUS_VIRTUAL = 0x06
+
+
+class DormantEventSocket:
+    """W0 plumbing only: refuse every request, without touching uinput.
+
+    A separate thread keeps idle clients from blocking the existing quit FIFO.
+    The control path is retained for W6; it is deliberately never opened here.
+    """
+
+    def __init__(self, path, owner_uid, control):
+        self.path = Path(path)
+        self.owner_uid = owner_uid
+        self.control_path = Path(control)
+        self.stopping = threading.Event()
+        self.selector = selectors.DefaultSelector()
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.bound = False
+        self.thread = None
+
+    def start(self):
+        # Bind privately: there must be no interval with world-writable access.
+        previous_umask = os.umask(0o177)
+        try:
+            self.listener.bind(str(self.path))
+            self.bound = True
+        finally:
+            os.umask(previous_umask)
+        os.chown(self.path, self.owner_uid, -1)
+        self.path.chmod(0o600)
+        self.listener.listen()
+        self.listener.setblocking(False)
+        self.selector.register(self.listener, selectors.EVENT_READ, None)
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        while not self.stopping.is_set():
+            for key, _ in self.selector.select(timeout=0.1):
+                connection = key.fileobj
+                try:
+                    if connection is self.listener:
+                        client, _ = self.listener.accept()
+                        client.setblocking(False)
+                        self.selector.register(client, selectors.EVENT_READ, b"")
+                        continue
+                    if key.events == selectors.EVENT_READ:
+                        if connection.recv(4096):
+                            self.selector.modify(connection, selectors.EVENT_WRITE,
+                                                 b'{"error": "dormant"}\n')
+                            continue
+                    else:
+                        remaining = key.data[connection.send(key.data):]
+                        if remaining:
+                            self.selector.modify(connection, selectors.EVENT_WRITE, remaining)
+                            continue
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    if connection is self.listener:
+                        continue
+                self.selector.unregister(connection)
+                connection.close()
+
+    def close(self):
+        self.stopping.set()
+        if self.thread is not None:
+            self.thread.join()
+        for key in list(self.selector.get_map().values()):
+            key.fileobj.close()
+        self.listener.close()
+        self.selector.close()
+        if self.bound:
+            self.path.unlink(missing_ok=True)
 
 
 class InputID(ctypes.Structure):
@@ -86,13 +162,24 @@ def main():
     parser.add_argument("--fifo", required=True)
     parser.add_argument("--devices-json", required=True)
     parser.add_argument("--name-prefix", required=True)
+    parser.add_argument("--event-socket")
+    parser.add_argument("--owner-uid", type=int)
+    parser.add_argument("--control")
     args = parser.parse_args()
+    plumbing = (args.event_socket, args.owner_uid, args.control)
+    if any(value is not None for value in plumbing) and not all(
+            value is not None for value in plumbing):
+        parser.error("--event-socket, --owner-uid and --control must be supplied together")
     devices_json = Path(args.devices_json)
     Path(str(devices_json) + ".pid").write_text(str(os.getpid()) + "\n")
     if not os.path.exists(args.fifo):
         os.mkfifo(args.fifo)
     fds = []
+    events = None
     try:
+        if args.event_socket is not None:
+            events = DormantEventSocket(args.event_socket, args.owner_uid, args.control)
+            events.start()
         nodes = {}
         for kind in ("kbd", "ptr"):
             fd, node = make_dev(f"{args.name_prefix} {kind}", kind)
@@ -105,12 +192,16 @@ def main():
                     if line.strip() == "quit":
                         return 0
     finally:
-        for fd in fds:
-            try:
-                destroy(fd)
-            except OSError:
-                pass
-        devices_json.unlink(missing_ok=True)
+        try:
+            if events is not None:
+                events.close()
+        finally:
+            for fd in fds:
+                try:
+                    destroy(fd)
+                except OSError:
+                    pass
+            devices_json.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
