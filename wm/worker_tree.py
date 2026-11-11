@@ -959,6 +959,35 @@ class Provider:
                     p.get('axis') == node.get('axis'))
         return None
 
+    def effect_fresh(self, p, dispatched):
+        """Use the same per-window facet clock as revision/selector guards.
+
+        Publication alone is not freshness: an installed page may still be the
+        one read before input. Unrelated facets/global commits cannot age it.
+        """
+        window = self.predicate_window(p)
+        return bool(window) and self.w.cache.facets.get('tree['+window+']', 1) > dispatched
+
+    def effect_verdict(self, p, dispatched):
+        """Return (value, positive contradiction) for a submitted step only."""
+        value = self.evaluate(p)
+        if not self.effect_fresh(p, dispatched):
+            # Preserve real provider failure, but a healthy old/dirty snapshot
+            # is merely "not yet" and must survive until the step deadline.
+            window = self.predicate_window(p)
+            unavailable = value is None and self.readiness(window) != 'healthy'
+            return (None if unavailable else False), False
+        if value is not False or p['kind'] != 'node_state':
+            return value, False
+        window = self.predicate_window(p)
+        node = self.resolve(window, p.get('ref', p.get('selector')), missing=True)
+        # A missing node alone is not contrary state evidence. Focus is
+        # exclusive within the window, so another focused node is positive
+        # evidence even if the original node has disappeared.
+        contrary = node is not None or (p['state'] == 'focused' and p.get('value', True) and
+                    any('focused' in n.get('states', []) for n in self.snapshot(window)['nodes'].values()))
+        return value, contrary
+
     def requirements(self, req, window, base, completed=False):
         for field, state in (('ref', None), ('selected_ref', 'selected'), ('editable_ref', 'editable')):
             if field in req:

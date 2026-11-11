@@ -430,6 +430,177 @@ class Semantic(tree_tests.ProviderHarness):
         self.assertEqual(self.result()['status'], 'success')
 
 
+class PostDispatchVerification(tree_tests.ProviderHarness):
+    """Real click engine/provider, explicit snapshot sequence and fake clock."""
+    def setUp(self):
+        super().setUp()
+        self.raw['children'][0]['states'] = ['editable']
+        self.p.cache.update(self.handle, self.raw, 1)
+        self.samples = []
+
+    def predicate(self):
+        return dict(kind='node_state', window=self.handle, ref=self.refs()['entry'],
+                    state='focused', value=True)
+
+    def click(self, expect=None):
+        return dict(target=dict(window=self.handle, ref=self.refs()['entry']),
+                    intent=dict(kind='click'), expect=expect or self.predicate(), timeout_ms=300)
+
+    def publish(self, raw):
+        self.assertTrue(self.p.cache.update(self.handle, raw, self.w.cache.rev + 1))
+        self.p.bump([self.handle])
+
+    def sample_then(self, update):
+        def refresh():
+            self.samples.append(self.e.verification_verdict(
+                self.step_expect, False, self.e.active['receipt']['steps'][0]['rev']['dispatched']))
+            if len(self.samples) == 2:
+                update()
+        self.t.refresh_hook = refresh
+
+    def focused_after_two_old_samples(self):
+        self.step_expect = self.predicate()
+        def focus():
+            self.raw['children'][0]['states'].append('focused')
+            self.publish(self.raw)
+        self.sample_then(focus)
+        return self.run_action(self.params([self.click()]))
+
+    def test_click_old_false_then_new_true_verifies(self):
+        result = self.focused_after_two_old_samples()
+        self.assertEqual((result['status'], result['effect']['status']), ('success', 'verified'), result)
+        self.assertEqual(self.samples, [(False, False), (False, False)])
+        self.assertGreater(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
+
+    def test_freshness_negative_control_old_false_is_premature_contradiction(self):
+        # By-construction replay of the reported classification: permit the
+        # pre-dispatch page to decide contrary state. The same click now fails
+        # before either server refresh or the delayed focused snapshot.
+        with patch.object(self.p, 'effect_fresh', return_value=True):
+            result = self.focused_after_two_old_samples()
+        self.assertEqual((result['effect']['status'], result['reason']),
+                         ('contradicted', 'effect_contradicted'))
+        self.assertFalse(self.samples)
+
+    def test_new_snapshot_other_node_focused_still_contradicts(self):
+        self.step_expect = self.predicate()
+        def other_focus():
+            self.raw['children'][1]['states'] = ['focused']
+            self.publish(self.raw)
+        self.sample_then(other_focus)
+        result = self.run_action(self.params([self.click()]))
+        self.assertEqual((result['effect']['status'], result['reason']),
+                         ('contradicted', 'effect_contradicted'), result)
+        self.assertEqual(self.samples, [(False, False), (False, False)])
+        self.assertGreater(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
+
+    def test_new_snapshot_target_definitively_false_still_contradicts(self):
+        self.step_expect = self.predicate()
+        def changed():
+            self.raw['children'][1]['name'] = 'Changed after dispatch'
+            self.publish(self.raw)
+        self.sample_then(changed)
+        result = self.run_action(self.params([self.click()]))
+        self.assertEqual((result['effect']['status'], result['reason']),
+                         ('contradicted', 'effect_contradicted'), result)
+
+    def test_new_snapshot_missing_target_other_node_focused_contradicts(self):
+        self.step_expect = self.predicate()
+        def other_focus():
+            self.raw['children'].pop(0)
+            self.raw['children'][0]['states'] = ['focused']
+            self.publish(self.raw)
+        self.sample_then(other_focus)
+        result = self.run_action(self.params([self.click()]))
+        self.assertEqual((result['effect']['status'], result['reason']),
+                         ('contradicted', 'effect_contradicted'), result)
+
+    def test_new_snapshot_missing_target_alone_is_not_positive_contradiction(self):
+        self.step_expect = self.predicate()
+        def remove():
+            self.raw['children'].pop(0)
+            self.publish(self.raw)
+        self.sample_then(remove)
+        result = self.run_action(self.params([self.click()]))
+        self.assertEqual((result['effect']['status'], result['reason']), ('not_observed', 'timeout'), result)
+
+    def test_no_new_target_snapshot_times_out_despite_other_facets_advancing(self):
+        facet = 'tree['+self.handle+']'
+        initial = self.w.cache.facets[facet]
+        self.t.refresh_hook = lambda: self.p.bump(['unrelated-window'])
+        started = self.now
+        result = self.run_action(self.params([self.click()]))
+        self.assertEqual((result['effect']['status'], result['reason']), ('not_observed', 'timeout'), result)
+        self.assertGreaterEqual(self.now - started, .3)
+        self.assertEqual(self.w.cache.facets[facet], initial)
+        self.assertGreater(self.w.cache.rev, result['rev']['dispatched'])
+
+    def test_text_equals_old_false_then_new_true_verifies(self):
+        self.step_expect = dict(kind='text_equals', window=self.handle, ref=self.refs()['entry'], value='done')
+        def text():
+            self.raw['children'][0]['text'] = 'done'
+            self.publish(self.raw)
+        self.sample_then(text)
+        result = self.run_action(self.params([self.click(self.step_expect)]))
+        self.assertEqual((result['status'], result['effect']['status']), ('success', 'verified'), result)
+        self.assertEqual(self.samples, [(False, False), (False, False)])
+
+    def test_every_tree_predicate_ignores_even_true_old_page(self):
+        predicates = [self.predicate(),
+            dict(kind='text_equals', ref=self.refs()['entry'], value='ab'),
+            dict(kind='text_contains', ref=self.refs()['entry'], value='a'),
+            dict(kind='node_present', ref=self.refs()['entry']),
+            dict(kind='node_absent', ref=self.refs()['entry']),
+            dict(kind='item_present', name='Input'), dict(kind='item_absent', name='Missing'),
+            dict(kind='scroll_value', ref=self.refs()['entry'], axis='y', value=3),
+            dict(kind='focus_is', ref=self.refs()['entry'])]
+        dispatched = self.w.cache.rev
+        for p in predicates:
+            with self.subTest(kind=p['kind']):
+                self.assertEqual(self.e.verification_verdict(dict(p, window=self.handle), False, dispatched),
+                                 (False, False))
+
+    def test_wait_can_use_current_tree_without_a_dispatch(self):
+        self.raw['children'][0]['states'].append('focused')
+        self.p.cache.update(self.handle, self.raw, 1)
+        step = dict(intent=dict(kind='wait'), expect=self.predicate(), timeout_ms=300)
+        result = self.run_action(self.params([step]))
+        self.assertEqual(result['effect']['status'], 'verified', result)
+        self.assertFalse(self.t.log)
+
+    def test_composite_contradiction_respects_alternatives(self):
+        focused = self.predicate()
+        text = dict(kind='text_equals', window=self.handle, ref=self.refs()['entry'], value='done')
+        dispatched = self.w.cache.rev
+        self.raw['children'][1]['states'] = ['focused']
+        self.publish(self.raw)
+        self.assertEqual(self.e.verification_verdict(dict(kind='all', of=[focused, text]), False, dispatched),
+                         (False, True))
+        self.assertEqual(self.e.verification_verdict(dict(kind='any', of=[focused, text]), False, dispatched),
+                         (False, False))
+        self.raw['children'][0]['text'] = 'done'
+        self.publish(self.raw)
+        self.assertEqual(self.e.verification_verdict(dict(kind='any', of=[focused, text]), False, dispatched),
+                         (True, False))
+
+    def test_post_dispatch_unexpected_popup_contradicts_even_with_old_tree(self):
+        def popup(event):
+            if event[0] != 'button_up':
+                return
+            self.w.cache.upsert(11, dict(self.w.cache.windows[10], xid=11, type='dialog',
+                                       title='Unexpected', transient_for=10, is_modal=True))
+            h = self.w.cache.handle(11)
+            self.w.cache.set('focus', h)
+            self.w.cache.set('modal', [h])
+            self.w.cache.commit()
+        self.t.on_write = popup
+        result = self.run_action(self.params([self.click()]))
+        self.assertEqual((result['effect']['status'], result['reason']),
+                         ('contradicted', 'effect_contradicted'), result)
+        self.assertLessEqual(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
+        self.assertGreater(self.w.cache.facets['modal'], result['rev']['dispatched'])
+
+
 class FixtureRejection(unittest.TestCase):
     def test_xtest_ignored_and_logged_other_sources_and_default_normal(self):
         # Execute the fixture's actual interception function without GTK import.

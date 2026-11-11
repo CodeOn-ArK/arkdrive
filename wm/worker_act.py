@@ -1846,6 +1846,25 @@ class Engine:
                                (win.get("is_modal") or win.get("transient_for") or win["type"] == "dialog"))
         return (bool(windows) or ocr_wait) and all(tree.can_wait(h) for h in windows) and (not ocr_wait or ocr.flight is not None)
 
+    def verification_verdict(self, p, sampled, dispatched):
+        """Admission/wait reads stay independent of post-input freshness."""
+        p = self.effective_predicate(p)
+        if p['kind'] in ('all', 'any'):
+            results = [self.verification_verdict(v, sampled, dispatched) for v in p['of']]
+            values, contrary = zip(*results)
+            if p['kind'] == 'all':
+                value = False if False in values else None if None in values else True
+                return value, any(contrary)
+            value = True if True in values else None if None in values else False
+            return value, all(contrary)
+        tree = getattr(self.w, 'tree', None)
+        if tree and dispatched is not None:
+            if predicate_class(p) == 'tree':
+                return tree.effect_verdict(p, dispatched)
+            if p['kind'] == 'focus_is' and 'ref' in p:
+                return tree.effect_verdict(dict(p, kind='node_state', state='focused'), dispatched)
+        return self.evaluate(p, sampled), False
+
     def verify(self, a, r, p, until):
         final = False
         sampled = False
@@ -1870,7 +1889,7 @@ class Engine:
             if not self.w.settle_pixels():
                 yield
                 continue
-            value = self.evaluate(p, sampled)
+            value, contrary = self.verification_verdict(p, sampled, r['rev']['dispatched'])
             old_focus = r["focus"].get("confirmed", r["focus"]["before"])
             dispatch_rev = r["rev"]["dispatched"]
             focus_gap = dispatch_rev is not None and self.w.cache.focus == old_focus and self.w.cache.facets.get("focus", 1) > dispatch_rev
@@ -1883,7 +1902,7 @@ class Engine:
                 r["rev"]["verified"] = self.w.cache.rev
                 return "verified", None
             transition = self.transition_expected(r, p, sampled)
-            if transition is False:
+            if transition is False or contrary:
                 return "contradicted", "effect_contradicted"
             if value is True and transition is True:
                 a["verification_sampled"] = sampled

@@ -201,8 +201,10 @@ class ProviderFixes(h.ProviderHarness):
         landed = self.start_effect()
         self.drain()
         self.assertGreaterEqual(self.now - landed, .25)
-        self.assertEqual(self.result()['reason'], 'provider_degraded')
-        self.assertEqual(self.result()['steps'][0]['effect']['status'], 'unknown')
+        # W8 fix round 1: a healthy provider with no post-dispatch target
+        # snapshot is "not yet" through the deadline, not degradation.
+        self.assertEqual(self.result()['reason'], 'timeout')
+        self.assertEqual(self.result()['steps'][0]['effect']['status'], 'not_observed')
 
     def test_f3_genuine_app_degradation_concludes_without_waiting_for_rebuild(self):
         landed = self.start_effect(degraded=True)
