@@ -320,6 +320,26 @@ class MemorySocket:
         self.closed = True
 
 
+class PausedSocket(MemorySocket):
+    """Expose the receive/EAGAIN yield without a real socket or thread."""
+    def __init__(self, handle, log):
+        super().__init__(handle, log, fragment=65536)
+        self.paused, self.blocked = True, False
+
+    def send(self, data):
+        if self.closed:
+            raise OSError(errno.EBADF, 'closed fake socket')
+        return super().send(data)
+
+    def recv(self, size):
+        if self.closed:
+            raise OSError(errno.EBADF, 'closed fake socket')
+        if self.paused:
+            self.blocked = True
+            raise BlockingIOError()
+        return super().recv(size)
+
+
 class Transport(unittest.TestCase):
     def setUp(self):
         self.now, self.log, self.raw = 0., [], []
@@ -497,6 +517,132 @@ class Transport(unittest.TestCase):
         self.assertTrue(self.t.last_ack.complete)
         self.assertEqual(len(self.log), 1)
 
+    def test_close_during_receive_yield_is_channel_error_and_down(self):
+        sock = PausedSocket(self.reply, self.log)
+        self.t.connector = Mock(side_effect=[sock, OSError(errno.ECONNRESET, 'retry disconnected')])
+        pending = self.t.request(**{k: v for k, v in request().items() if k != 'seq'})
+        next(pending)  # Entire request sent.
+        next(pending)  # recv raises BlockingIOError and yields.
+        self.assertTrue(sock.blocked)
+        self.t.close()
+        self.t.close()  # None is harmless, including during inflight I/O.
+        with self.assertRaises(ChannelError) as caught:
+            self.run_gen(pending)
+        self.assertEqual((caught.exception.reason, caught.exception.submitted), ('helper_disconnected', True))
+        self.assertEqual(self.t.health['last_error'], 'helper_disconnected')
+        self.assertEqual(self.t.health['state'], 'down')
+        self.assertFalse(self.t.inflight)
+        self.assertIsNone(self.t.sock)
+        self.assertEqual(self.t.connector.call_count, 2)
+
+    def test_exchange_never_switches_to_replacement_socket_after_yield(self):
+        old = PausedSocket(self.reply, self.log)
+        replacement = Mock()
+        self.t.sock = old
+        pending = self.t.exchange(request())
+        next(pending)
+        next(pending)
+        self.t.close()
+        self.t.sock = replacement
+        with self.assertRaises(ChannelError) as caught:
+            next(pending)
+        self.assertEqual(caught.exception.reason, 'helper_disconnected')
+        replacement.send.assert_not_called()
+        replacement.recv.assert_not_called()
+
+    def test_failed_initial_connect_uses_fresh_exchange_on_retry(self):
+        sock = PausedSocket(self.reply, self.log)
+        self.t.connector = Mock(side_effect=[OSError('first connect failed'), sock])
+        pending = self.t.request(op='grab_check')
+        next(pending)
+        next(pending)
+        self.assertTrue(sock.blocked)
+        self.assertEqual(self.t.reconnects, 1)
+        self.t.down('session_keymap_changed')
+        with self.assertRaises(ChannelError) as caught:
+            self.run_gen(pending)
+        self.assertEqual((caught.exception.reason, caught.exception.submitted), ('helper_disconnected', True))
+        self.assertEqual(self.t.health['last_error'], 'session_keymap_changed')
+        self.assertEqual(self.t.connector.call_count, 2)
+        self.assertEqual(len(self.log), 1)
+
+    def test_unexpected_transport_exceptions_are_structured(self):
+        for phase in ('connect', 'send', 'recv', 'packet', 'request'):
+            with self.subTest(phase=phase):
+                self.setUp()
+                sock = Mock()
+                sock.send.return_value = len(packet(request()))
+                sock.recv.side_effect = RuntimeError('fake receive fault')
+                self.t.connector = Mock(return_value=sock)
+                if phase == 'connect':
+                    self.t.connector.side_effect = RuntimeError('fake connector fault')
+                elif phase == 'send':
+                    sock.send.side_effect = RuntimeError('fake send fault')
+                elif phase == 'request':
+                    self.t.seq = None
+                with patch('worker_evdev.packet', side_effect=RuntimeError('fake framing fault')) if phase == 'packet' else patch('worker_evdev.packet', wraps=packet):
+                    with self.assertRaises(ChannelError) as caught:
+                        self.run_gen(self.t.request(**{k: v for k, v in request().items() if k != 'seq'}))
+                kind = 'TypeError' if phase == 'request' else 'RuntimeError'
+                self.assertEqual(caught.exception.reason, 'helper_transport_error:' + kind)
+                self.assertEqual(caught.exception.submitted, phase == 'recv')
+                self.assertEqual(self.t.health['last_error'], caught.exception.reason)
+                self.assertEqual(self.t.health['state'], 'down')
+                self.assertFalse(self.t.inflight)
+                self.assertIsNone(self.t.sock)
+
+    def test_close_fault_detaches_socket_and_is_idempotent(self):
+        sock = self.t.sock = Mock()
+        sock.close.side_effect = RuntimeError('fake close fault')
+        self.t.close()
+        self.t.close()
+        sock.close.assert_called_once()
+        self.assertIsNone(self.t.sock)
+        self.assertEqual(self.t.health['state'], 'down')
+        self.assertEqual(self.t.health['last_error'], 'helper_transport_error:RuntimeError')
+
+    def test_grab_check_and_release_queue_behind_event_exchange(self):
+        reply = lambda req: dict(self.reply(req), kbd='busy', ptr='busy')
+        sock = PausedSocket(reply, self.log)
+        self.t.connector = Mock(return_value=sock)
+        pending = self.t.request(**{k: v for k, v in request().items() if k != 'seq'})
+        next(pending)
+        next(pending)
+        grab, release = self.t.grab_check(), self.t.release_all()
+        for _ in range(3):
+            next(grab)
+            next(release)
+        self.assertEqual(len(self.log), 1)
+        self.assertEqual(self.t.seq, 1)
+        self.assertTrue(self.t.inflight)
+        self.assertFalse(sock.closed)
+        self.assertEqual(self.t.health['state'], 'untested')
+        sock.paused = False
+        self.assertTrue(self.run_gen(pending)['ok'])
+        next(grab)  # grab now owns the stream and has sent its request.
+        next(release)
+        self.assertEqual([req.get('op') for req in self.log], [None, 'grab_check'])
+        self.assertTrue(self.run_gen(grab))
+        self.assertTrue(self.run_gen(release))
+        self.assertEqual([req.get('op') for req in self.log], [None, 'grab_check', 'release_all'])
+        self.assertEqual([req['seq'] for req in self.log], [1, 2, 3])
+        self.t.connector.assert_called_once()
+        self.assertFalse(self.t.inflight)
+
+    def test_cancelling_queued_request_does_not_unlock_owner(self):
+        sock = PausedSocket(self.reply, self.log)
+        self.t.connector = lambda: sock
+        pending = self.t.request(op='grab_check')
+        next(pending)
+        queued = self.t.request(op='release_all')
+        next(queued)
+        queued.close()
+        self.assertTrue(self.t.inflight)
+        self.assertEqual(len(self.log), 1)
+        sock.paused = False
+        self.run_gen(pending)
+        self.assertFalse(self.t.inflight)
+
 
     def test_session_xkb_compilation_uses_key_names_and_releases_resources(self):
         xcb, xkb, x11 = Mock(), Mock(), Mock()
@@ -638,6 +784,129 @@ class EngineW6(base.Harness):
         self.assertEqual(self.evdev.health['state'], 'down')
         self.assertEqual(self.e.channel['state'], 'ok')
         self.assertEqual(self.evdev.health['last_error'], 'input_unacknowledged')
+
+    def assert_xtest_allows_worker_ready(self, reason):
+        self.assertEqual(self.evdev.health['state'], 'down')
+        self.assertEqual(self.evdev.health['last_error'], reason)
+        self.assertEqual(self.e.channel['state'], 'ok')
+        self.assertIsNone(self.e.selftest)
+        # Exercise the production channel_test -> ready transition, without
+        # constructing an X connection or publishing any real worker endpoint.
+        state = base.w.XState.__new__(base.w.XState)
+        state.w, state.phase = self.w, 'channel_test'
+        self.w.ready = Mock()
+        state.advance()
+        self.assertEqual(state.phase, 'ready')
+        self.w.ready.assert_called_once_with()
+
+    def test_startup_event_invalidation_during_evdev_receive_continues_xtest(self):
+        from Xlib import X
+        # The real worker ingests X events between successive Engine.tick calls.
+        self.w.x = NS(ev=NS(display=NS(get_extension_major=lambda name: 131)))
+        sock = PausedSocket(self.helper.handle, self.log)
+        # Permit startup grab_check, pause only once the first event request
+        # has reached recv/EAGAIN. Cleanup can open a fresh stream afterwards.
+        original_recv = sock.recv
+        sock.recv = lambda size: original_recv(size) if 'frames' in self.log[-1] else MemorySocket.recv(sock, size)
+        self.evdev.connector = Mock(side_effect=[sock, MemorySocket(self.helper.handle, self.log, fragment=65536)])
+        self.w.cache.windows.clear()
+        self.e.start_selftest()
+        for _ in range(1000):
+            self.tick()
+            if sock.blocked:
+                break
+        self.assertTrue(sock.blocked)
+        self.assertTrue(self.evdev.inflight)
+        self.assertEqual(self.log[0]['op'], 'grab_check')
+        self.evdev.events([NS(type=X.MappingNotify)])
+        self.assertIsNone(self.evdev.sock)
+        self.drain()
+        self.assert_xtest_allows_worker_ready('session_keymap_changed')
+        self.assertFalse(self.evdev.inflight)
+        self.assertEqual(sum('frames' in req for req in self.log), 1)
+        self.assertEqual(self.t.test_presses, 50)
+        self.assertEqual(self.t.position, {'x': 2, 'y': 2})
+        self.assertIn('release_all', [req.get('op') for req in self.log])
+
+    def test_startup_hierarchy_invalidation_during_grab_check_continues_xtest(self):
+        from Xlib.ext import ge, xinput
+        self.w.x = NS(ev=NS(display=NS(get_extension_major=lambda name: 131)))
+        sock = PausedSocket(self.helper.handle, self.log)
+        self.evdev.connector = Mock(return_value=sock)
+        self.e.start_selftest()
+        self.tick()  # bootstrap request sends grab_check
+        self.tick()  # recv/EAGAIN
+        self.assertTrue(sock.blocked)
+        self.assertTrue(self.evdev.inflight)
+        self.evdev.events([NS(type=ge.GenericEventCode, evtype=xinput.HierarchyChanged, extension=131)])
+        self.drain()
+        self.assert_xtest_allows_worker_ready('assigned_device_changed')
+        self.evdev.connector.assert_called_once()  # Invalidation never reconnects a retired channel.
+        self.assertFalse(any('frames' in req for req in self.log))
+
+    def test_unexpected_event_transport_fault_preserves_cause_and_runs_xtest(self):
+        self.w.cache.windows.clear()
+        self.evdev.connector = self.event_fault_socket
+        self.e.start_selftest()
+        self.drain()
+        self.assert_xtest_allows_worker_ready('helper_transport_error:RuntimeError')
+        self.assertEqual(self.t.test_presses, 50)
+        self.assertEqual(len(self.t.log), 200)  # The complete XTEST diagnostic.
+        self.assertFalse(self.evdev.inflight)
+        self.assertEqual(self.evdev.reconnects, 1)
+
+    def test_unexpected_connector_fault_still_completes_startup(self):
+        self.evdev.connector = Mock(side_effect=RuntimeError('fake connector failure'))
+        self.e.start_selftest()
+        self.drain()
+        self.assert_xtest_allows_worker_ready('helper_transport_error:RuntimeError')
+        self.assertEqual(len(self.t.log), 100)
+        self.assertEqual(self.evdev.connector.call_count, 2)
+
+    def event_fault_socket(self):
+        sock = MemorySocket(self.helper.handle, self.log, fragment=65536)
+        send = sock.send
+        def fail_events(data):
+            if 'frames' in json.loads(data[4:]):
+                raise RuntimeError('fake batch send failure')
+            return send(data)
+        sock.send = fail_events
+        return sock
+
+    def test_unexpected_evdev_fault_mid_batch_returns_channel_down(self):
+        self.evdev.connector = self.event_fault_socket
+        r = self.run_action(self.params([self.move(100, 2), self.key()]))
+        first = r['steps'][0]
+        self.assertEqual((first['reason'], first['dispatch_status'], first['written']),
+                         ('channel_down', 'not_dispatched', 0))
+        self.assertEqual(first['attempts'][0]['error'], 'helper_transport_error:RuntimeError')
+        self.assertEqual(r['steps'][1]['reason'], 'not_reached')
+        self.assertEqual(r['advice'], 'do_not_retry')
+        self.assertEqual(self.evdev.health['last_error'], 'helper_transport_error:RuntimeError')
+        self.assertEqual(self.evdev.health['state'], 'down')
+
+    def test_unexpected_reply_fault_mid_batch_is_unknown_without_duplicate_input(self):
+        def connect():
+            sock = MemorySocket(self.helper.handle, self.log, fragment=65536)
+            recv = sock.recv
+            def fail_event_reply(size):
+                if 'frames' in self.log[-1]:
+                    raise RuntimeError('fake event receive failure')
+                return recv(size)
+            sock.recv = fail_event_reply
+            return sock
+        self.evdev.connector = connect
+        r = self.run_action(self.params([self.move(100, 2), self.key()]))
+        first = r['steps'][0]
+        self.assertEqual((first['reason'], first['dispatch_status']), ('channel_down', 'unknown'))
+        self.assertEqual(first['attempts'][0]['error'], 'helper_transport_error:RuntimeError')
+        self.assertEqual(r['steps'][1]['reason'], 'not_reached')
+        frames = [req for req in self.log if 'frames' in req]
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0], frames[1])
+        self.assertEqual(self.frame_count, 3)  # Retried reply, each actual frame written only once.
+        self.assertEqual(self.evdev.health['state'], 'down')
+        self.assertEqual(r['advice'], 'do_not_retry')
 
     def test_grab_fail_routes_to_xtest_without_evdev_frames(self):
         self.helper.grab = lambda d: 'free'

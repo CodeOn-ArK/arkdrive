@@ -1902,6 +1902,8 @@ class Engine:
             while keyboard and self.t.test_presses < 50 and self.clock() < until:
                 yield
             pointer = yield from self.query("pointer", deadline=self.clock() + 0.2)
+            if self.evdev.health['state'] == 'down':
+                raise ActError("channel_down")
             if pointer["x"] != x or pointer["y"] != y or keyboard and self.t.test_presses != 50:
                 raise ActError("selftest_delivery_failed")
             self.evdev.health.update(state="up", keyboard="tested" if keyboard else "untested", last_error=None)

@@ -100,46 +100,74 @@ class EvdevTransport:
         return self.xtest.raw_seq
 
     def close(self):
-        if self.sock is not None:
-            self.sock.close()
-            self.sock = None
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception as exc:
+                # Cleanup is also a transport boundary. Detach first so a
+                # failed close cannot leave a dead socket available to reuse.
+                if self.health['state'] != 'down':
+                    self.health.update(state='down', last_error=self.failure(exc).reason)
 
     def down(self, reason):
-        self.health.update(state='down', last_error=reason)
+        # Retain the initiating fault through self-test/act cleanup failures.
+        if self.health['state'] != 'down':
+            self.health.update(state='down', last_error=reason)
         self.close()
+
+    @staticmethod
+    def failure(exc, submitted=False):
+        if isinstance(exc, ChannelError):
+            return ChannelError(exc.reason, submitted or exc.submitted)
+        if isinstance(exc, OSError):
+            disconnected = exc.errno in (errno.EBADF, errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN)
+            reason = 'helper_disconnected' if disconnected else 'helper_socket_error'
+        else:
+            reason = 'helper_transport_error:' + type(exc).__name__
+        return ChannelError(reason, submitted)
 
     def connect(self):
         info = self.path.stat()
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o600:
             raise OSError('helper_socket_permissions')
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.setblocking(False)
         try:
+            sock.setblocking(False)
             result = sock.connect_ex(str(self.path))
             if result not in (0, errno.EINPROGRESS, errno.EAGAIN):
                 raise OSError(result, 'helper_connect')
             return sock
         except BaseException:
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
             raise
 
     def exchange(self, req):
-        data, received, sent = packet(req), bytearray(), 0
-        deadline = self.clock() + 0.25 + len(req.get('frames', [])) * req.get('gap_us', 0) / 1e6
+        sock, sent, submitted = self.sock, 0, False
         try:
-            if self.sock is None:
-                self.sock = self.connector()
+            data, received = packet(req), bytearray()
+            deadline = self.clock() + 0.25 + len(req.get('frames', [])) * req.get('gap_us', 0) / 1e6
+            if sock is None:
+                sock = self.sock = self.connector()
             while True:
+                # X ingestion may retire this channel while I/O yields. Never
+                # dereference self.sock again or switch to a replacement stream.
+                if sock is None or self.sock is not sock:
+                    raise ChannelError('helper_disconnected', submitted)
                 if self.clock() >= deadline:
-                    raise ChannelError('helper_timeout', sent == len(data))
+                    raise ChannelError('helper_timeout', submitted)
                 try:
                     if sent < len(data):
-                        count = self.sock.send(data[sent:])
+                        count = sock.send(data[sent:])
                         if not count:
-                            raise ChannelError('helper_disconnected', sent == len(data))
+                            raise ChannelError('helper_disconnected', submitted)
                         sent += count
+                        submitted = sent == len(data)
                     else:
-                        chunk = self.sock.recv(4096)
+                        chunk = sock.recv(4096)
                         if not chunk:
                             raise ChannelError('helper_disconnected', True)
                         received.extend(chunk)
@@ -155,15 +183,23 @@ class EvdevTransport:
                 except (BlockingIOError, InterruptedError):
                     pass
                 yield
-        except (OSError, ValueError, TypeError) as exc:
-            raise ChannelError(getattr(exc, 'reason', 'helper_socket_error'), sent == len(data)) from exc
+        except Exception as exc:
+            raise self.failure(exc, submitted) from exc
 
     def request(self, **fields):
-        if self.inflight:
-            raise ChannelError('helper_request_in_progress')
+        # Bootstrap grab checks, per-batch probes and releases share the event
+        # stream. A busy probe must not down()/close() another request's socket.
+        while self.inflight:
+            yield
         self.inflight = True
         try:
+            if self.health['state'] == 'down' and fields.get('op') != 'release_all':
+                raise ChannelError(self.health['last_error'] or 'channel_down')
             return (yield from self._request(**fields))
+        except Exception as exc:
+            failure = self.failure(exc)
+            self.down(failure.reason)
+            raise failure from exc
         finally:
             self.inflight = False
 
@@ -177,10 +213,11 @@ class EvdevTransport:
         while True:
             try:
                 return (yield from self.exchange(req))
-            except ChannelError as exc:
+            except Exception as fault:
+                exc = self.failure(fault)
                 submitted |= exc.submitted
                 self.close()
-                if self.reconnects:
+                if self.reconnects or self.health['state'] == 'down':
                     self.down(exc.reason)
                     raise ChannelError(exc.reason, submitted) from exc
                 self.reconnects += 1
@@ -217,6 +254,8 @@ class EvdevTransport:
             self.down('assigned_slaves_unavailable')
             return False
         if not (yield from self.grab_check()):
+            return False
+        if self.health['state'] == 'down':
             return False
         try:
             if self.keycodes is None:
