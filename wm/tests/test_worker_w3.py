@@ -377,17 +377,17 @@ class PixelCase(unittest.TestCase):
         self.owner(1280, 800)
         frame = self.observe(channels=['pixels'])['frames'][0]
         width, height, rows = decode(frame['path'])
-        self.assertEqual((width, height), (1024, 640))
-        self.assertEqual(frame['scale'], 0.8)
-        self.assertEqual(rows, [b''.join(rgb(int(x/.8),int(y/.8)) for x in range(width)) for y in range(height)])
+        self.assertEqual((width, height), (576, 360))
+        self.assertEqual(frame['scale'], 0.45)
+        self.assertEqual(rows, [b''.join(rgb(int(x/.45),int(y/.45)) for x in range(width)) for y in range(height)])
 
-    def test_scale_one_oversized_and_nonfinite_rejected(self):
+    def test_scale_one_native_and_invalid_scales_rejected(self):
         for scale in (0, -1, float('nan'), float('inf'), True, 2):
             with self.subTest(scale=scale), self.assertRaises(ActError):
                 self.observe(channels=['pixels'], scale=scale)
         self.owner(1280,800)
-        with self.assertRaises(ActError):
-            self.observe(channels=['pixels'], scale=1)
+        frame = self.observe(channels=['pixels'], scale=1)['frames'][0]
+        self.assertEqual(decode(frame['path'])[:2], (1280, 800))
 
     def test_content_addressing_and_transform_identity(self):
         a = self.observe(channels=['pixels'])['frames'][0]
@@ -510,8 +510,8 @@ class PixelCase(unittest.TestCase):
         self.owner(1920, 1080)
         f = self.observe(channels=['pixels'])['frames'][0]
         width, height, rows = decode(f['path'])
-        self.assertEqual((width,height),(1024,576))
-        scale = 1024/1920
+        self.assertEqual((width,height),(640,360))
+        scale = 640/1920
         self.assertEqual(rows,[b''.join(rgb(int(x/scale),int(y/scale)) for x in range(width)) for y in range(height)])
 
     def test_unusual_downscale_exact_general_mapping(self):

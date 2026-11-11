@@ -339,10 +339,10 @@ class Pixels:
             raise ActError('provider_degraded', 'capture_pending')
         if not rect['w'] or not rect['h']:
             raise ActError('target_not_found')
-        default = min(1, 1024/max(rect['w'], rect['h']))
+        default = min(1, 640/rect['w'], 360/rect['h'])
         if scale is None:
             scale = default
-        if type(scale) not in (float, int) or not 0 < scale <= default:
+        if type(scale) not in (float, int) or not 0 < scale <= 1:
             raise ActError('invalid_params', 'frame_scale')
         visible = []
         for win in wins:
@@ -367,7 +367,7 @@ class Pixels:
                            self.w.cache.tombstones.get(handle))
                 if win is None:
                     raise ActError('target_not_found')
-                frame = self.frame(intersect(win['geometry'], self.bounds), [win])
+                frame = self.frame(intersect(win['geometry'], self.bounds), [win], scale=1)
                 step['effect']['evidence'].append(dict(frame, type='frame'))
                 # Protect every frame in this in-progress receipt immediately.
                 self.frames.pins.update(self.frames.references(receipt))
