@@ -690,7 +690,7 @@ class PixelActionTests(Harness):
         self.assertEqual(r['state_delta']['rev'],r['rev']['final'])
 
     def test_unknown_receipt_also_carries_target_frame(self):
-        r = self.run_action([self.key(expect=dict(kind='text_equals',value='later'))])
+        r = self.run_action([self.key(expect=dict(kind='ocr_text',value='later'))])
         self.assertEqual(r['effect']['status'],'unknown')
         frames = [v for v in r['effect']['evidence'] if v['type']=='frame']
         self.assertEqual(len(frames),1)

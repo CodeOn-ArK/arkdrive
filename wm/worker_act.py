@@ -18,6 +18,13 @@ class ActError(Exception):
         super().__init__(reason)
 
 
+class TreePending(ActError):
+    """A recoverable window has no decidable snapshot yet; admission may wait."""
+    def __init__(self, window):
+        self.window = window
+        super().__init__("provider_degraded")
+
+
 MODIFIERS = {"ctrl": "Control_L", "control": "Control_L", "shift": "Shift_L",
              "alt": "Alt_L", "super": "Super_L"}
 MODS = {"Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Super_L", "Super_R"}
@@ -92,6 +99,9 @@ def predicate_schema(p, nested=False):
             raise ActError("invalid_expectation")
         if "tolerance_px" in p:
             integer(p["tolerance_px"], 0, 1)
+        if "bind" in p:
+            if not isinstance(p["bind"], dict) or len(p["bind"]) > 8:
+                raise ActError("invalid_params")
         if "match" in p:
             closed(p["match"], ("title", "title_re", "class", "type"))
             if any(not isinstance(v, str) or len(v) > 512 for v in p["match"].values()):
@@ -103,7 +113,14 @@ def predicate_schema(p, nested=False):
                     raise ActError("invalid_params")
     elif k in PROVIDERS:
         closed(p, ("kind", "ref", "match", "value", "state", "within", "container", "name", "role",
-                   "window", "rect", "axis", "crop", "text", "re", "region", "mode", "hash", "quiet_ms"))
+                   "window", "selector", "rect", "axis", "crop", "text", "re", "region", "mode", "hash", "quiet_ms"))
+        if "selector" in p:
+            from worker_tree import selector_schema
+            selector_schema(p["selector"])
+        if k == "node_state" and (p.get("state") not in
+                ("selected", "checked", "expanded", "focused", "enabled", "editable", "disabled") or
+                "value" in p and type(p["value"]) is not bool):
+            raise ActError("invalid_expectation")
     else:
         # Reaction and generic pixel change are evidence, never proof.
         raise ActError("invalid_expectation")
@@ -177,7 +194,7 @@ class Engine:
         except OSError:
             self.boot_id = None
         digest = hashlib.sha256()
-        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_pixels.py", "openbox-rc.xml"):
+        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_pixels.py", "worker_tree.py", "worker_atspi.py", "openbox-rc.xml"):
             digest.update(name.encode() + Path(__file__).with_name(name).read_bytes())
         self.build_id = digest.hexdigest()
         try:
@@ -238,6 +255,24 @@ class Engine:
     def observed(self, peer, params, result):
         token = self.w.lease
         state = self.lease_state.get(token)
+        tree = result.get("tree", {})
+        if state and peer is self.w.lease_peer and params.get("lease", token) == token and "rev" in tree:
+            baselines = state.setdefault("trees", {})
+            pages = state.setdefault("tree_pages", {})
+            h, rev = tree["window"], tree["rev"]
+            if "delta" in tree:
+                baselines[h] = rev
+            elif tree.get("full"):
+                continuation = params.get("cursor")
+                prior = pages.get(h)
+                contiguous = continuation is None or prior == (rev, continuation)
+                if contiguous:
+                    if tree.get("truncated"):
+                        baselines.pop(h, None)
+                        pages[h] = (rev, tree["cursor"])
+                    else:
+                        baselines[h] = rev
+                        pages.pop(h, None)
         if (state and peer is self.w.lease_peer and result.get("full") and result.get("settled")
                 and params.get("lease", token) == token
                 and not result.get("resync_required")
@@ -300,6 +335,9 @@ class Engine:
                     string(s["target"])
                 else:
                     closed(s["target"], ("window", "ref", "selector", "point", "from_step", "name"))
+                    if "selector" in s["target"]:
+                        from worker_tree import selector_schema
+                        selector_schema(s["target"]["selector"])
             intent = s["intent"]
             if not isinstance(intent, dict) or not isinstance(intent.get("kind"), str) or intent["kind"] not in KINDS:
                 raise ActError("invalid_request")
@@ -401,6 +439,9 @@ class Engine:
             return
         # Authorisation precedes intent; dedupe retrieval itself never dispatches.
         self.w.require_lease(peer, p)
+        tree = getattr(self.w, "tree", None)
+        if tree:
+            tree.admission(p["steps"])
         receipt = self.make_receipt(p, h)
         a = {"params": p, "hash": h, "receipt": receipt, "peer": peer, "ident": ident,
              "received": self.clock(), "deadline": self.clock() + p["deadline_ms"] / 1000,
@@ -557,9 +598,9 @@ class Engine:
 
     def resolve(self, s, base=None):
         target, intent = s.get("target"), s["intent"]
-        if contains_ref(target) or contains_ref(s["require"]):
-            raise ActError("provider_degraded")
-        if intent["kind"] == "invoke":
+        tree = getattr(self.w, "tree", None)
+        semantic = contains_ref(target) or intent["kind"] == "invoke"
+        if (semantic or contains_ref(s["require"])) and tree is None:
             raise ActError("provider_degraded")
         pointer = intent["kind"] in ("move", "click", "scroll", "drag")
         handle = target if isinstance(target, str) else (target or {}).get("window")
@@ -570,6 +611,23 @@ class Engine:
         at = intent.get("from") if intent["kind"] == "drag" else intent.get("at")
         at = at or ((target or {}).get("point") if isinstance(target, dict) else None)
         point = self.point(at, base) if at is not None else None
+        if semantic:
+            if not isinstance(target, dict):
+                target = {}
+            subject = target.get("ref", target.get("selector", intent.get("ref")))
+            node = tree.resolve(handle, subject, base, completed=True)
+            if "disabled" in node.get("states", []):
+                raise ActError("precondition_failed")
+            s["_node"] = dict(node)
+            handle = handle or self.w.cache.focus
+            x, y, width, height = node["bounds"]
+            g = self.window(handle)["geometry"]
+            right, bottom = min(x+width, g["x"]+g["w"]), min(y+height, g["y"]+g["h"])
+            x, y = max(x, g["x"]), max(y, g["y"])
+            width, height = right-x, bottom-y
+            if width <= 0 or height <= 0:
+                raise ActError("target_not_found")
+            point = self.point({"x": x + width//2, "y": y + height//2}, base) if intent["kind"] != "invoke" else None
         if pointer and point is None:
             raise ActError("invalid_request")
         if pointer and handle is None:
@@ -584,6 +642,15 @@ class Engine:
 
     def guards(self, a, s, base, handle, point):
         cache, req = self.w.cache, s["require"]
+        tree = getattr(self.w, "tree", None)
+        if tree and contains_ref(req):
+            tree.requirements(req, handle, base, completed=True)
+        if s.get("_node"):
+            current = tree.resolve(handle, s["_node"]["ref"], base, completed=True)
+            if any(current.get(k) != s["_node"].get(k) for k in ("key", "role", "name")):
+                raise ActError("stale_rev", "tree_identity")
+            if "disabled" in current.get("states", []):
+                raise ActError("precondition_failed")
         if not 1 <= base <= cache.rev:
             raise ActError("stale_rev")
         facets = ["focus", "modal"]
@@ -676,6 +743,11 @@ class Engine:
             if k == "all":
                 return False if False in results else None if None in results else True
             return True if True in results else None if None in results else False
+        tree = getattr(self.w, "tree", None)
+        if tree and k in ("node_present", "node_absent", "text_equals", "text_contains", "node_state", "item_present", "item_absent", "scroll_value"):
+            return tree.evaluate(p)
+        if tree and k == "focus_is" and "ref" in p:
+            return tree.evaluate(dict(p, kind="node_state", state="focused"))
         if k not in STATE or (k == "focus_is" and "ref" in p):
             return None
         if not sampled and not self.w.covered():
@@ -694,7 +766,7 @@ class Engine:
         if k.startswith("dialog"):
             if contains_ref(p.get("parent")):
                 return None
-            if p.get("role") or (not handle and not any(f in match for f in ("title", "title_re", "class"))):
+            if (p.get("role") and tree is None) or (not p.get("role") and not handle and not any(f in match for f in ("title", "title_re", "class"))):
                 return None  # No semantic profile classifier before W4.
             wins = [v for v in wins if v.get("is_modal") or v.get("transient_for") or v["type"] == "dialog"]
             if p.get("parent"):
@@ -702,6 +774,19 @@ class Engine:
                 if not parent:
                     return None
                 wins = [v for v in wins if v["family"] == parent["family"]]
+            if p.get("role") and tree:
+                classified, uncertain = [], False
+                for win in wins:
+                    result = tree.classify(win["handle"], p["role"],
+                                           getattr(self, "dialog_initial", None) if k == "dialog_present" else None)
+                    if result is None:
+                        uncertain = True
+                        tree.ensure(win["handle"])
+                    elif result:
+                        classified.append(win)
+                if not classified and uncertain:
+                    return None
+                wins = classified
         if k in ("window_focused", "focus_is"):
             return any(v["handle"] == focus for v in wins)
         return not wins if k.endswith("absent") else bool(wins)
@@ -709,6 +794,9 @@ class Engine:
     def expectation(self, s, handle, point):
         k = s["intent"]["kind"]
         p = s.get("expect")
+        if p is None and k == "text" and s.get("_node") and getattr(self.w, "tree", None):
+            p = {"kind": "text_equals", "window": handle, "ref": s["_node"]["ref"],
+                 "value": self.w.tree.computed_text(s["_node"], s["intent"])}
         if p is None:
             p = {"kind": "pointer_at", "point": point} if k == "move" else (
                 {"kind": "window_focused", "window": handle} if k == "focus_window" else (
@@ -935,6 +1023,24 @@ class Engine:
     def key_events(codes):
         return [("key_down", c) for c in codes] + [("key_up", c) for c in reversed(codes)]
 
+    def current_tree_ref(self, a, handle, ref, base):
+        """Earlier macro input can invalidate the tree we must recheck."""
+        tree = self.w.tree
+        until = min(a["deadline"], a["step_deadline"])
+        while True:
+            try:
+                self.gate(a)
+            except ActError as exc:
+                if exc.reason == "timeout" and self.clock() >= until:
+                    raise ActError("provider_degraded") from exc
+                raise
+            try:
+                return tree.resolve(handle, ref, base)
+            except ActError as exc:
+                if exc.reason != "provider_degraded" or not tree.can_wait(handle) or self.clock() >= until:
+                    raise
+            yield
+
     def dispatch(self, a, s, r, handle, point):
         intent, k = s["intent"], s["intent"]["kind"]
         # Resolve the entire macro before positioning/focusing/arming it.
@@ -943,13 +1049,16 @@ class Engine:
             self.guards(a, s, r["rev"]["base"], handle, end)
         codes = self.mapped_keys(intent["keys"]) if k == "key" else []
         mods = self.mapped_keys(intent.get("modifiers", []))
-        text = None
+        text, insertion_keys = None, None
         if k == "text":
             text = [self.t.character(c) for c in intent["text"]]
             if any(v is None for v in text):
                 raise ActError("backend_unsupported", "unmappable_text")
             select_all = self.mapped_keys(self.t.select_all(handle)) if intent["replace"] else []
-        route = "wm" if k in ("focus_window", "close_window") else "xtest"
+            if (s.get("_node") and "focused" not in s["_node"].get("states", []) and not intent["replace"]):
+                insertion_keys = (self.mapped_keys(["Control_L", "Home"]), self.mapped_keys(["Right"]),
+                                  self.mapped_keys(["Shift_L", "Right"]))
+        route = "atspi" if k == "invoke" else "wm" if k in ("focus_window", "close_window") else "xtest"
         requested = intent.get("route", "auto")
         if requested not in ("auto", "input", route) or intent.get("via") == "paste":
             raise ActError("backend_unsupported")
@@ -960,6 +1069,44 @@ class Engine:
         if point and handle is not None:
             facet = "geometry[" + handle + "]"
             r.setdefault("geometry_guard", {"facet": facet, "rev": self.w.cache.facets.get(facet, 1)})
+        if s.get("_node"):
+            yield from self.current_tree_ref(a, handle, s["_node"]["ref"], r["rev"]["base"])
+            r["tree_guard"] = (handle, s["_node"]["ref"])
+        if k == "invoke":
+            self.gate(a)
+            self.arm(a, r)
+            attempt = {"route": "atspi", "dispatch_status": "not_dispatched", "accepted": None,
+                       "written": 0, "expected": 1, "written_prefix": {}, "server_ack": None,
+                       "provider_result": None, "error": None, "reason": None,
+                       "started_ns": int(self.clock()*1e9), "ended_ns": None}
+            task = self.w.tree.request("invoke", handle, key=s["_node"]["key"], action=intent.get("action"),
+                                       role=s["_node"]["role"], name=s["_node"].get("name", ""),
+                                       control=str(self.w.sd / "control"), generation=self.w.generation,
+                                       epoch=a["params"]["control_epoch"], deadline=min(a["deadline"], a["step_deadline"]))
+            if task is None:
+                raise ActError("provider_degraded")
+            r["attempts"].append(attempt)
+            r["route"] = "atspi"
+            r["rev"]["dispatched"] = self.w.cache.rev
+            attempt["dispatch_status"] = r["dispatch_status"] = "unknown"
+            while not task["done"] and not task["breached"]:
+                self.gate(a)
+                yield
+            attempt["ended_ns"] = int(self.clock()*1e9)
+            if task.get("error") or task["breached"]:
+                attempt["error"] = task.get("error") or "provider_deadline"
+                if task.get("error") in ("stale_rev", "invalid_request", "backend_unsupported", "preempted", "precondition_failed"):
+                    attempt.update(dispatch_status="not_dispatched", accepted=False)
+                    r["dispatch_status"] = "not_dispatched"
+                    raise ActError(task["error"])
+                raise ActError("provider_degraded")
+            attempt["provider_result"] = task["result"]
+            accepted = task["result"].get("accepted", False)
+            attempt.update(dispatch_status="accepted" if accepted else "not_dispatched", accepted=accepted, written=int(accepted))
+            r["dispatch_status"] = attempt["dispatch_status"]
+            if not accepted:
+                raise ActError("effect_not_observed")
+            return
         if k in ("key", "text"):
             focus_started = self.clock()
             yield from self.focus(a, r, handle)
@@ -967,7 +1114,26 @@ class Engine:
             r["focus"]["confirmed"] = self.w.cache.focus
             r["macro_focus"], r["macro_modal"] = self.w.cache.focus, list(self.w.cache.modal)
             r["macro_rev"] = self.w.cache.rev
+            if k == "text" and s.get("_node"):
+                if "editable" not in s["_node"].get("states", []):
+                    raise ActError("precondition_failed")
+                if "focused" not in s["_node"].get("states", []):
+                    yield from self.position(a, r, point, handle)
+                    yield from self.current_tree_ref(a, handle, s["_node"]["ref"], r["rev"]["base"])
+                    yield from self.send(a, r, [("button_down", 1), ("button_up", 1)])
+                    if not intent["replace"]:
+                        node = s["_node"]
+                        start, end = sorted(node.get("selection", [node.get("caret", 0)] * 2))
+                        home, right, select_right = insertion_keys
+                        yield from self.send(a, r, self.key_events(home))
+                        for _ in range(start):
+                            yield from self.send(a, r, self.key_events(right))
+                        for _ in range(end-start):
+                            yield from self.send(a, r, self.key_events(select_right))
         if point and k in ("click", "scroll", "drag"):
+            if s.get("_node"):
+                yield from self.focus(a, r, handle)
+                r["focus"]["confirmed"] = self.w.cache.focus
             r["macro_focus"], r["macro_modal"] = self.w.cache.focus, list(self.w.cache.modal)
             r["macro_rev"] = self.w.cache.rev
             yield from self.position(a, r, point, handle)
@@ -1008,6 +1174,8 @@ class Engine:
             button = {"left": 1, "middle": 2, "right": 3}[intent.get("button", "left")]
             if k == "click":
                 yield from self.pause(0.01, a)
+                if s.get("_node"):
+                    yield from self.current_tree_ref(a, handle, s["_node"]["ref"], r["rev"]["base"])
                 for n in range(intent["count"]):
                     yield from self.send(a, r, [("button_down", button)])
                     yield from self.pause(0.015, a)
@@ -1043,6 +1211,10 @@ class Engine:
         old_focus, old_modal = r["focus"].get("confirmed", r["focus"]["before"]), set(r["modal"]["before"])
         dialog_effect = any(v["kind"] in ("dialog_present", "dialog_absent") for v in leaves(p))
         appearance = any(v["kind"] in ("window_present", "dialog_present") for v in leaves(p))
+        tree = getattr(self.w, "tree", None)
+        if tree and any(v["kind"].startswith("dialog") and v.get("role") and
+                        self.evaluate(v, sampled) is None for v in leaves(p)):
+            return None
         if old_focus == new_focus and old_modal == new_modal and not dialog_effect and not appearance:
             return True
         # Focus may name an as-yet unsampled client (derive then yields None).
@@ -1059,9 +1231,12 @@ class Engine:
                 subject = v.get("window", v.get("handle"))
                 if subject and subject != handle:
                     continue
-                if not subject and not v.get("match"):
+                if not subject and not v.get("match") and not v.get("role"):
                     continue
                 if not win or not self.matches(win, v.get("match", {})):
+                    continue
+                if k.startswith("dialog") and v.get("role") and tree and present and not tree.classify(
+                        handle, v["role"], getattr(self, "dialog_initial", None)):
                     continue
                 if k.startswith("dialog") and not (win.get("transient_for") or win.get("is_modal") or win["type"] == "dialog"):
                     continue
@@ -1096,12 +1271,36 @@ class Engine:
         return focus_ok and all(names(h, True) for h in new_modal - old_modal) and all(names(h, False) for h in removed)
 
     def evidence(self, p, sampled=False):
+        if predicate_class(p) == "composite":
+            return [e for leaf in leaves(p) if self.evaluate(leaf, sampled) is True
+                    for e in self.evidence(leaf, sampled)]
         comparison = {"predicate": p, "result": True}
         if isinstance(sampled, dict) and "classifiers" in sampled:
             comparison["classifiers"] = list(sampled["classifiers"].values())
-        return [{"kind": "state", "provider": "x11", "rev": self.w.cache.rev, "sample_ns": int(self.clock() * 1e9),
+        tree_evidence = predicate_class(p) == "tree"
+        return [{"kind": "tree" if tree_evidence else "state", "provider": "atspi" if tree_evidence else "x11", "rev": self.w.cache.rev, "sample_ns": int(self.clock() * 1e9),
                  "scope": {"kind": "session"}, "hash": None, "ref": None, "coverage": "complete", "redactions": [],
                  "comparison": comparison}]
+
+    def tree_expectation(self, p):
+        return any(predicate_class(leaf) == "tree" or
+                   (leaf["kind"] == "focus_is" and "ref" in leaf) or
+                   (leaf["kind"].startswith("dialog_") and leaf.get("role")) for leaf in leaves(p))
+
+    def tree_undecided(self, p):
+        tree = getattr(self.w, "tree", None)
+        if tree is None:
+            return False
+        windows = []
+        for leaf in leaves(p):
+            if predicate_class(leaf) == "tree" or (leaf["kind"] == "focus_is" and "ref" in leaf):
+                windows.append(tree.predicate_window(leaf))
+            elif leaf["kind"].startswith("dialog_") and leaf.get("role"):
+                windows.extend(win["handle"] for win in self.w.cache.windows.values()
+                               if win["mapped"] and self.matches(win, leaf.get("match", {})) and
+                               (not leaf.get("window") or win["handle"] == leaf["window"]) and
+                               (win.get("is_modal") or win.get("transient_for") or win["type"] == "dialog"))
+        return bool(windows) and all(tree.can_wait(h) for h in windows)
 
     def verify(self, a, r, p, until):
         final = False
@@ -1147,7 +1346,7 @@ class Engine:
                 self.w.cache.commit(True)
                 r["rev"]["verified"] = self.w.cache.rev
                 return "verified", None
-            if value is None and self.w.covered():
+            if value is None and self.w.covered() and not self.tree_undecided(p):
                 return "unknown", "provider_degraded"
             if final:
                 return ("unknown", "provider_degraded") if value is None or transition is None else ("not_observed", "timeout")
@@ -1172,6 +1371,71 @@ class Engine:
                 refresh_at = min(until, self.clock() + 0.1)
             yield
 
+    def bound(self, value, bindings, field=None):
+        if isinstance(value, dict) and set(value) == {"from_step", "name"}:
+            item = bindings.get(value["from_step"], {}).get(value["name"])
+            if item is None:
+                raise ActError("invalid_request", "unverified_binding")
+            if field == "target":
+                return copy.deepcopy(item)
+            return item.get("ref", item.get("window")) if isinstance(item, dict) else item
+        if isinstance(value, dict):
+            return {k: self.bound(v, bindings, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self.bound(v, bindings, field) for v in value]
+        return value
+
+    def exports(self, p):
+        tree = getattr(self.w, "tree", None)
+        if not tree:
+            return {}
+        output = {}
+        for leaf in leaves(p):
+            if leaf["kind"] != "dialog_present" or not leaf.get("bind"):
+                continue
+            parent = self.window(leaf.get("parent"))
+            candidates = [win for win in self.w.cache.windows.values() if win["mapped"] and
+                          (not parent or win["family"] == parent["family"]) and
+                          (win.get("is_modal") or win.get("transient_for") or win.get("type") == "dialog") and
+                          self.matches(win, leaf.get("match", {}))]
+            matches = [(win, tree.classify(win["handle"], leaf.get("role", "dialog"),
+                        getattr(self, "dialog_initial", None), remember=True, completed=True)) for win in candidates]
+            matches = [(win, result) for win, result in matches if result]
+            if len(matches) != 1:
+                raise ActError("invalid_request", "ambiguous_dialog_binding")
+            win, result = matches[0]
+            for name, selector in leaf["bind"].items():
+                if selector == "dialog":
+                    output[name] = {"window": win["handle"]}
+                else:
+                    # The adopted rename classifier supplies the unique editable
+                    # text field (GTK exposes it as either text or entry).
+                    if selector == {"role": "text"} and "entry" in result:
+                        ref = result["entry"]
+                    else:
+                        ref = tree.resolve(win["handle"], dict(provider="atspi", **selector), completed=True)["ref"]
+                    output[name] = {"window": win["handle"], "ref": ref}
+        return output
+
+    def admit_tree(self, a, read):
+        """Wait for recoverable, undecided admission reads within this step."""
+        waiting = False
+        while True:
+            if waiting:
+                try:
+                    self.gate(a)
+                except ActError as exc:
+                    if exc.reason == "timeout":
+                        raise ActError("provider_degraded") from exc
+                    raise
+            try:
+                return read()
+            except TreePending as exc:
+                if not self.w.tree.can_wait(exc.window):
+                    raise ActError("provider_degraded") from exc
+                waiting = True
+            yield
+
     def run(self, a):
         p, receipt = a["params"], a["receipt"]
         state = self.lease_state.get(p["lease"], {})
@@ -1190,6 +1454,8 @@ class Engine:
                 dirty = yield from self.query("pointer", deadline=min(a["deadline"], self.clock() + 0.1))
                 if dirty.get("mask", 0) & 255:
                     raise ActError("precondition_failed", "modifier_state_dirty")
+            bindings = {}
+            self.dialog_initial = None
             for s, r in zip(p["steps"], receipt["steps"]):
                 stopping = r
                 started = self.clock()
@@ -1199,6 +1465,8 @@ class Engine:
                 r["modal"]["before"] = list(self.w.cache.modal)
                 self.w.counters["steps"] += 1
                 try:
+                    until = min(a["deadline"], self.clock() + s["timeout_ms"] / 1000)
+                    a["step_deadline"] = until
                     self.gate(a)
                     while not self.w.covered():
                         self.gate(a)
@@ -1208,8 +1476,13 @@ class Engine:
                     while not self.w.settle_pixels():
                         self.gate(a)
                         yield
-                    handle, point = self.resolve(s, base)
-                    self.guards(a, s, base, handle, point)
+                    s = self.bound(s, bindings)
+                    handle, point = yield from self.admit_tree(a, lambda: self.resolve(s, base))
+                    if getattr(self.w, "tree", None) and "selected_ref" in s["require"]:
+                        selected = yield from self.admit_tree(a, lambda: self.w.tree.resolve(
+                            handle, s["require"]["selected_ref"], base, completed=True))
+                        self.dialog_initial = selected.get("name") or selected.get("text")
+                    yield from self.admit_tree(a, lambda: self.guards(a, s, base, handle, point))
                     r["target_resolved"] = r["target"] = handle
                     expect = self.expectation(s, handle, point)
                     r["expect"] = expect
@@ -1217,9 +1490,23 @@ class Engine:
                         r["windows_before"] = copy.deepcopy({win["handle"]: win for win in self.w.cache.windows.values() if win["mapped"]})
                     r["predicate_class"] = predicate_class(expect)
                     k = s["intent"]["kind"]
-                    before = self.initially_satisfied(expect, k)
+                    before = yield from self.admit_tree(a, lambda: self.initially_satisfied(expect, k))
+                    if k != "wait" and self.tree_expectation(expect):
+                        while before is None and self.clock() < until:
+                            if not self.tree_undecided(expect):
+                                raise ActError("provider_degraded")
+                            self.gate(a)
+                            yield
+                            if self.clock() >= until:
+                                break
+                            before = yield from self.admit_tree(a, lambda: self.initially_satisfied(expect, k))
+                        if before is None:
+                            raise ActError("provider_degraded")
                     if before is True and k != "wait":
-                        if k in ("move", "focus_window"):
+                        if k in ("move", "focus_window") or (k == "text" and s.get("_node") and
+                                s["intent"]["replace"] and expect.get("kind") == "text_equals" and
+                                expect.get("ref") == s["_node"]["ref"] and
+                                expect.get("value") == s["intent"]["text"]):
                             r.update(disposition="satisfied_without_dispatch", reason="precondition_already_satisfied")
                             r["rev"]["verified"] = self.w.cache.rev
                             r["effect"] = self.effect("verified", expect, self.evidence(expect))
@@ -1227,8 +1514,7 @@ class Engine:
                             raise ActError("invalid_expectation", "precondition_already_satisfied")
                     else:
                         receipt["phase"] = "dispatch"
-                        until = min(a["deadline"], self.clock() + s["timeout_ms"] / 1000)
-                        a["step_deadline"] = until
+                        yield from self.admit_tree(a, lambda: self.guards(a, s, base, handle, point))
                         dispatch_started = self.clock()
                         yield from self.dispatch(a, s, r, handle, point)
                         r["timing_ms"]["application_wait"] = (self.clock() - dispatch_started) * 1000
@@ -1256,6 +1542,9 @@ class Engine:
                     if r.get("unexpected_transient") or not self.transition_expected(r, expect, a.get("verification_sampled", False)):
                         stop_reason = r["reason"] = "unexpected_state"
                         break
+                    if getattr(self.w, "tree", None):
+                        r["bindings"] = yield from self.admit_tree(a, lambda: self.exports(expect))
+                        bindings[s["id"]] = r["bindings"]
                     base = r["rev"]["verified"]
                 except ActError as exc:
                     r["reason"], r["detail"] = exc.reason, exc.detail
@@ -1428,8 +1717,16 @@ class Engine:
                 step = next(s for s in action["receipt"]["steps"] if s["id"] == pending["step_id"])
                 if acks and all(ack.complete for ack in acks) and step["cleanup"]["confirmed"]:
                     pending["delivery_quiescent"] = True
+            proven = False
             if (generation == self.w.generation and pending["delivery_quiescent"]
-                    and self.w.cache.rev >= pending["rev"] and self.evaluate(pending["expect"]) is True):
+                    and self.w.cache.rev >= pending["rev"]):
+                try:
+                    proven = self.evaluate(pending["expect"]) is True
+                except ActError:
+                    # A restarted provider or stale selector cannot reconcile
+                    # an old mutation. Keep it unresolved without replaying.
+                    pass
+            if proven:
                 self.durable("reconciliation", action_id=pending["action_id"], step_id=pending["step_id"], rev=self.w.cache.rev, effect="verified")
                 if action:
                     action.setdefault("reconciliations", []).append({"step_id": pending["step_id"], "rev": self.w.cache.rev, "effect": "verified"})

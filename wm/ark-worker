@@ -39,6 +39,7 @@ sys.path.insert(0, str(WM))
 from worker_act import ActError, Engine, canonical, leaves, predicate_schema, recover_receipt
 from worker_xtest import XTestTransport
 from worker_pixels import Pixels, Shadow, intersect, bbox
+from worker_tree import Provider as TreeProvider
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
 STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
 PAGE = struct.Struct("<4sI16sQIIQ16s")
@@ -416,14 +417,15 @@ class StateCache:
             return [w for w in self.windows.values() if w["family"] == target["family"]]
         raise RPCError("invalid_params")
 
-    def observe(self, scope, since, covered=True, pixel_tiles=None):
+    def observe(self, scope, since, covered=True, pixel_tiles=None, tree_window=None):
         windows = self.selected(scope)
         known = type(since) is int and 1 <= since <= self.rev
         # Integer comparisons only. Conservative across scopes: a change in
         # another window can yield an empty delta, never a false unchanged.
         unchanged = known and covered and max((rev for facet, rev in self.facets.items()
-                if not facet.startswith("pixels[") or pixel_tiles is None or
-                int(facet[7:-1]) in pixel_tiles), default=1) <= since
+                if (not facet.startswith("tree[") or facet == "tree[" + str(tree_window) + "]") and
+                (not facet.startswith("pixels[") or pixel_tiles is None or
+                int(facet[7:-1]) in pixel_tiles)), default=1) <= since
         full = not known
         result = {"rev": self.rev, "generation": self.generation,
                   "unchanged": bool(unchanged), "full": full}
@@ -938,6 +940,9 @@ class XState:
         transient = first("WM_TRANSIENT_FOR")
         leader = first("WM_CLIENT_LEADER")
         pid = first("_NET_WM_PID")
+        if not hasattr(self, "window_pids"):
+            self.window_pids = {}
+        self.window_pids[wid] = pid
         old = self.w.cache.windows.get(wid, {})
         fallback = old.get("family")
         focused = self.w.cache.windows.get(self.focus_xid)
@@ -1073,6 +1078,7 @@ class Worker:
         self.cache = StateCache(self.sid, generation)
         self.act = None
         self.pixels = None
+        self.tree = None
         self.resync_baseline = None
         self.setup_action_profile()
         self.journal = Journal(state / "acts" / (generation + ".jsonl"), self.sid, generation)
@@ -1119,6 +1125,13 @@ class Worker:
             result["pixels"] = {"state": "degraded" if pixels.failure else "healthy",
                                 "sample_rev": self.cache.rev, "coverage": "screen",
                                 "reason": pixels.failure, "age_ms": 0}
+        tree = getattr(self, "tree", None)
+        if tree:
+            result.update(tree.health())
+            result["tree"] = dict(result["atspi"])
+        else:
+            for name in ("atspi", "tree"):
+                result[name].update(state="down", reason="provider_unavailable")
         return result
 
     def settle_pixels(self):
@@ -1161,7 +1174,8 @@ class Worker:
                 "evdev": {"state": "down", "grab": False, "reason":
                           "not_implemented" if self.record["profile"] == "xorg" else "backend_unsupported"},
                 "paste": {"state": "unavailable", "reason": "not_implemented"},
-                "atspi": {"state": "unavailable", "reason": "not_implemented"}}
+                "atspi": self.tree.health()["atspi"] if getattr(self, "tree", None) else
+                         {"state": "down", "reason": "provider_unavailable"}}
 
     def versions(self):
         return {"python": sys.version.split()[0], "python_xlib": ".".join(map(str, Xlib.__version__)),
@@ -1196,7 +1210,13 @@ class Worker:
         reason = None if covered else ("metadata_truncated" if self.x and self.x.uncovered else "refresh_pending")
         return {"state": {"complete": covered, "sample_rev": self.cache.rev,
                           "reason": reason},
-                **{n: {"complete": False, "reason": "not_implemented"} for n in ("tree", "ocr")},
+                "tree": {"complete": bool(getattr(self, "tree", None) and self.tree.ready and all(
+                          self.tree.status(w["handle"]) in ("usable", "empty")
+                          for w in self.cache.windows.values() if w["mapped"])),
+                         "reason": None if getattr(self, "tree", None) and self.tree.ready and all(
+                          self.tree.status(w["handle"]) in ("usable", "empty")
+                          for w in self.cache.windows.values() if w["mapped"]) else "provider_degraded"},
+                "ocr": {"complete": False, "reason": "not_implemented"},
                 "pixels": {"complete": bool(getattr(self, "pixels", None) and not self.pixels.failure
                                                and not self.pixels.pending and not self.pixels.dirty),
                            "reason": self.pixels.failure if getattr(self, "pixels", None) else "not_implemented"}}
@@ -1464,6 +1484,13 @@ class Worker:
                 return
             if method == "system.info":
                 result = self.health()
+            elif method == "debug.tree_dump":
+                if not getattr(self, "tree", None) or params["window"] not in self.tree.raw:
+                    raise RPCError("provider_degraded", "snapshot_unavailable")
+                handle = params["window"]
+                path = self.sd / ("tree-dump-" + handle.replace("/", "_") + ".json")
+                path.write_text(json.dumps(self.tree.raw[handle], ensure_ascii=False, indent=2) + "\n")
+                result = {"path": str(path)}
             elif method == "session.attach":
                 self.expire_lease()
                 if self.lease:
@@ -1520,6 +1547,7 @@ class Worker:
         keys = {
             "session.attach": {"client", "name", "budget"},
             "system.info": set(),
+            "debug.tree_dump": {"window"},
             "window.observe": {"lease", "scope", "since_rev", "channels", "region", "ignore_regions", "budget", "cursor", "scale"},
             "window.wait": {"lease", "expect", "predicate", "since_rev"},
             "action.get": {"action_id"},
@@ -1527,6 +1555,9 @@ class Worker:
         if method not in keys:
             raise RPCError("method_not_found", code=-32601)
         if set(params) - keys[method] - {"session", "generation", "deadline_ms"}:
+            raise RPCError("invalid_params", code=-32602)
+        if method == "debug.tree_dump" and (not isinstance(params.get("window"), str) or
+                not re.fullmatch(r"[A-Za-z0-9:/_-]+", params["window"])):
             raise RPCError("invalid_params", code=-32602)
         if params.get("session", self.sid) != self.sid:
             raise RPCError("invalid_params")
@@ -1579,7 +1610,10 @@ class Worker:
             ignored, _ = pixels.region(dict(params, region=raw)) if pixels else (None, [])
             if pixels:
                 tiles -= {t for t in tiles if intersect(pixels.rects[t], ignored) == pixels.rects[t]}
-        result = self.cache.observe(scope, since, self.covered(), tiles)
+        tree = getattr(self, "tree", None)
+        tree_requested = tree is not None and any(c in ("auto", "tree") for c in channels)
+        tree_window = tree.target(scope) if tree_requested else None
+        result = self.cache.observe(scope, since, self.covered(), tiles, tree_window)
         result.update(providers=self.providers(), coverage=self.coverage(),
                       channels_used=["state"], settled=self.covered())
         if pixels:
@@ -1600,7 +1634,40 @@ class Worker:
             if "pixels" in channels and not result["unchanged"]:
                 result["frames"] = [pixels.frame(rect, wins, params.get("scale"))]
                 result["channels_used"].append("pixels")
-        if any(c in ("tree", "ocr") or c == "pixels" and pixels is None for c in channels):
+        cursor = params.get("cursor")
+        if tree_requested and tree_window and (cursor is not None or any(
+                w["handle"] == tree_window and w["mapped"] for w in self.cache.windows.values())):
+            tree.consumers[tree_window] = self.lease
+            if since is None and cursor is None:
+                tree.ensure(tree_window, health=True)
+            result["tree"] = dict(window=tree_window, status=tree.status(tree_window))
+            usable = tree.probes.get(tree_window) == "usable"
+            if cursor is not None or (tree.healthy(tree_window) and
+                    tree.probes.get(tree_window) in ("usable", "empty") and
+                    tree_window in tree.cache.windows and ("tree" in channels or usable)):
+                if not result["unchanged"] or params.get("cursor"):
+                    try:
+                        state = self.act.lease_state.get(self.lease, {}) if getattr(self, "act", None) else {}
+                        baseline = state.get("trees", {}).get(tree_window)
+                        tree_since = baseline if since is not None and baseline is not None and baseline <= since else None
+                        result["tree"] = tree.cache.page(tree_window, tree_since, params.get("cursor"), params.get("budget"),
+                                                        dirty=tree_window in tree.dirty)
+                        result["channels_used"].append("tree")
+                    except ActError as exc:
+                        if exc.reason != "provider_degraded":
+                            raise
+                        result["providers"]["atspi"].update(state="degraded")
+                        result["tree"].update(status="degraded", reason=exc.detail)
+                        if any(w["handle"] == tree_window and w["mapped"] for w in self.cache.windows.values()):
+                            result["providers"]["atspi"]["apps"][tree.app(tree.window(tree_window))].update(
+                                state="degraded", reason=exc.detail)
+                        if pixels and channels == ["auto"]:
+                            result["frames"] = [pixels.frame(rect, wins, params.get("scale"))]
+                            result["channels_used"].append("pixels")
+            elif pixels and channels == ["auto"] and not result["unchanged"]:
+                result["frames"] = [pixels.frame(rect, wins, params.get("scale"))]
+                result["channels_used"].append("pixels")
+        if any(c == "ocr" or c == "tree" and tree is None or c == "pixels" and pixels is None for c in channels):
             result.update(unchanged=None, resync_required=True)
         return result
 
@@ -1726,6 +1793,9 @@ class Worker:
                     if item["kind"] == "observe":
                         if not expired and (not self.covered() or item.get("pointer_pending")):
                             continue
+                        if (not expired and item["params"].get("since_rev") is None and
+                                getattr(self, "tree", None) and self.tree.busy(item["params"])):
+                            continue
                         result = self.observation(item["params"])
                     else:
                         satisfied = self.predicate(item["params"].get("expect", item["params"].get("predicate")))
@@ -1749,10 +1819,13 @@ class Worker:
         self.x.events(events)
         self.poll_control()
         self.cache.commit(bool(events))
+        if getattr(self, "tree", None):
+            self.tree.tick()
 
     def run(self):
         failure = None
         try:
+            self.tree = TreeProvider(self)
             self.x = XState(self)
             self.selector.register(self.x.ev.fileno(), selectors.EVENT_READ, "ev")
             self.selector.register(self.x.inp.fileno(), selectors.EVENT_READ, "inp")
@@ -1773,6 +1846,11 @@ class Worker:
                     self.selector.select(0.02)
                     continue
                 self.ingest()
+                if not self.published and self.tree.wire is not None and not self.tree.ready:
+                    self.x.ax.flush()
+                    self.x.inp_ax.flush()
+                    self.selector.select(0.01)
+                    continue
                 self.x.advance()
                 if self.openbox and self.openbox.poll() is not None:
                     raise RuntimeError("worker_fault: openbox exited")
@@ -1844,6 +1922,8 @@ class Worker:
     def cleanup(self, failure):
         # Reap our child before touching selector/X resources: either may
         # already be broken on this path. Never report failed-start early.
+        if getattr(self, "tree", None):
+            self.tree.close()
         if self.openbox:
             if self.openbox.poll() is None:
                 self.openbox.terminate()
@@ -2004,6 +2084,8 @@ def command(args):
             raise RuntimeError("worker_not_running")
     if args.command == "status":
         return rpc_call(metadata["socket"], "system.info"), 0
+    if args.command == "tree-dump":
+        return rpc_call(metadata["socket"], "debug.tree_dump", {"window": args.window}), 0
     if args.command == "stop":
         os.kill(metadata["pid"], signal.SIGTERM)
         if not wait_pid(metadata["pid"], 5):
@@ -2040,9 +2122,10 @@ class Parser(argparse.ArgumentParser):
 
 def main():
     parser = Parser(description=__doc__)
-    parser.add_argument("command", choices=("start", "stop", "status", "control"))
+    parser.add_argument("command", choices=("start", "stop", "status", "control", "tree-dump"))
     parser.add_argument("--session", required=True)
     parser.add_argument("--state", choices=("agent", "paused", "human"))
+    parser.add_argument("--window")
     parser.add_argument("--clear-fence", action="store_true")
     for flag in ("daemon", "state", "generation", "record"):
         parser.add_argument("--_" + flag, action="store_true" if flag == "daemon" else "store",
@@ -2051,6 +2134,8 @@ def main():
     args = None
     try:
         args = parser.parse_args()
+        if args.command == "tree-dump" and not args.window:
+            raise RuntimeError("invalid_arguments: tree-dump requires --window")
         if args.command == "control" and args.state is None:
             raise RuntimeError("invalid_arguments: control requires --state")
         if args.clear_fence and (args.command != "control" or args.state != "agent"):
@@ -2060,7 +2145,10 @@ def main():
         result = {"session": args.session if args else None, "state": "failed", "error": str(exc)}
         code = 1
     if result is not None:
-        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        if args and args.command == "tree-dump" and code == 0:
+            print(result["path"])
+        else:
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
     return code
 
 

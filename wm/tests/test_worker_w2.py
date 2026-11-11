@@ -1671,10 +1671,13 @@ class FreshnessAndPredicates(Harness):
     def test_provider_predicate_unknown_after_submission(self):
         for kind in ("text_equals", "node_present", "ocr_text", "frame_matches"):
             r = self.run_action(self.params([self.key(expect={"kind": kind})], action_id=kind))
-            if kind == "text_equals":
+            if kind in ("text_equals", "node_present"):
+                self.assertEqual(r["status"], "failed")
+                self.assertEqual(r["dispatch_status"], "not_dispatched")
+                self.assertEqual(r["reason"], "provider_degraded")
+            elif kind == "ocr_text":
                 self.assertEqual(r["status"], "unknown")
                 self.assertEqual(r["dispatch_status"], "accepted")
-                self.assertEqual(r["reason"], "provider_degraded")
             else:
                 self.assertEqual(r["reason"], "awaiting_reconciliation")
         self.assertEqual(len([ev for ev in self.t.log if ev[0] == "key_down"]), 1)
@@ -1972,7 +1975,7 @@ class ReceiptAndSelftest(Harness):
         required = set("version phase session generation window action_id request_hash journal_seq profile_hash control_epoch actor_id lease_hash build_id boot_id development_flags rev status dispatched dispatch_status effect reason steps completed_steps stopped_step unexecuted_steps pending_effects state_delta timing_ms advice".split())
         step_fields = set("id target_requested target_resolved require intent_redacted expect disposition route attempts focus modal rev effect bindings reason timing_ms cleanup predicate_class expect_source".split())
         variants = [self.params(), self.params([self.key()], action_id="failed"),
-                    self.params([self.key(expect={"kind": "node_present"})], action_id="unknown")]
+                    self.params([self.key(expect={"kind": "ocr_text"})], action_id="unknown")]
         statuses = []
         for p in variants:
             self.e.pending_effects.clear()

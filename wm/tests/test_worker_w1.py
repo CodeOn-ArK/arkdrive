@@ -298,7 +298,7 @@ class RPCTests(SandboxCase):
         for name in ("tree", "ocr", "pixels"):
             self.assertNotIn(name, value)
             self.assertFalse(value["coverage"][name]["complete"])
-            self.assertEqual(value["providers"][name]["state"], "unavailable")
+            self.assertEqual(value["providers"][name]["state"], "down" if name == "tree" else "unavailable")
 
     def test_wait_event_completion_and_timeout(self):
         token = self.attach()

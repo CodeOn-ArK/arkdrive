@@ -83,12 +83,14 @@ class Fixture:
         Gdk.event_handler_set(self.input_event, None)
         if args.hang:
             GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.hang)
+            GLib.timeout_add(3000, self.hang)
         if args.repaint:
             Gtk.Settings.get_default().set_property("gtk-cursor-blink", False)
             GLib.timeout_add(100, self.repaint)
         self.window.show_all()
         self.entry.grab_focus()
         self.window.get_frame_clock().connect("after-paint", self.after_paint)
+        self.inventory_written = False
         if args.label_changes:
             self.schedule_label()
 
@@ -149,6 +151,9 @@ class Fixture:
         return GLib.SOURCE_REMOVE
 
     def after_paint(self, _clock):
+        if not self.inventory_written:
+            self.inventory_written = True
+            GLib.idle_add(self.inventory)
         records, self.paint_records = self.paint_records, []
         if records:
             # The painted oracle follows a server round trip, rather than
@@ -156,6 +161,28 @@ class Fixture:
             self.window.get_display().sync()
         for kind, fields in records:
             self.write(kind, **fields)
+
+    def inventory(self):
+        # GTK/ATK-side oracle: no AT-SPI client or worker refs are consulted.
+        origin = self.window.get_window().get_origin()
+        root_x, root_y = origin[-2:]
+        widgets = []
+        def walk(widget, parent=None):
+            allocation = widget.get_allocation()
+            point = widget.translate_coordinates(self.window, 0, 0) or (0, 0)
+            accessible = widget.get_accessible()
+            index = len(widgets)
+            widgets.append(dict(id=index, parent=parent,
+                gtk_class=type(widget).__name__, role=accessible.get_role().value_nick.replace('-', '_'),
+                name=accessible.get_name() or '',
+                bounds=[root_x+point[0], root_y+point[1], allocation.width, allocation.height],
+                visible=widget.get_visible(), mapped=widget.get_mapped()))
+            if isinstance(widget, Gtk.Container):
+                for child in widget.get_children():
+                    walk(child, index)
+        walk(self.window)
+        self.write("widget_inventory", widgets=widgets)
+        return GLib.SOURCE_REMOVE
 
     def schedule_label(self):
         GLib.timeout_add(self.random.randint(self.args.label_min_ms, self.args.label_max_ms), self.change_label)
@@ -179,7 +206,7 @@ class Fixture:
         return GLib.SOURCE_CONTINUE
 
     def hang(self):
-        self.write("hang", signal="SIGUSR1")
+        self.write("hang", signal="SIGUSR1", trigger="SIGUSR1_or_startup_timer")
         # SIGTERM retains its default action so sessiond can still tear us down.
         while True:
             signal.pause()
