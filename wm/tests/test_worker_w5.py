@@ -537,6 +537,62 @@ class ProviderCase(unittest.TestCase):
         self.assertEqual(msg['tool_calls'][0]['id'], 'x')
         self.assertEqual(usage['prompt_tokens'], 7)
 
+    def test_effort_defaults_to_medium_for_hosted_chat_presets(self):
+        for preset in ('openai', 'deepseek', 'openrouter'):
+            with self.subTest(preset=preset):
+                config = self.config(preset)
+                body = loop.request_body(config, a.TOOLS, self.history())
+                self.assertEqual(body['reasoning_effort'], 'medium')
+                self.assertFalse(config['effort_fallback'])
+
+    def test_explicit_effort_values_are_honored(self):
+        for preset in ('openai', 'deepseek', 'openrouter'):
+            for effort in ('low', 'medium', 'high'):
+                with self.subTest(preset=preset, effort=effort):
+                    config = loop.provider_config(dict(CU_MODEL_PROVIDER=preset, CU_MODEL='model',
+                        CU_MODEL_API_KEY='private-key', CU_MODEL_EFFORT=effort))
+                    self.assertEqual(loop.request_body(config, [], [])['reasoning_effort'], effort)
+                    self.assertFalse(config['effort_fallback'])
+
+    def test_none_omits_effort_parameter(self):
+        for preset in ('openai', 'deepseek', 'openrouter'):
+            with self.subTest(preset=preset):
+                config = loop.provider_config(dict(CU_MODEL_PROVIDER=preset, CU_MODEL='model',
+                    CU_MODEL_API_KEY='private-key', CU_MODEL_EFFORT='none'))
+                self.assertNotIn('reasoning_effort', loop.request_body(config, [], []))
+                self.assertEqual(config['effort'], 'none')
+                self.assertFalse(config['effort_fallback'])
+
+    def test_empty_and_invalid_effort_fall_back_to_medium(self):
+        for effort in ('', 'invalid', 'HIGH', ' medium '):
+            with self.subTest(effort=effort):
+                config = loop.provider_config(dict(CU_MODEL_PROVIDER='openai', CU_MODEL='model',
+                    CU_MODEL_API_KEY='private-key', CU_MODEL_EFFORT=effort))
+                self.assertEqual(loop.request_body(config, [], [])['reasoning_effort'], 'medium')
+                self.assertTrue(config['effort_fallback'])
+
+    def test_llama_never_sends_effort(self):
+        baseline = loop.request_body(self.config('llama'), a.TOOLS, self.history())
+        self.assertNotIn('reasoning_effort', baseline)
+        for effort in ('low', 'medium', 'high', 'none', '', 'invalid'):
+            with self.subTest(effort=effort):
+                config = loop.provider_config(dict(CU_MODEL_PROVIDER='llama', CU_MODEL='vision-model',
+                    CU_MODEL_EFFORT=effort))
+                self.assertEqual(config['effort'], 'none')
+                self.assertEqual(loop.request_body(config, a.TOOLS, self.history()), baseline)
+
+    def test_anthropic_payload_unchanged_by_effort(self):
+        expected = dict(model='model', messages=[], max_tokens=4096, temperature=.1, top_p=1,
+                        system='System', tools=[])
+        for effort in (None, 'low', 'medium', 'high', 'none', '', 'invalid'):
+            with self.subTest(effort=effort):
+                env = dict(CU_MODEL_PROVIDER='anthropic', CU_MODEL='model', CU_MODEL_API_KEY='private-key')
+                if effort is not None:
+                    env['CU_MODEL_EFFORT'] = effort
+                config = loop.provider_config(env)
+                self.assertEqual(config['effort'], 'none')
+                self.assertEqual(loop.request_body(config, [], [dict(role='system', content='System')]), expected)
+
     def test_openai_multi_tool_images_follow_all_matching_results(self):
         h = self.history()
         h[2]['tool_calls'].append(dict(id='c2', type='function', function=dict(name='wait', arguments='{}')))
@@ -615,6 +671,38 @@ class LoopCase(unittest.TestCase):
         self.assertEqual(result['done'], dict(status='success', summary='Verified'))
         self.assertEqual(result['token_usage'], dict(prompt_tokens=6, completion_tokens=8))
         self.assertEqual(p.complete.call_count, 2)
+
+    def test_run_summary_reports_effective_effort_and_fallback(self):
+        for preset in loop.PRESETS:
+            for effort in (None, 'low', 'high', 'none', '', 'invalid'):
+                for failed in (False, True):
+                    with self.subTest(preset=preset, effort=effort, failed=failed):
+                        env = dict(CU_MODEL_PROVIDER=preset, CU_MODEL='model', CU_MODEL_API_KEY='private-key')
+                        if effort is not None:
+                            env['CU_MODEL_EFFORT'] = effort
+                        c, p = self.setup_loop([(self.call('done', status='success', summary='Verified'), {})])
+                        p.config = loop.provider_config(env)
+                        if failed:
+                            p.complete.side_effect = a.AdapterError('provider_http_429')
+                        with patch.object(loop, 'check_kill'):
+                            summary = loop.run_loop(c, p, 'Task')
+                        expected = 'none' if preset in ('llama', 'anthropic') else effort if effort in ('low', 'high', 'none') else 'medium'
+                        self.assertEqual(summary['effort'], expected)
+                        self.assertEqual('notes' in summary, effort in ('', 'invalid'))
+                        if 'notes' in summary:
+                            self.assertIn('CU_MODEL_EFFORT empty or invalid; using default medium', summary['notes'][0])
+                        self.assertEqual(summary['reason'], 'provider_http_429' if failed else None)
+
+    def test_startup_failure_summary_retains_effort_fallback_note(self):
+        env = dict(CU_MODEL_PROVIDER='openai', CU_MODEL='model', CU_MODEL_API_KEY='private-key', CU_MODEL_EFFORT='')
+        with patch.object(sys, 'argv', ['ark-loop', '--session', 's1', '--task', 'Task']), \
+                patch.dict(os.environ, env, clear=True), patch.object(loop, 'check_kill'), \
+                patch.object(loop, 'MCPClient', side_effect=OSError), patch('sys.stdout', new_callable=io.StringIO) as out:
+            self.assertEqual(loop.main(), 1)
+        summary = json.loads(out.getvalue())
+        self.assertEqual(summary['effort'], 'medium')
+        self.assertIn('using default medium', summary['notes'][0])
+        self.assertEqual(summary['reason'], 'loop_start_failed')
 
     def test_hard_turn_cap_40_even_if_requested_higher(self):
         c, p = self.setup_loop([(self.call('observe'), {})]*50)

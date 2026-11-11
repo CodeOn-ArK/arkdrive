@@ -71,9 +71,24 @@ def provider_config(env=None):
             raise ValueError
     except (ValueError, TypeError, OverflowError):
         http_timeout = 120
+    effort = env.get('CU_MODEL_EFFORT', 'medium')
+    effort_fallback = effort not in ('low', 'medium', 'high', 'none')
+    if effort_fallback:
+        effort = 'medium'
+    if provider in ('llama', 'anthropic'):
+        effort = 'none'
     return dict(provider=provider, server=server, model=model, key=key,
                 token_budget=token_budget, http_timeout=http_timeout,
+                effort=effort, effort_fallback=effort_fallback,
                 images=provider in ('llama', 'openai', 'openrouter', 'anthropic'))
+
+
+def effort_summary(config):
+    summary = dict(effort=config.get('effort', 'none'))
+    if config.get('effort_fallback'):
+        summary['notes'] = ['CU_MODEL_EFFORT empty or invalid; using default medium '
+                            '(sent only for openai, deepseek, openrouter).']
+    return summary
 
 
 def tool_results(history):
@@ -181,6 +196,8 @@ def request_body(config, tools, history):
         body.update(tools=[dict(type='function', function=dict(name=t['name'], description=t['description'], parameters=t['inputSchema'])) for t in tools], tool_choice='auto')
         if config['provider'] == 'llama':
             body.update(n_predict=4096, cache_prompt=True, top_k=40, repeat_penalty=1.0)
+        elif config['effort'] != 'none':
+            body['reasoning_effort'] = config['effort']
     return body
 
 
@@ -315,7 +332,7 @@ class MCPClient:
 def run_loop(client, provider, task, max_turns=40):
     cap = min(max_turns, 40)
     summary = dict(turns_used=0, tool_calls_made=0, frames_viewed=0, token_usage={}, max_turns=cap,
-                   done=None, reason=None)
+                   done=None, reason=None, **effort_summary(provider.config))
     history = [dict(role='system', content=SYSTEM), dict(role='user', content=task)]
     pending_results = []
     failed_call, failures = None, 0
@@ -389,9 +406,10 @@ def main():
         args = parser.parse_args()
     except AdapterError:
         print(encoded(dict(turns_used=0, tool_calls_made=0, frames_viewed=0, token_usage={}, done=None,
-                           reason='invalid_arguments')).decode())
+                           reason='invalid_arguments', effort='none')).decode())
         return 1
     client = None
+    config = {}
     try:
         if args.max_turns < 1:
             raise AdapterError('invalid_max_turns')
@@ -401,7 +419,8 @@ def main():
         summary = run_loop(client, Provider(config), args.task, args.max_turns)
     except (AdapterError, OSError) as exc:
         summary = dict(turns_used=0, tool_calls_made=0, frames_viewed=0, token_usage={}, done=None,
-                       reason=exc.reason if isinstance(exc, AdapterError) else 'loop_start_failed')
+                       reason=exc.reason if isinstance(exc, AdapterError) else 'loop_start_failed',
+                       **effort_summary(config))
     finally:
         if client:
             client.close()

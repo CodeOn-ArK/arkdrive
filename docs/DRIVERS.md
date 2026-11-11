@@ -71,6 +71,21 @@ executor's JSON tool format (see `SYSTEM_PROMPT` in
 `src/cu_executor.py`). That requirement — not the vendor — is what
 makes a model compatible with the loop.
 
+### ark-loop environment: reasoning effort
+
+`CU_MODEL_EFFORT` controls the stack's own provider calls in `wm/ark-loop`.
+It defaults to `medium`; accepted effort values are `low`, `medium`, and
+`high`. An empty or invalid value falls back to `medium`, with a fallback
+note in the run summary. Set `none` to omit the parameter entirely.
+
+For the `openai`, `deepseek`, and `openrouter` presets, chat completions
+requests include `reasoning_effort` with the selected value unless disabled.
+The `llama` preset never sends it: the local server is not a reasoning-effort
+API. Anthropic requests remain unchanged; there is no thinking-budget mapping.
+The run summary's `effort` field reports the effective value, or `none` when
+disabled or using llama/Anthropic. A fallback adds a `notes` entry explaining
+the default. This setting does not affect R&D or external coding tools.
+
 ---
 
 ## 2. Agentic drivers: the tool-layer contract
