@@ -472,6 +472,78 @@ class PostDispatchVerification(tree_tests.ProviderHarness):
         self.assertEqual(self.samples, [(False, False), (False, False)])
         self.assertGreater(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
 
+    def window_focus_transition(self, destination):
+        # A window/point click lets the click itself focus the client. Ref
+        # clicks explicitly focus it before dispatch and would hide this bug.
+        cache = self.w.cache
+        cache.upsert(11, dict(cache.windows[10], xid=11, family='x:11', title='Old focus'))
+        old = cache.handle(11)
+        cache.set('focus', old)
+        if destination == 'target':
+            new = self.handle
+        else:
+            family = cache.windows[10]['family'] if destination == 'family' else 'x:12'
+            cache.upsert(12, dict(cache.windows[10], xid=12, family=family,
+                                 title='New focus', type='dialog' if destination == 'family' else 'normal',
+                                 transient_for=10 if destination == 'family' else None))
+            new = cache.handle(12)
+        cache.baseline()
+        expect = self.predicate()
+        facets = []
+        def refresh():
+            cache.set('focus', new)
+            if not facets:
+                self.raw['children'][1]['name'] = 'Newer but still unfocused'
+            else:
+                self.raw['children'][0]['states'].append('focused')
+            self.publish(self.raw)
+            dispatched = self.e.active['receipt']['steps'][0]['rev']['dispatched']
+            facets.append(cache.facets['tree['+self.handle+']'])
+            self.samples.append(self.e.verification_verdict(expect, False, dispatched))
+        self.t.refresh_hook = refresh
+        click = dict(self.click(), target=self.handle,
+                     intent=dict(kind='click', at=dict(point=dict(space='desktop', x=20, y=20))))
+        result = self.run_action(self.params([click]))
+        step = result['steps'][0]
+        self.assertEqual(step['target_resolved'], self.handle)
+        self.assertEqual((step['focus']['before'], step['focus']['after']), (old, new))
+        self.assertNotIn('confirmed', step['focus'])
+        self.assertTrue(all(facet > step['rev']['dispatched'] for facet in facets))
+        return result
+
+    def test_unfocused_window_click_tree_expect_target_focus_verifies(self):
+        result = self.window_focus_transition('target')
+        self.assertEqual((result['status'], result['effect']['status']), ('success', 'verified'), result)
+        self.assertEqual(self.samples, [(False, False), (True, False)])
+
+    def test_unfocused_window_click_tree_expect_foreign_focus_contradicts(self):
+        result = self.window_focus_transition('foreign')
+        self.assertEqual((result['effect']['status'], result['reason']),
+                         ('contradicted', 'effect_contradicted'), result)
+        self.assertEqual(self.samples, [(False, False)])
+        self.assertLess(result['steps'][0]['timing_ms']['total'], 300)
+
+    def test_unfocused_window_click_tree_expect_target_family_focus_verifies(self):
+        result = self.window_focus_transition('family')
+        self.assertEqual((result['status'], result['effect']['status']), ('success', 'verified'), result)
+        self.assertEqual(self.samples, [(False, False), (True, False)])
+
+    def test_transition_new_modal_target_itself_is_explained(self):
+        r = dict(target=self.handle, focus=dict(before=self.handle), modal=dict(before=[]))
+        self.w.cache.set('modal', [self.handle])
+        self.assertIs(self.e.transition_expected(r, self.predicate()), True)
+
+    def test_transition_new_modal_family_member_is_not_explained(self):
+        # Focus within the target family is permitted; a new modal in that
+        # family still needs its own STATE expectation on the opening step.
+        r = dict(target=self.handle, focus=dict(before=self.handle), modal=dict(before=[]))
+        self.w.cache.upsert(11, dict(self.w.cache.windows[10], xid=11, type='dialog',
+                                    title='Unexpected', transient_for=10, is_modal=True))
+        h = self.w.cache.handle(11)
+        self.w.cache.set('focus', h)
+        self.w.cache.set('modal', [h])
+        self.assertIs(self.e.transition_expected(r, self.predicate()), False)
+
     def old_holder_then_target_focuses(self):
         self.raw['children'][1]['states'] = ['focused']
         self.p.cache.update(self.handle, self.raw, 1)

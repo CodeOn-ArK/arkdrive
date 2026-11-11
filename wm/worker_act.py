@@ -1800,9 +1800,18 @@ class Engine:
         # A named disappearing modal permits focus to return to its parent.
         removed = old_modal - new_modal
         removed_named = bool(removed) and all(names(h, False) for h in removed)
+        # Focusing the step's target or its family is an explained transition,
+        # including when a pure tree expectation cannot name X state.
+        target = next((w for w in windows.values() if w["handle"] == r["target"] and w["mapped"]), None)
+        focused = next((w for w in windows.values() if w["handle"] == new_focus and w["mapped"]), None)
+        target_focus = new_focus is not None and (new_focus == r["target"] or
+                       bool(target and focused and target["family"] == focused["family"]))
         focus_ok = ((appearance and new_focus is None) or old_focus == new_focus or
-                    names(new_focus, True) or names(old_focus, False) or removed_named)
-        return focus_ok and all(names(h, True) for h in new_modal - old_modal) and all(names(h, False) for h in removed)
+                    target_focus or names(new_focus, True) or names(old_focus, False) or removed_named)
+        # A newly modal target is explained, but a new modal child must still
+        # be named: the opening step targets its parent, including D5 popups.
+        return (focus_ok and all(h == r["target"] or names(h, True) for h in new_modal - old_modal)
+                and all(names(h, False) for h in removed))
 
     def evidence(self, p, sampled=False):
         p = self.effective_predicate(p)

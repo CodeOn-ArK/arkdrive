@@ -1613,10 +1613,25 @@ class Dispatch(Harness):
 
 
 class FreshnessAndPredicates(Harness):
+    def test_verified_move_continues_on_target_family_focus(self):
+        # later() belongs to the target's x:10 family. Round 3 permits that
+        # focus transition; the former unexpected_state assertion was wrong.
+        def change(ev):
+            if ev[0] == "motion":
+                self.later()
+                self.w.cache.set("focus", self.w.cache.handle(11))
+                self.w.cache.commit()
+        self.t.on_write = change
+        r = self.run_action(self.params([self.move(), self.move(30)]))
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["steps_verified"], 2)
+        self.assertEqual(r["steps"][0]["target_resolved"], self.handle)
+
     def test_verified_move_stops_on_unexpected_focus(self):
         def change(ev):
             if ev[0] == "motion":
                 self.later()
+                self.w.cache.upsert(11, dict(self.w.cache.windows[11], family="x:11"))
                 self.w.cache.set("focus", self.w.cache.handle(11))
                 self.w.cache.commit()
         self.t.on_write = change
