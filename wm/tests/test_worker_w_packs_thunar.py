@@ -207,11 +207,13 @@ class SkillTests(unittest.TestCase):
         self.adapter = adapter_with_rpc()
         self.adapter.sd = self.directory
         self.observations = [listing()]
+        self.observes = []
         self.acts = []
         self.status = 'success'
         self.mutate = lambda: None
         def rpc(method, params, **kwargs):
             if method == 'window.observe':
+                self.observes.append(copy.deepcopy(params))
                 return copy.deepcopy(self.observations.pop(0) if len(self.observations) > 1 else self.observations[0])
             if method == 'window.act':
                 self.acts.append(copy.deepcopy(params))
@@ -297,6 +299,76 @@ class SkillTests(unittest.TestCase):
         self.assertEqual(thunar.create_folder(self.adapter, dict(name='new')), dict(status='success', verified=True))
         self.assertEqual([s['steps'][0]['id'] for s in self.acts], ['details', '1'])
 
+    def test_dirty_initial_page_reobserves_then_runs_mutation(self):
+        for run, args in ((thunar.rename, dict(old='old', new='new')),
+                          (thunar.create_folder, dict(name='new'))):
+            with self.subTest(skill=run.__name__):
+                dirty = listing(('new',))  # Must not retain a stale collision.
+                dirty['tree']['dirty'] = True
+                self.observations = [dirty, listing(rev=12)]
+                self.observes, self.acts = [], []
+                self.assertEqual(run(self.adapter, args), dict(status='success', verified=False))
+                self.assertEqual(len(self.observes), 2)
+                self.assertEqual(len(self.acts), 1)
+                for observe in self.observes:
+                    self.assertIsNone(observe['since_rev'])
+                    self.assertEqual(observe['scope'], dict(kind='session'))
+                    self.assertEqual(observe['channels'], ['state', 'tree'])
+                self.assertEqual(self.acts[0]['base_rev'], 12)
+
+    def test_dirty_icon_page_reobserves_before_details_switch_and_mutation(self):
+        icon = listing(())
+        icon['tree']['lines'] = ['n1 frame "Files" @0,0,100,100']
+        dirty = copy.deepcopy(icon)
+        dirty['tree']['dirty'] = True
+        self.observations = [dirty, icon, listing()]
+        self.mutate = lambda: (self.directory / 'home/new').mkdir(exist_ok=True)
+        self.assertEqual(thunar.create_folder(self.adapter, dict(name='new')),
+                         dict(status='success', verified=True))
+        self.assertEqual(len(self.observes), 3)
+        self.assertEqual(len(self.acts), 2)
+        self.assertEqual([s['steps'][0]['id'] for s in self.acts], ['details', '1'])
+
+    def test_dirty_initial_page_exhausts_exactly_five_observes_without_act(self):
+        for run, args in ((thunar.rename, dict(old='old', new='new')),
+                          (thunar.create_folder, dict(name='new'))):
+            with self.subTest(skill=run.__name__):
+                dirty = listing()
+                dirty['tree']['dirty'] = True
+                self.observations = [dirty]
+                self.observes = []
+                self.assertEqual(run(self.adapter, args), dict(status='listing_unavailable', detail='tree_dirty'))
+                self.assertEqual(len(self.observes), 5)
+                self.assertEqual(self.acts, [])
+
+    def test_clean_fifth_initial_page_can_run_mutation(self):
+        dirty = listing()
+        dirty['tree']['dirty'] = True
+        self.observations = [dirty] * 4 + [listing()]
+        self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
+                         dict(status='success', verified=False))
+        self.assertEqual(len(self.observes), 5)
+        self.assertEqual(len(self.acts), 1)
+
+    def test_dirty_initial_page_other_failures_still_fail_fast(self):
+        for change, expected in (
+                (dict(settled=False), dict(status='observe_required')),
+                (dict(resync_required=True), dict(status='observe_required')),
+                (dict(state=listing(focus='w2')['state']), dict(status='inactive_pack')),
+                (dict(state=dict(listing()['state'], modal=['dialog'])),
+                 dict(status='blocked', detail='session modal is present')),
+                (dict(tree=dict(listing()['tree'], window='w2', dirty=True)),
+                 dict(status='listing_unavailable'))):
+            with self.subTest(change=change):
+                value = listing()
+                value['tree']['dirty'] = True
+                value.update(change)
+                self.observations = [value, listing()]
+                self.observes = []
+                self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')), expected)
+                self.assertEqual(len(self.observes), 1)
+                self.assertEqual(self.acts, [])
+
     def test_unknown_contradicted_and_failed_never_replay_or_run_oracle(self):
         for run, args in ((thunar.rename, dict(old='old', new='new')),
                           (thunar.create_folder, dict(name='new'))):
@@ -367,6 +439,63 @@ class SkillTests(unittest.TestCase):
         call = self.adapter.rpc.call.call_args_list[-1]
         self.assertEqual(call.args[1]['scope'], dict(kind='window', window='w1'))
         self.assertEqual(call.args[1]['cursor'], 'next')
+
+    def test_dirty_continuation_discards_entire_page_set_and_restarts(self):
+        stale = listing(('new', 'stale'))
+        middle, dirty = copy.deepcopy(stale), copy.deepcopy(stale)
+        middle['tree'].update(lines=stale['tree']['lines'][3:6], cursor='last', truncated=True)
+        dirty['tree'].update(lines=stale['tree']['lines'][6:], dirty=True)
+        stale['tree'].update(lines=stale['tree']['lines'][:3], cursor='next', truncated=True)
+        fresh = listing(rev=12)
+        last = copy.deepcopy(fresh)
+        last['tree']['lines'] = fresh['tree']['lines'][3:]
+        fresh['tree'].update(lines=fresh['tree']['lines'][:3], cursor='next', truncated=True)
+        self.observations = [stale, middle, dirty, fresh, last]
+        self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
+                         dict(status='success', verified=False))
+        self.assertEqual(len(self.observes), 5)
+        self.assertEqual([p.get('cursor') for p in self.observes], [None, 'next', 'last', None, 'next'])
+        for i in (0, 3):
+            self.assertIsNone(self.observes[i]['since_rev'])
+            self.assertEqual(self.observes[i]['scope'], dict(kind='session'))
+        self.assertEqual(len(self.acts), 1)
+        self.assertEqual(self.acts[0]['base_rev'], 12)
+
+    def test_dirty_continuation_allows_only_three_restarts(self):
+        for exhaust in (False, True):
+            with self.subTest(exhaust=exhaust):
+                first = listing()
+                first['tree'].update(cursor='next', truncated=True)
+                dirty = listing()
+                dirty['tree']['dirty'] = True
+                clean = listing()
+                clean['tree']['lines'] = []
+                self.observations = [first, dirty] * 3 + [first, dirty if exhaust else clean]
+                self.observes, self.acts = [], []
+                result = thunar.rename(self.adapter, dict(old='old', new='new'))
+                expected = (dict(status='listing_unavailable', detail='state changed during tree paging')
+                            if exhaust else dict(status='success', verified=False))
+                self.assertEqual(result, expected)
+                self.assertEqual(len(self.observes), 8)
+                self.assertEqual(sum('cursor' not in p for p in self.observes), 4)
+                self.assertEqual(len(self.acts), 0 if exhaust else 1)
+
+    def test_dirty_continuation_other_state_changes_still_fail_fast(self):
+        for section, field, value in ((None, 'settled', False), (None, 'resync_required', True),
+                                      (None, 'rev', 12), ('tree', 'rev', 12),
+                                      ('tree', 'window', 'w2'), ('state', 'focus', 'w2'),
+                                      ('state', 'modal', ['dialog'])):
+            with self.subTest(section=section, field=field):
+                first, dirty = listing(), listing()
+                first['tree'].update(cursor='next', truncated=True)
+                dirty['tree']['dirty'] = True
+                (dirty if section is None else dirty[section])[field] = value
+                self.observations = [first, dirty, listing()]
+                self.observes = []
+                self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
+                                 dict(status='listing_unavailable', detail='state changed during tree paging'))
+                self.assertEqual(len(self.observes), 2)
+                self.assertEqual(self.acts, [])
 
     def test_changed_paged_state_is_rejected_before_act(self):
         value = listing()

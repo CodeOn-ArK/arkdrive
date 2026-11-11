@@ -28,40 +28,51 @@ def _shown(adapter, name, args):
 
 def _observe(adapter):
     """A complete fresh tree page set, without scrolling virtualized rows."""
-    result = _shown(adapter, 'observe', dict(full=True, scope=dict(kind='session'),
-                                           channels=['state', 'tree']))
-    if not result.get('settled') or result.get('resync_required'):
-        return None, dict(status='observe_required')
-    state = result.get('state', {})
-    focus = state.get('focus')
-    window = next((w for w in state.get('windows', []) if w['handle'] == focus), {})
-    if window.get('class', '').casefold() not in [c.casefold() for c in CLASSES]:
-        return None, dict(status='inactive_pack')
-    if state.get('modal'):
-        return None, dict(status='blocked', detail='session modal is present')
-    tree = result.get('tree', {})
-    if tree.get('window') != focus or tree.get('dirty'):
-        return None, dict(status='listing_unavailable')
-    lines = list(tree.get('lines', []))
-    cursor, seen = tree.get('cursor'), set()
-    while cursor:
-        if cursor in seen:
-            return None, dict(status='listing_unavailable', detail='repeated tree cursor')
-        seen.add(cursor)
-        page = _shown(adapter, 'observe', dict(cursor=cursor, channels=['state', 'tree'],
-                      scope=dict(kind='window', window=focus)))
-        more = page.get('tree', {})
-        if (not page.get('settled') or page.get('resync_required') or
-                page.get('rev') != result.get('rev') or more.get('rev') != tree.get('rev') or
-                more.get('window') != focus or more.get('dirty') or
-                page.get('state', {}).get('focus', focus) != focus or
-                page.get('state', {}).get('modal')):
-            return None, dict(status='listing_unavailable', detail='state changed during tree paging')
-        lines.extend(more.get('lines', []))
-        cursor = more.get('cursor')
-    if tree.get('truncated') and not tree.get('cursor'):
-        return None, dict(status='listing_unavailable', detail='tree continuation missing')
-    return (focus, _listing(lines)), None
+    for restart in range(4):  # Initial page set plus at most three dirty-page restarts.
+        for _ in range(5):
+            result = _shown(adapter, 'observe', dict(full=True, scope=dict(kind='session'),
+                                                   channels=['state', 'tree']))
+            if not result.get('settled') or result.get('resync_required'):
+                return None, dict(status='observe_required')
+            state = result.get('state', {})
+            focus = state.get('focus')
+            window = next((w for w in state.get('windows', []) if w['handle'] == focus), {})
+            if window.get('class', '').casefold() not in [c.casefold() for c in CLASSES]:
+                return None, dict(status='inactive_pack')
+            if state.get('modal'):
+                return None, dict(status='blocked', detail='session modal is present')
+            tree = result.get('tree', {})
+            if tree.get('window') != focus:
+                return None, dict(status='listing_unavailable')
+            if not tree.get('dirty'):
+                break
+        else:
+            return None, dict(status='listing_unavailable', detail='tree_dirty')
+        lines = list(tree.get('lines', []))
+        cursor, seen = tree.get('cursor'), set()
+        while cursor:
+            if cursor in seen:
+                return None, dict(status='listing_unavailable', detail='repeated tree cursor')
+            seen.add(cursor)
+            page = _shown(adapter, 'observe', dict(cursor=cursor, channels=['state', 'tree'],
+                          scope=dict(kind='window', window=focus)))
+            more = page.get('tree', {})
+            if (not page.get('settled') or page.get('resync_required') or
+                    page.get('rev') != result.get('rev') or more.get('rev') != tree.get('rev') or
+                    more.get('window') != focus or
+                    page.get('state', {}).get('focus', focus) != focus or
+                    page.get('state', {}).get('modal')):
+                return None, dict(status='listing_unavailable', detail='state changed during tree paging')
+            if more.get('dirty'):
+                if restart == 3:
+                    return None, dict(status='listing_unavailable', detail='state changed during tree paging')
+                break  # Discard all lines/cursors and start a fresh full page set.
+            lines.extend(more.get('lines', []))
+            cursor = more.get('cursor')
+        else:
+            if tree.get('truncated') and not tree.get('cursor'):
+                return None, dict(status='listing_unavailable', detail='tree continuation missing')
+            return (focus, _listing(lines)), None
 
 
 def _listing(lines):

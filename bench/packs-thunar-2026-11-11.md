@@ -142,3 +142,46 @@ Log: `wm/tests/.tmp/packs-thunar-full-suite.log`.
   `wm/ark-act call use_skill '{"name":"thunar.create_folder","args":{"name":"Reports"}}' --session s1`.
 - **Measurement pilot — NOT RUN; separate later step.** No paired generalist
   versus pack runs, benefit claims or measurement pilot were attempted.
+
+## Fix round 2
+
+Raj's November 11 live skill gate found that settled Thunar observes routinely
+serve a tree page with `dirty:true` while icon view invalidates its AT-SPI
+snapshot. That flag is a freshness caveat; immediately rejecting it prevented
+the skills from reaching their work, including the create skill's Details
+switch.
+
+`wm/packs/thunar.py` now retries a dirty initial tree page with the same full
+session observe, up to **five observes total per page-set attempt**. Exhaustion
+returns `listing_unavailable` with detail `tree_dirty`, without input. A dirty
+continuation discards the entire page set (lines and seen cursors) and starts
+again from a full session observe, with **at most three restarts**. Exhausting
+that restart limit preserves `listing_unavailable` / `state changed during
+tree paging`. Each new page set establishes its own revision baseline.
+All existing settled/resync, class, modal, window, revision, focus, repeated
+cursor and missing-continuation checks remain; other failures still stop
+immediately, even on a dirty page. Batches, timeouts, skill short-circuits and
+filesystem oracles are unchanged. No worker or adapter changes.
+
+The headless pack test file now has **37 passing tests** (eight added),
+covering dirty-to-clean recovery for both skills, recovery through the icon
+to Details switch and mutation, exactly five observes and zero acts for a
+permanently dirty initial page, success on the fifth initial observe, full
+page-set discard with a fresh revision and reused cursor, the three-restart
+boundary, and fail-fast validation alongside dirty flags. Observe and act
+counts are asserted.
+
+Full headless validation, with temporary paths in the checkout and bytecode
+disabled:
+
+```sh
+TMPDIR="$PWD/wm/tests/.tmp" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wm/tests
+```
+
+**1036 tests in 132.848 s: 1035 passed, 1 skipped**, exit 0,
+`OK (skipped=1)`. The existing sandbox-dependent ptrace/strace check remains
+skipped. Log: `wm/tests/.tmp/packs-thunar-fix2-full-suite.log`.
+
+**Raj's live skill gate re-run — NOT RUN.** No live session or display was
+opened or driven, including display `:0`. Nothing staged or committed.
+Existing unrelated checkout changes were preserved.
