@@ -294,10 +294,27 @@ def rename(adapter, args):
     if any(item['name'] == args['new'] for item in data['items']):
         return dict(status='collision')
     item = matches[0]
-    steps = [dict(id='0', target=dict(window=window, ref=item['ref']), timeout_ms=2000,
-                  intent=dict(kind='click'),
-                  expect=dict(kind='node_state', window=window, ref=item['ref'], state='selected')),
-             dict(id='1', target=dict(window=window, ref=item['row']), timeout_ms=2000,
+    result = _shown(adapter, 'act', dict(steps=[dict(id='0',
+        target=dict(window=window, ref=item['ref']), timeout_ms=2000,
+        intent=dict(kind='click'),
+        expect=dict(kind='node_state', window=window, ref=item['ref'], state='selected'))]))
+    if not _verified(result, ['0']):
+        return _uncertain_outcome(adapter, args, _outcome(result), args['new'], args['old'])
+    # Selection is a separate act so the proven rename batch fits its deadline.
+    # Re-resolve refs and names because the listing may have changed meanwhile.
+    listing, error = _observe(adapter)
+    if error:
+        return _uncertain_outcome(adapter, args, error, args['new'], args['old'])
+    window, data = listing
+    matches = [item for item in data['items'] if item['name'] == args['old']]
+    if not matches:
+        return dict(status='not_found', candidates=[i['name'] for i in data['items'][:5]])
+    if len(matches) != 1:
+        return dict(status='ambiguous')
+    if any(item['name'] == args['new'] for item in data['items']):
+        return dict(status='collision')
+    item = matches[0]
+    steps = [dict(id='1', target=dict(window=window, ref=item['row']), timeout_ms=2000,
                   require=dict(selected_ref=item['ref']), intent=dict(kind='key', keys=['F2']),
                   expect=dict(kind='dialog_present', parent=window, role='rename',
                               bind=dict(dialog='dialog', entry=dict(role='text')))),
@@ -310,7 +327,7 @@ def rename(adapter, args):
                       dict(kind='node_present', window=window, selector=dict(provider='atspi',
                            role='table_cell', name=args['new']))]))]
     result = _shown(adapter, 'act', dict(steps=steps))
-    if not _verified(result, ['0', '1', '2', '3']):
+    if not _verified(result, ['1', '2', '3']):
         return _uncertain_outcome(adapter, args, _outcome(result), args['new'], args['old'])
     return dict(status='success', verified=_oracle(adapter, args, args['new'], args['old']))
 

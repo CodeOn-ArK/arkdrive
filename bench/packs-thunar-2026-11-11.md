@@ -346,3 +346,48 @@ skipped. Log: `wm/tests/.tmp/packs-thunar-fix5-full-suite.log`.
 **Raj's live skill gate re-run — NOT RUN.** No live session or display was
 opened or driven, including display `:0`. Nothing staged or committed.
 Existing unrelated checkout changes were preserved.
+
+## Fix round 6
+
+Raj's November 11 live gate found that adding selection to the rename batch
+made its step timeouts total 11,000 ms. The worker's 500 ms deadline allowance
+then exceeds the 10,000 ms hard cap, so the adapter returns `invalid_params`
+before any input dispatches.
+
+Rename now verifies selection in its own single-step act: step `0` clicks the
+name-cell `{window, ref}`, expects `node_state` / `selected`, and retains its
+2000 ms timeout. A failed or incomplete selection receipt returns the compact
+outcome through the existing uncertainty/oracle rule without issuing the
+rename batch. After verified selection, a fresh listing resolves current refs
+and repeats the old-name uniqueness and new-name absence checks. A vanished,
+ambiguous or colliding target returns the corresponding short-circuit status.
+Post-selection observe failures retain the existing uncertainty/oracle rule.
+
+The rename batch contains exactly the proven steps `1`–`3`, built from that
+fresh listing, with the original 2000/3500/3500 ms timeouts and selected-ref
+guard. Verification requires `['1', '2', '3']` on that batch. Its timeout sum
+is 9000 ms (9500 ms with the allowance); selection alone sums to 2000 ms.
+Create-folder, the playbook, worker and adapter code are unchanged.
+
+Headless pack tests: **57 passed**. Assertions cover the separate selection
+and rename act sequence, exact step shapes and deadline sums, changed refs
+and revision after selection, failed/incomplete selection without a rename
+batch, refreshed not-found/ambiguity/collision checks, and oracle handling
+after selection or post-selection observe failures. Existing final-outcome,
+dirty/paged listing, dispatch retry, MCP and one-shot regressions remain
+covered with the two-act rename flow.
+
+Full headless validation, with temporary paths in the checkout and bytecode
+disabled:
+
+```sh
+TMPDIR="$PWD/wm/tests/.tmp" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wm/tests
+```
+
+**1056 tests in 132.824 s: 1055 passed, 1 skipped**, exit 0,
+`OK (skipped=1)`. The existing sandbox-dependent ptrace/strace check remains
+skipped. Log: `wm/tests/.tmp/packs-thunar-fix6-full-suite.log`.
+
+**Raj's live skill gate re-run — NOT RUN.** No live session or display was
+opened or driven, including display `:0`. Nothing staged or committed.
+Existing unrelated checkout changes were preserved.

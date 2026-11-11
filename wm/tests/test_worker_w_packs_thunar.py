@@ -261,7 +261,8 @@ class SkillTests(unittest.TestCase):
                 if params['steps'][0]['intent'].get('keys') == ['Control_L', 'Shift_L', 'n']:
                     self.creating = self.status == 'success'
                 else:
-                    self.mutate()
+                    if params['steps'][0]['intent']['kind'] != 'click':
+                        self.mutate()
                     if params['steps'][0]['intent']['kind'] == 'invoke':
                         self.creating = False
                 value = verified(params['steps'], self.status)
@@ -273,7 +274,7 @@ class SkillTests(unittest.TestCase):
             raise AssertionError(method)
         self.adapter.rpc.call.side_effect = rpc
 
-    def test_exact_rename_batch_row_target_name_cell_guard_and_oracle(self):
+    def test_exact_rename_selection_then_batch_row_target_name_cell_guard_and_oracle(self):
         self.observations = [listing()]
         self.observations[0]['tree']['lines'][3] = self.observations[0]['tree']['lines'][3].replace(' [selected]', '')
         (self.directory / 'home/old').touch()
@@ -293,8 +294,13 @@ class SkillTests(unittest.TestCase):
                  intent=dict(kind='key', keys=['Return']), expect=dict(kind='all', of=[
                      dict(kind='dialog_absent', handle=dict(from_step='1', name='dialog')),
                      dict(kind='node_present', window='w1', selector=dict(provider='atspi', role='table_cell', name='new'))]))]
-        self.assertEqual(self.acts[0]['steps'], expected)
-        self.assertEqual(len(self.acts), 1)
+        self.assertEqual([act['steps'] for act in self.acts], [expected[:1], expected[1:]])
+        self.assertEqual([sum(s['timeout_ms'] for s in act['steps']) for act in self.acts],
+                         [2000, 9000])
+        self.assertTrue(all(sum(s['timeout_ms'] for s in act['steps']) + 500 <= 10000
+                            for act in self.acts))
+        self.assertEqual([c.args[0] for c in self.adapter.rpc.call.call_args_list],
+                         ['window.observe', 'window.observe', 'window.act', 'window.observe', 'window.act'])
         for step in expected:
             if 'expect' in step:
                 predicate_schema(step['expect'])
@@ -302,6 +308,32 @@ class SkillTests(unittest.TestCase):
         self.assertEqual(self.acts[0]['lease'], 'lease')
         self.assertEqual(self.acts[0]['control_epoch'], 3)
         self.assertNotIn('pending', self.adapter.state)
+
+    def test_rename_batch_uses_post_selection_listing_refs_and_revision(self):
+        self.observations = [listing(), listing(('other', 'old'), rev=12)]
+        self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
+                         dict(status='success', verified=False))
+        self.assertEqual([c.args[0] for c in self.adapter.rpc.call.call_args_list],
+                         ['window.observe', 'window.act', 'window.observe', 'window.act'])
+        self.assertEqual(self.acts[0]['steps'][0]['target'], dict(window='w1', ref='n4'))
+        self.assertEqual(self.acts[1]['steps'][0]['target'], dict(window='w1', ref='n6'))
+        self.assertEqual(self.acts[1]['steps'][0]['require'], dict(selected_ref='n7'))
+        self.assertEqual([act['base_rev'] for act in self.acts], [11, 12])
+
+    def test_rename_post_selection_name_checks_stop_before_batch(self):
+        (self.directory / 'home/new').touch()  # Must not override a name short-circuit.
+        for names, expected in ((('other',), dict(status='not_found', candidates=['other'])),
+                                ((), dict(status='not_found', candidates=[])),
+                                (('old', 'old'), dict(status='ambiguous')),
+                                (('old', 'new'), dict(status='collision'))):
+            with self.subTest(names=names):
+                self.observations = [listing(), listing(names, rev=12)]
+                self.acts, self.observes = [], []
+                with patch.object(thunar, '_oracle', wraps=thunar._oracle) as oracle:
+                    self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')), expected)
+                    oracle.assert_not_called()
+                self.assertEqual([act['steps'][0]['id'] for act in self.acts], ['0'])
+                self.assertEqual(len(self.observes), 2)
 
     def test_create_two_acts_bind_only_dialog_entry_and_resolve_fresh_targets(self):
         self.mutate = lambda: (self.directory / 'home/Reports').mkdir()
@@ -439,11 +471,11 @@ class SkillTests(unittest.TestCase):
                 calls = self.adapter.rpc.call.call_args_list
                 sequence = ['window.observe', 'window.act', 'window.observe']
                 if expected['status'] == 'success':
-                    sequence.append('window.act')
+                    sequence.extend(['window.act', 'window.observe', 'window.act'])
                     self.assertEqual(self.acts[1]['steps'][0]['target'], dict(window='w1', ref='n7'))
-                    self.assertEqual(self.acts[1]['steps'][1]['target'], dict(window='w1', ref='n6'))
-                    self.assertEqual(self.acts[1]['steps'][1]['require'], dict(selected_ref='n7'))
-                    self.assertEqual(self.acts[1]['base_rev'], 12)
+                    self.assertEqual(self.acts[2]['steps'][0]['target'], dict(window='w1', ref='n6'))
+                    self.assertEqual(self.acts[2]['steps'][0]['require'], dict(selected_ref='n7'))
+                    self.assertEqual(self.acts[2]['base_rev'], 12)
                 self.assertEqual([call.args[0] for call in calls], sequence)
                 self.assertEqual(self.acts[0]['steps'], [dict(id='details', target='w1', timeout_ms=2000,
                     intent=dict(kind='key', keys=['Control_L', '2']),
@@ -481,8 +513,8 @@ class SkillTests(unittest.TestCase):
                 self.observations = [dirty, listing(rev=12)]
                 self.observes, self.acts = [], []
                 self.assertEqual(run(self.adapter, args), dict(status='success', verified=False))
-                self.assertEqual(len(self.observes), 4 if run is thunar.create_folder else 2)
-                self.assertEqual(len(self.acts), 2 if run is thunar.create_folder else 1)
+                self.assertEqual(len(self.observes), 4 if run is thunar.create_folder else 3)
+                self.assertEqual(len(self.acts), 2)
                 for observe in self.observes[:2]:
                     self.assertIsNone(observe['since_rev'])
                     self.assertEqual(observe['scope'], dict(kind='session'))
@@ -510,10 +542,12 @@ class SkillTests(unittest.TestCase):
                 self.observations = [listing(('new',), rev=i) for i in range(11, 15)] + [listing(rev=15)]
                 for value in self.observations:
                     value['tree']['dirty'] = True
+                if run is thunar.rename:
+                    self.observations.append(listing(rev=16))
                 self.assertEqual(run(self.adapter, args), dict(status='success', verified=False))
                 self.assertEqual(self.acts[0]['base_rev'], 15)
-                self.assertEqual(len(self.acts), 2 if run is thunar.create_folder else 1)
-                self.assertEqual(len(self.observes), 7 if run is thunar.create_folder else 5)
+                self.assertEqual(len(self.acts), 2)
+                self.assertEqual(len(self.observes), 7 if run is thunar.create_folder else 6)
 
     def test_dirty_fallback_zero_complete_sets_returns_tree_dirty_without_act(self):
         dirty = listing()
@@ -564,8 +598,8 @@ class SkillTests(unittest.TestCase):
         self.observations = [dirty] * 4 + [listing()]
         self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
                          dict(status='success', verified=False))
-        self.assertEqual(len(self.observes), 5)
-        self.assertEqual(len(self.acts), 1)
+        self.assertEqual(len(self.observes), 6)
+        self.assertEqual(len(self.acts), 2)
 
     def test_dirty_initial_page_other_failures_still_fail_fast(self):
         for change, expected in (
@@ -624,7 +658,7 @@ class SkillTests(unittest.TestCase):
                                 def rpc(method, params, **kwargs):
                                     value = original(method, params, **kwargs)
                                     if method == 'window.act' and (
-                                            run is thunar.rename or params['steps'][0]['id'] == '3'):
+                                            params['steps'][0]['id'] == ('1' if run is thunar.rename else '3')):
                                         value.update(status=status, reason='provider_degraded')
                                         value['steps'][-1]['effect']['status'] = 'unknown'
                                     return value
@@ -640,7 +674,7 @@ class SkillTests(unittest.TestCase):
                                         self.assertEqual(result, expected)
                                         oracle.assert_called_once_with(self.adapter, args,
                                             *(['new', 'old'] if run is thunar.rename else ['new']))
-                                    self.assertEqual(len(self.acts), 1 if run is thunar.rename else 2)
+                                    self.assertEqual(len(self.acts), 2)
                                 finally:
                                     old.unlink(missing_ok=True)
                                     if new.is_dir():
@@ -650,8 +684,8 @@ class SkillTests(unittest.TestCase):
 
     def test_uncertain_rename_requires_old_absent_even_when_new_exists(self):
         (self.directory / 'home/old').touch()
+        (self.directory / 'home/new').touch()
         self.status = 'contradicted'
-        self.mutate = lambda: (self.directory / 'home/new').touch()
         self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
                          dict(status='contradicted'))
         self.assertEqual(len(self.acts), 1)
@@ -713,6 +747,42 @@ class SkillTests(unittest.TestCase):
         with patch.object(self.adapter.rpc, 'call', side_effect=rpc):
             self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
                              dict(status='unverified'))
+        self.assertEqual([act['steps'][0]['id'] for act in self.acts], ['0'])
+        self.assertEqual(len(self.observes), 1)
+
+    def test_failed_rename_selection_projects_outcome_with_oracle_without_batch(self):
+        original = self.adapter.rpc.call.side_effect
+        for confirms in (False, True):
+            with self.subTest(confirms=confirms):
+                self.acts, self.observes = [], []
+                def rpc(method, params, **kwargs):
+                    value = original(method, params, **kwargs)
+                    if method == 'window.act':
+                        if confirms:
+                            (self.directory / 'home/new').touch()
+                        value.update(status='failed', reason='selection failed')
+                        value['steps'][0]['effect']['status'] = 'contradicted'
+                    return value
+                with patch.object(self.adapter.rpc, 'call', side_effect=rpc):
+                    result = thunar.rename(self.adapter, dict(old='old', new='new'))
+                self.assertEqual(result, dict(status='success', verified=True,
+                    detail='filesystem oracle confirms; batch outcome was failed') if confirms else
+                    dict(status='failed', detail='selection failed'))
+                self.assertEqual([act['steps'][0]['id'] for act in self.acts], ['0'])
+                self.assertEqual(len(self.observes), 1)
+
+    def test_rename_post_selection_observe_failure_consults_oracle_without_batch(self):
+        for confirms in (False, True):
+            with self.subTest(confirms=confirms):
+                self.observations = [listing(), dict(listing(), settled=False)]
+                self.acts = []
+                if confirms:
+                    (self.directory / 'home/new').touch()
+                self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
+                    dict(status='success', verified=True,
+                         detail='filesystem oracle confirms; batch outcome was observe_required')
+                    if confirms else dict(status='observe_required'))
+                self.assertEqual([act['steps'][0]['id'] for act in self.acts], ['0'])
 
     def test_uncertain_details_switch_stops_before_mutation(self):
         (self.directory / 'home/new').touch()  # Oracle would confirm, but this is a pre-check.
@@ -783,15 +853,15 @@ class SkillTests(unittest.TestCase):
         last = copy.deepcopy(fresh)
         last['tree']['lines'] = fresh['tree']['lines'][3:]
         fresh['tree'].update(lines=fresh['tree']['lines'][:3], cursor='next', truncated=True)
-        self.observations = [stale, middle, dirty, fresh, last]
+        self.observations = [stale, middle, dirty, fresh, last, listing(rev=12)]
         self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
                          dict(status='success', verified=False))
-        self.assertEqual(len(self.observes), 5)
-        self.assertEqual([p.get('cursor') for p in self.observes], [None, 'next', 'last', None, 'next'])
+        self.assertEqual(len(self.observes), 6)
+        self.assertEqual([p.get('cursor') for p in self.observes], [None, 'next', 'last', None, 'next', None])
         for i in (0, 3):
             self.assertIsNone(self.observes[i]['since_rev'])
             self.assertEqual(self.observes[i]['scope'], dict(kind='session'))
-        self.assertEqual(len(self.acts), 1)
+        self.assertEqual(len(self.acts), 2)
         self.assertEqual(self.acts[0]['base_rev'], 12)
 
     def test_dirty_continuation_allows_only_three_restarts(self):
@@ -803,14 +873,14 @@ class SkillTests(unittest.TestCase):
                 dirty['tree'].update(dirty=True, lines=[])
                 clean = listing()
                 clean['tree']['lines'] = []
-                self.observations = [first, dirty] * 3 + [first, dirty if exhaust else clean]
+                self.observations = [first, dirty] * 3 + [first, dirty if exhaust else clean, listing()]
                 self.observes, self.acts = [], []
                 result = thunar.rename(self.adapter, dict(old='old', new='new'))
                 expected = dict(status='success', verified=False)
                 self.assertEqual(result, expected)
-                self.assertEqual(len(self.observes), 8)
-                self.assertEqual(sum('cursor' not in p for p in self.observes), 4)
-                self.assertEqual(len(self.acts), 1)
+                self.assertEqual(len(self.observes), 9)
+                self.assertEqual(sum('cursor' not in p for p in self.observes), 5)
+                self.assertEqual(len(self.acts), 2)
 
     def test_dirty_continuation_other_state_changes_still_fail_fast(self):
         for section, field, value in ((None, 'settled', False), (None, 'resync_required', True),
@@ -893,7 +963,7 @@ class EntryPointTests(unittest.TestCase):
                         return listing(rev=value['rev'])
                     if method == 'window.act':
                         actions.append(params)
-                        if params['steps'][0]['id'] == '0':
+                        if params['steps'][0]['intent'].get('keys') == ['F2']:
                             (directory / 'home/old').rename(directory / 'home/new')
                         elif params['steps'][0]['intent']['kind'] == 'invoke':
                             (directory / 'home/Reports').mkdir()
@@ -920,7 +990,7 @@ class EntryPointTests(unittest.TestCase):
                                 params=dict(name=n, arguments=args)))+'\n' for i, (n, args) in enumerate(calls, 1))
                             results = [r['result'] for r in invoke(['ark-act', 'mcp', '--session', 's1'], incoming)]
                     self.assertEqual([shown(r) for r in results], [dict(status='success', verified=True)] * 2)
-                    self.assertEqual(len(actions), 3)
+                    self.assertEqual(len(actions), 4)
                     self.assertEqual(worker.errors, [])
                 finally:
                     worker.close()
