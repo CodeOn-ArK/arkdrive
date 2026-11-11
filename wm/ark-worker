@@ -35,7 +35,7 @@ import Xlib
 
 WM = Path(__file__).resolve().parent
 sys.path.insert(0, str(WM))
-from worker_act import ActError, OCRPending, Engine, canonical, leaves, predicate_schema, recover_receipt
+from worker_act import ActError, OCRPending, Engine, action_digest, canonical, leaves, predicate_schema, recover_receipt
 from worker_xtest import XTestTransport
 from worker_evdev import EvdevTransport
 from input_protocol import control_store
@@ -225,17 +225,71 @@ def initialise_control(path, generation):
             os.fsync(stream.fileno())
 
 
+class ActionOffsets:
+    """No receipts/requests here: just offsets into one generation's JSONL."""
+    __slots__ = ("request_hash", "intent", "receipt", "armed", "reconciliation")
+
+    def __init__(self):
+        self.request_hash = self.intent = self.receipt = None
+        self.armed, self.reconciliation = [], []
+
+
 class Journal:
     def __init__(self, path, session, generation):
         self.path, self.session, self.generation = path, session, generation
-        self.stream = path.open("a", encoding="utf-8")
+        self.stream = path.open("ab")
+        self.index, self.index_error = {}, False
+        try:
+            self._reindex()
+        except (OSError, ValueError):
+            self.index_error = True
+
+    def _index_row(self, index, row, offset):
+        if row.get("session") != self.session or row.get("generation") != self.generation:
+            return
+        kind, action_id = row.get("type"), row.get("action_id")
+        if kind not in ("intent", "receipt", "step_armed", "reconciliation") or not isinstance(action_id, str):
+            return
+        digest = action_digest(action_id)
+        entry = index.get(digest)
+        if entry is None:
+            entry = index[digest] = ActionOffsets()
+        if kind == "intent":
+            entry.intent, entry.request_hash = offset, row.get("request_hash")
+        elif kind == "receipt":
+            entry.receipt = offset
+            entry.armed.clear()
+        elif kind == "step_armed":
+            entry.armed.append(offset)
+        else:
+            entry.reconciliation.append(offset)
+
+    def _reindex(self):
+        index = {}
+        with self.path.open("rb") as stream:
+            while True:
+                offset = stream.tell()
+                line = stream.readline()
+                if not line:
+                    break
+                row = json.loads(line)
+                if not line.endswith(b"\n") or not isinstance(row, dict):
+                    raise ValueError("journal_unavailable")
+                self._index_row(index, row, offset)
+        self.index, self.index_error = index, False
 
     def append(self, kind, **fields):
         value = {"ts": utc(), "type": kind, "session": self.session,
                  "generation": self.generation, **fields}
-        self.stream.write(json_bytes(value).decode() + "\n")
+        self.stream.seek(0, os.SEEK_END)
+        offset = self.stream.tell()
+        self.stream.write(json_bytes(value) + b"\n")
         self.stream.flush()
         os.fsync(self.stream.fileno())
+        # Publish offsets only after fsync succeeds. Storage recovery rebuilds
+        # the index after validating and syncing an uncertain append.
+        self._index_row(self.index, value, offset)
+        return offset
 
     def close(self):
         self.stream.close()
@@ -245,10 +299,50 @@ class Journal:
         # A writable disk does not repair a torn JSONL tail.
         self.stream.flush()
         os.fsync(self.stream.fileno())
-        with self.path.open(encoding="utf-8") as stream:
-            for line in stream:
-                if not line.endswith("\n") or not isinstance(json.loads(line), dict):
-                    raise ValueError("journal_unavailable")
+        try:
+            self._reindex()
+        except (OSError, ValueError):
+            self.index_error = True
+            raise
+
+    def entry(self, action_id):
+        if self.index_error:
+            raise RPCError("journal_unavailable")
+        return self.index.get(action_digest(action_id))
+
+    def action(self, action_id, offset=None):
+        """Current generation: seek only this action's indexed JSONL rows."""
+        entry = self.entry(action_id)
+        if entry is None:
+            return {"status": "not_found", "action_id": action_id}
+        if offset is not None and offset != entry.receipt:
+            raise RPCError("journal_unavailable")
+        try:
+            with self.path.open("rb") as stream:
+                def read(at, kind):
+                    stream.seek(at)
+                    line = stream.readline()
+                    row = json.loads(line)
+                    if (not line.endswith(b"\n") or row.get("action_id") != action_id or
+                            row.get("type") != kind or row.get("session") != self.session or
+                            row.get("generation") != self.generation):
+                        raise ValueError("journal_unavailable")
+                    return row
+                if entry.receipt is not None:
+                    receipt = read(entry.receipt, "receipt")["receipt"]
+                else:
+                    receipt = recover_receipt(read(entry.intent, "intent"),
+                                              [read(at, "step_armed")["step_id"] for at in entry.armed])
+                reconciliations = [self.reconciliation(read(at, "reconciliation")) for at in entry.reconciliation]
+        except FileNotFoundError:
+            raise RPCError("history_expired")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            raise RPCError("journal_unavailable")
+        return {"status": "final", "receipt": receipt, "reconciliation": reconciliations}
+
+    @staticmethod
+    def reconciliation(row):
+        return {key: row[key] for key in ("step_id", "rev", "effect")}
 
     def unresolved(self):
         """Recover admission blockers across generations, without replaying input."""
@@ -288,7 +382,7 @@ class Journal:
         return pending
 
     @staticmethod
-    def action(path, action_id):
+    def history_action(path, action_id):
         intent, receipt, armed, reconciliations = None, None, [], []
         try:
             with path.open(encoding="utf-8") as stream:
@@ -302,20 +396,21 @@ class Journal:
                         elif row.get("type") == "step_armed":
                             armed.append(row["step_id"])
                         elif row.get("type") == "reconciliation":
-                            reconciliations.append(row)
+                            reconciliations.append(Journal.reconciliation(row))
         except FileNotFoundError:
             raise RPCError("history_expired")
         except (OSError, ValueError):
             if intent is not None:
                 unknown = recover_receipt(intent, armed)
                 unknown["reason"] = "journal_unavailable"
-                return {"status": "final", "receipt": unknown, "history_complete": False}
+                return {"status": "final", "receipt": unknown, "history_complete": False,
+                        "reconciliation": reconciliations}
             raise RPCError("journal_unavailable")
         if intent is None:
             return {"status": "not_found", "action_id": action_id}
         if receipt is not None:
             return {"status": "final", "receipt": receipt, "reconciliation": reconciliations}
-        return {"status": "final", "receipt": recover_receipt(intent, armed)}
+        return {"status": "final", "receipt": recover_receipt(intent, armed), "reconciliation": reconciliations}
 
 
 class StateCache:
@@ -1305,6 +1400,8 @@ class Worker:
             journal_bytes = None
         return {"schema": 1,
                 "actions_retained": len(act.actions) if act else 0,
+                "action_stubs": len(act.action_stubs) if act else 0,
+                "journal_actions_indexed": len(self.journal.index),
                 "lease_records": len(act.lease_state) if act else 0,
                 "removed_windows": len(self.cache.removed),
                 "frame_identities": len(frames.issued) if frames else 0,
@@ -1666,7 +1763,8 @@ class Worker:
                     raise RPCError("invalid_params")
                 result = self.act.get(gen, params["action_id"]) if getattr(self, "act", None) else None
                 if result is None:
-                    result = Journal.action(self.state / "acts" / (gen + ".jsonl"), params["action_id"])
+                    result = (self.journal.action(params["action_id"]) if gen == self.generation else
+                              Journal.history_action(self.state / "acts" / (gen + ".jsonl"), params["action_id"]))
             elif method == "session.done":
                 if params.get("status") not in ("success", "failed", "blocked") or not isinstance(params.get("summary"), str):
                     raise RPCError("invalid_params")

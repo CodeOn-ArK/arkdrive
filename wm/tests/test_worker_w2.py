@@ -691,7 +691,7 @@ class FixRound6(Harness):
         self.assertEqual((original["status"], original["last_armed"]), ("unknown", "k2"))
         self.assertFalse(self.t.log)
         self.observe(lease=self.w.lease)
-        self.assertEqual(w.Journal.action(self.path / "acts" / (GEN + ".jsonl"), "a")["receipt"], original)
+        self.assertEqual(w.Journal.history_action(self.path / "acts" / (GEN + ".jsonl"), "a")["receipt"], original)
         self.assertFalse(self.t.log)
         self.admitted()
         self.restart()
@@ -706,7 +706,7 @@ class FixRound6(Harness):
         self.blocked()
         self.observe(lease=self.w.lease)
         self.admitted()
-        self.assertEqual(w.Journal.action(self.path / "acts" / (GEN + ".jsonl"), "a")["receipt"], original)
+        self.assertEqual(w.Journal.history_action(self.path / "acts" / (GEN + ".jsonl"), "a")["receipt"], original)
 
     def test_journal_failure_keeps_acknowledgment_fenced(self):
         self.stopped()
@@ -1744,7 +1744,7 @@ class Failures(Harness):
         self.e.fence("F3:journal_unavailable", journal=False)
         self.e.control_changed({"state": "paused", "epoch": 1}, {"state": "agent", "epoch": 2, "flags": 1})
         self.assertTrue(self.e.fence_reason.startswith("F3"))
-        found = w.Journal.action(self.w.journal.path, "a")
+        found = w.Journal.history_action(self.w.journal.path, "a")
         self.assertEqual(found["receipt"]["effect"]["status"], "unknown")
         self.assertFalse(found["history_complete"])
         self.assertFalse(self.t.log)
@@ -2007,10 +2007,10 @@ class ReceiptAndSelftest(Harness):
     def test_action_get_crash_boundary_never_not_found(self):
         self.w.journal.append("intent", action_id="crash", request_hash="hash", journal_seq=1)
         self.w.journal.append("step_armed", action_id="crash", step_id="one")
-        result = w.Journal.action(self.w.journal.path, "crash")
+        result = w.Journal.history_action(self.w.journal.path, "crash")
         self.assertEqual(result["receipt"]["status"], "unknown")
         self.assertEqual(result["receipt"]["last_armed"], "one")
-        self.assertEqual(w.Journal.action(self.w.journal.path, "absent")["status"], "not_found")
+        self.assertEqual(w.Journal.history_action(self.w.journal.path, "absent")["status"], "not_found")
         self.assertFalse(self.t.log)
 
     def test_selftest_pointer_only_when_client_exists(self):

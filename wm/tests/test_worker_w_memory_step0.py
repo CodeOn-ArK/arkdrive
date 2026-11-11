@@ -21,17 +21,18 @@ class MemoryCounters(Harness):
         super().setUp()
         self.w.pixels = self.w.tree = self.w.x = None
 
-    def test_completed_acts_and_leases_grow_without_retirement(self):
+    def test_completed_acts_retire_but_leases_still_grow(self):
         before = self.w.memory_counters()
         for i in range(3):
             result = self.run_action(self.params(action_id=f'a-{i}', base_rev=self.w.cache.rev))
             self.assertEqual(result['status'], 'success')
         self.e.attach('second', NS(), {})
         after = self.w.memory_counters()
-        self.assertEqual(after['actions_retained'] - before['actions_retained'], 3)
+        self.assertEqual(after['actions_retained'] - before['actions_retained'], 0)
+        self.assertEqual(after['action_stubs'] - before['action_stubs'], 3)
+        self.assertEqual(after['journal_actions_indexed'] - before['journal_actions_indexed'], 3)
         self.assertEqual(after['lease_records'] - before['lease_records'], 1)
-        self.assertTrue(all(a['final'] for a in self.e.actions.values()))
-        self.assertEqual(len(self.e.actions), 3)
+        self.assertEqual(len(self.e.actions), 0)
 
     def test_removed_history_grows_on_real_window_lifecycles(self):
         before = self.w.memory_counters()
@@ -108,7 +109,8 @@ class MemoryCounters(Harness):
         result = self.result()
         memory = result.pop('memory')
         self.assertEqual(result, before)
-        self.assertEqual(memory, dict(schema=1, actions_retained=0, lease_records=1,
+        self.assertEqual(memory, dict(schema=1, actions_retained=0, action_stubs=0,
+            journal_actions_indexed=0, lease_records=1,
             removed_windows=0, frame_identities=0, frame_files=0, atspi_apps=0,
             journal_bytes=0, pending_x_requests=None))
 
@@ -236,7 +238,10 @@ class MeasurementHarness(unittest.TestCase):
                     step = params['steps'][0]
                     if step['intent']['kind'] == 'key':
                         title = next(row['title'] for row in windows.values() if row['handle'] == step['target'])
-                        windows[title+' popup'] = dict(title=title+' popup', handle='popup-' + title)
+                        if step['intent']['keys'] == ['Return']:
+                            removed.append(windows.pop(title)['handle'])
+                        else:
+                            windows[title+' popup'] = dict(title=title+' popup', handle='popup-' + title)
                     return dict(status='success', pending_effects=[])
                 raise AssertionError(method)
             def close(self):
@@ -259,7 +264,7 @@ class MeasurementHarness(unittest.TestCase):
                          ['window_churn', 'act_churn', 'popup_flood', 'observe_size'])
         self.assertEqual([row.get('completed') for row in summaries[:3]], [3, 4, 2])
         self.assertEqual(summaries[1]['memory_delta']['actions_retained'], 4)
-        self.assertEqual(len(acts), 6)
+        self.assertEqual(len(acts), 8)  # 4 waits + 2 popup triggers + 2 dismissals
         self.assertEqual(len(removed), 8)  # 3 churn + 1 act fixture + 2 popup pairs
         self.assertEqual(windows, {})
 

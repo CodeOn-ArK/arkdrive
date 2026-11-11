@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from pathlib import Path
 
 from worker_routes import RouteTable, ladder
@@ -47,6 +47,10 @@ TIMINGS = ("queue", "focus", "dispatch", "application_wait", "provider", "captur
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+def action_digest(action_id):
+    return hashlib.sha256(action_id.encode("utf-8")).digest()
 
 
 def closed(value, allowed, required=()):
@@ -191,10 +195,15 @@ class Ack:
 
 
 class Engine:
+    # This bounds only the hot stub cache. The journal's per-generation index
+    # retains every ID/hash/offset so dropping a stub cannot permit redispatch.
+    ACTION_STUB_LIMIT = 4096
+
     def __init__(self, worker, transport, clock=time.monotonic):
         self.w, self.t, self.clock = worker, transport, clock
         self.queue, self.active = deque(), None
         self.actions = {}
+        self.action_stubs = OrderedDict()
         self.seq = 0
         self.evdev = None
         from worker_paste import Clipboard
@@ -228,7 +237,7 @@ class Engine:
     def durable(self, kind, **fields):
         started = self.clock()
         try:
-            self.w.journal.append(kind, **fields)
+            return self.w.journal.append(kind, **fields)
         except (OSError, ValueError):
             self.fence("F3:journal_unavailable", journal=False)
             raise ActError("journal_unavailable")
@@ -478,6 +487,20 @@ class Engine:
                 raise ActError("action_id_conflict")
             self.w.respond(peer, ident, prior["receipt"] if prior.get("final") else self.pending(prior))
             return
+        if p["generation"] == self.w.generation:
+            digest = action_digest(p["action_id"])
+            stub = self.action_stubs.get(digest)
+            indexed = self.w.journal.entry(p["action_id"])
+            if stub is not None or indexed is not None:
+                request_hash = stub[0] if stub is not None else indexed.request_hash
+                if request_hash != h:
+                    raise ActError("action_id_conflict")
+                # A failed read must fail closed, never fall through to enqueue.
+                result = self.w.journal.action(p["action_id"], offset=stub[1] if stub else None)
+                if result["status"] != "final":
+                    raise ActError("journal_unavailable")
+                self.w.respond(peer, ident, result["receipt"])
+                return
         # Authorisation precedes intent; dedupe retrieval itself never dispatches.
         self.w.require_lease(peer, p)
         tree = getattr(self.w, "tree", None)
@@ -538,18 +561,46 @@ class Engine:
     def get(self, generation, action_id):
         a = self.actions.get((generation, action_id))
         if not a:
-            return None
+            return self.w.journal.action(action_id) if generation == self.w.generation else None
         if not a["final"] and a.get("outcome_known"):
             try:
                 self.validate_journal()
                 if not a.get("intent_durable"):
                     self.durable("intent", **a["intent_record"])
                     a["intent_durable"] = True
-                self.durable("receipt", action_id=action_id, receipt=a["receipt"])
+                a["receipt_offset"] = self.durable("receipt", action_id=action_id, receipt=a["receipt"])
                 a["final"] = True
             except ActError:
                 pass
-        return {"status": "final", "receipt": a["receipt"], "reconciliation": a.get("reconciliations", [])} if a["final"] else self.pending(a)
+        result = {"status": "final", "receipt": a["receipt"], "reconciliation": a.get("reconciliations", [])} if a["final"] else self.pending(a)
+        self.compact(a)
+        return result
+
+    def compact(self, a):
+        """Retire only a durable FINAL with no remaining delivery/effect work."""
+        r = a["receipt"]
+        if (not a["final"] or not a.get("intent_durable") or a.get("receipt_offset") is None
+                or self.w.journal.index_error
+                or r["effect"]["status"] in ("unknown", "contradicted")
+                or r["pending_effects"]
+                or any(p["action_id"] == r["action_id"] and
+                       p.get("generation", self.w.generation) == r["generation"] for p in self.pending_effects)
+                or any(not ack.complete for _, ack in a.get("acks", []))
+                or any(s["effect"]["status"] in ("unknown", "contradicted") or
+                       not s["cleanup"]["confirmed"] for s in r["steps"])):
+            return
+        digest = action_digest(r["action_id"])
+        indexed = self.w.journal.index.get(digest)
+        if indexed is None or (indexed.request_hash, indexed.receipt) != (a["hash"], a["receipt_offset"]):
+            return
+        self.action_stubs[digest] = (a["hash"], a["receipt_offset"])
+        del self.actions[(r["generation"], r["action_id"])]
+        while len(self.action_stubs) > self.ACTION_STUB_LIMIT:
+            oldest, stub = next(iter(self.action_stubs.items()))
+            entry = self.w.journal.index.get(oldest)
+            if entry is None or (entry.request_hash, entry.receipt) != stub:
+                break  # Never trade exact dedupe for the cache ceiling.
+            self.action_stubs.popitem(last=False)
 
     def tick(self):
         if self.evdev:
@@ -2339,7 +2390,7 @@ class Engine:
         durable_start = self.clock()
         a["outcome_known"] = True
         try:
-            self.durable("receipt", action_id=p["action_id"], receipt=r)
+            a["receipt_offset"] = self.durable("receipt", action_id=p["action_id"], receipt=r)
         except ActError:
             self.w.respond(a["peer"], a["ident"], self.pending(a))
             return
@@ -2347,6 +2398,7 @@ class Engine:
         self.last_durable_ms = (self.clock() - durable_start) * 1000
         a["final"] = True
         self.w.respond(a["peer"], a["ident"], r)
+        self.compact(a)
 
     @staticmethod
     def advice(reason, dispatch):

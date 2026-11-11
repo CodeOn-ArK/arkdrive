@@ -104,13 +104,13 @@ class JournalTests(SandboxCase):
         rows = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual([r["type"] for r in rows], ["worker_start", "attach"])
         self.assertTrue(all(r["ts"].endswith("Z") for r in rows))
-        self.assertEqual(w.Journal.action(path, "x")["status"], "not_found")
+        self.assertEqual(w.Journal.history_action(path, "x")["status"], "not_found")
         journal.append("intent", action_id="x")
-        self.assertEqual(w.Journal.action(path, "x")["receipt"]["dispatch_status"], "unknown")
+        self.assertEqual(w.Journal.history_action(path, "x")["receipt"]["dispatch_status"], "unknown")
         journal.append("receipt", action_id="x", receipt={"reason": "example"})
-        self.assertEqual(w.Journal.action(path, "x")["receipt"], {"reason": "example"})
+        self.assertEqual(w.Journal.history_action(path, "x")["receipt"], {"reason": "example"})
         with self.assertRaisesRegex(w.RPCError, "history_expired"):
-            w.Journal.action(self.path / "missing", "x")
+            w.Journal.history_action(self.path / "missing", "x")
 
     def test_fsync_failure_propagates(self):
         journal = w.Journal(self.path / "acts", "s1", GEN)
@@ -123,7 +123,7 @@ class JournalTests(SandboxCase):
         path = self.path / "broken.jsonl"
         path.write_text('{"type":"intent",')
         with self.assertRaisesRegex(w.RPCError, "journal_unavailable"):
-            w.Journal.action(path, "missing")
+            w.Journal.history_action(path, "missing")
 
 
 class CacheTests(unittest.TestCase):
