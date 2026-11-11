@@ -110,3 +110,42 @@ Full log: `wm/tests/.tmp/packs-adapter-full-suite.log`.
   unfocused window and an unrelated focused family to check anchor behavior.
   Preserve the D1 filesystem oracle, 3/3 verified steps and 30/30-run gate,
   plus existing isolation observers. No headless result establishes D1.
+
+## Fix round 1
+
+Fixed the step-5 session layout regression in `wm/worker_adapter.py` only.
+`session_dir(session)` still validates `s[1-9][0-9]*` and resolves the account
+home through `pwd.getpwuid(os.getuid())`, never inherited `HOME`. It now reads
+that account's `.local/state/ark-sessiond/sessions.json` and uses the matching
+session record's direct `session_dir`, including `run/<sid>/<instance>/`.
+Missing/unreadable/malformed registries, missing records or fields, and unusable
+field values retain the legacy `run/<session>` fallback for fabricated layouts.
+Sessiond, the worker and the registry format are unchanged.
+
+Audited every adapter directory use: MCP and one-shot both receive the resolved
+directory; `driver/act.sock`, `driver/adapter-state.lock` and
+`driver/adapter-state.json` derive from it. Inline frames read the worker-returned
+paths directly, with no separate legacy directory construction.
+
+Seven new headless regressions in `wm/tests/test_worker_w_packs_adapter.py` cover
+instance directory/socket resolution despite inherited `HOME`, absent registry,
+absent record/field, unreadable/malformed registry and invalid field types,
+unchanged session-ID rejection, and both one-shot and MCP observe/act entry
+points using a fake worker. Entry-point checks include instance socket selection,
+inline frame reads and one-shot state/lock persistence in the instance directory.
+Targeted pack-adapter run: **17 tests passed**, exit 0.
+
+Full headless suite: **999 tests in 134.909 s; 998 passed, 1 skipped**, exit 0,
+`OK (skipped=1)`. The existing sandbox-dependent ptrace/strace check remains
+skipped. Ran the full default discovery with all temporary files kept in the
+checkout and bytecode generation disabled:
+
+```sh
+TMPDIR="$PWD/wm/tests/.tmp" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wm/tests
+```
+
+Full log: `wm/tests/.tmp/packs-adapter-fix1-full-suite.log`.
+
+**Live re-check — NOT RUN.** Raj reruns the one-shot observe/budget/cursor/act
+smoke and D1 live gate. No live session, provider API or display (including `:0`)
+was opened or driven. Nothing staged or committed.

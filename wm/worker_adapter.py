@@ -54,7 +54,16 @@ def session_dir(session):
     if not re.fullmatch(r's[1-9][0-9]*', session):
         raise AdapterError('invalid_session')
     # Same account-database root as ark-worker; never trust inherited HOME.
-    return Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local/state/ark-sessiond/run' / session
+    root = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local/state/ark-sessiond'
+    try:
+        registry = json.loads((root / 'sessions.json').read_text())
+        record = registry.get(session) if isinstance(registry, dict) else None
+        path = record.get('session_dir') if isinstance(record, dict) else None
+        if isinstance(path, str) and path:
+            return Path(path)
+    except (OSError, ValueError):
+        pass
+    return root / 'run' / session
 
 
 def check_kill():

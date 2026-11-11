@@ -2,15 +2,121 @@
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
 
 from test_worker_w4 import ProviderHarness, node
-from test_worker_w5 import a, loop, shown, receipt, GEN
+from test_worker_w5 import a, loop, shown, receipt, GEN, FakeWorker
 from test_worker_w5_fix1 import adapter_with_rpc, add_result
+
+
+class SessionDirectories(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='packs-session-dir-')
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name)
+        self.root = self.home / '.local/state/ark-sessiond'
+        self.root.mkdir(parents=True)
+        self.registry = self.root / 'sessions.json'
+        self.legacy = self.root / 'run/s1'
+        self.instance = self.legacy / 'instance-1'
+        account = patch.object(a.pwd, 'getpwuid', return_value=NS(pw_dir=str(self.home)))
+        account.start()
+        self.addCleanup(account.stop)
+
+    def register(self):
+        self.registry.write_text(json.dumps({'s1': {'session_dir': str(self.instance)}}))
+
+    def test_registry_resolves_instance_directory_without_inherited_home(self):
+        self.register()
+        (self.instance / 'driver').mkdir(parents=True)
+        (self.instance / 'driver/act.sock').touch()  # Fake socket location only.
+        with patch.dict(os.environ, HOME=str(self.home / 'inherited-home')):
+            self.assertEqual(a.session_dir('s1'), self.instance)
+        self.assertEqual(a.Adapter(a.session_dir('s1')).rpc.path,
+                         self.instance / 'driver/act.sock')
+
+    def test_missing_registry_uses_legacy_directory(self):
+        self.assertEqual(a.session_dir('s1'), self.legacy)
+
+    def test_missing_record_or_field_uses_legacy_directory(self):
+        for registry in ({}, {'s2': {'session_dir': str(self.instance)}}, {'s1': {}},
+                         {'s1': {'session_dir': None}}, {'s1': {'session_dir': ''}}):
+            with self.subTest(registry=registry):
+                self.registry.write_text(json.dumps(registry))
+                self.assertEqual(a.session_dir('s1'), self.legacy)
+
+    def test_unreadable_or_invalid_registry_uses_legacy_directory(self):
+        with patch.object(Path, 'read_text', side_effect=PermissionError):
+            self.assertEqual(a.session_dir('s1'), self.legacy)
+        for text in ('{', '[]', 'null', '{"s1": []}', '{"s1": {"session_dir": 42}}'):
+            with self.subTest(text=text):
+                self.registry.write_text(text)
+                self.assertEqual(a.session_dir('s1'), self.legacy)
+
+    def test_invalid_session_ids_still_fail_before_registry_read(self):
+        with patch.object(Path, 'read_text') as read:
+            for session in ('', 's0', 's01', 's-1', '../s1', 's1/instance-1'):
+                with self.subTest(session=session):
+                    with self.assertRaisesRegex(a.AdapterError, '^invalid_session$'):
+                        a.session_dir(session)
+            read.assert_not_called()
+
+    def entry_point(self, mode):
+        self.register()
+        self.instance.mkdir(parents=True)
+        worker = FakeWorker(self.instance)
+        self.addCleanup(worker.close)
+        (self.instance / 'driver/act.sock').touch()
+        frame = self.instance / 'frames/frame.png'
+        frame.parent.mkdir()
+        frame.write_bytes(b'fake-image')
+        worker.frames = [dict(frame='f:1', path=str(frame), rev=11)]
+        paths = []
+        def connect(rpc):
+            paths.append(rpc.path)
+            self.assertEqual(rpc.path, self.instance / 'driver/act.sock')
+            worker.connect(rpc)
+        def invoke(argv, incoming=''):
+            with patch.object(sys, 'argv', argv), \
+                    patch('sys.stdin', io.StringIO(incoming)), \
+                    patch('sys.stdout', new_callable=io.StringIO) as output:
+                self.assertEqual(a.main(), 0)
+                return [json.loads(line) for line in output.getvalue().splitlines()]
+        calls = [('observe', {}), ('act', {'steps': [{}]})]
+        with patch.object(a.WorkerRPC, 'connect', new=connect):
+            if mode == 'call':
+                results = [invoke(['ark-act', mode, name, json.dumps(args), '--session', 's1',
+                                   '--images', 'inline'])[0] for name, args in calls]
+                self.assertTrue(all(result['ok'] for result in results))
+                state = json.loads((self.instance / 'driver/adapter-state.json').read_text())
+                self.assertEqual(state['rev'], shown(results[-1])['rev'])
+                self.assertTrue((self.instance / 'driver/adapter-state.lock').exists())
+                self.assertFalse((self.legacy / 'driver').exists())
+            else:
+                incoming = ''.join(json.dumps(dict(jsonrpc='2.0', id=i, method='tools/call',
+                    params=dict(name=name, arguments=args)))+'\n'
+                    for i, (name, args) in enumerate(calls, 1))
+                results = [reply['result'] for reply in invoke(
+                    ['ark-act', mode, '--session', 's1', '--images', 'inline'], incoming)]
+        self.assertTrue(paths)
+        self.assertTrue(all(not result['isError'] for result in results))
+        self.assertEqual(results[0]['content'][1]['data'], 'ZmFrZS1pbWFnZQ==')
+        self.assertEqual(shown(results[0])['frames'][0]['path'], str(frame))
+        self.assertEqual(shown(results[-1])['status'], 'success')
+        self.assertEqual(len(worker.calls('window.act')), 1)
+        self.assertEqual(worker.errors, [])
+
+    def test_one_shot_socket_state_frames_and_act_follow_instance_directory(self):
+        self.entry_point('call')
+
+    def test_mcp_socket_frames_and_act_follow_instance_directory(self):
+        self.entry_point('mcp')
 
 
 class Readiness(unittest.TestCase):
