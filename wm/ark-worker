@@ -1281,6 +1281,40 @@ class Worker:
                 "pending_effects": act.pending_effects if act else [],
                 "lease_suspended": bool(act and act.lease_state.get(self.lease, {}).get("suspended"))}
 
+    def memory_counters(self):
+        """Step-0 gauges, sampled only by system.info; never prune or refresh.
+
+        File errors are unknown (null), not zero. pending_x_requests counts
+        parent-side AsyncX requests, not server work or buffered X events.
+        Schema/units are documented in bench/memory-step0-2026-11-11.md.
+        """
+        act = getattr(self, 'act', None)
+        pixels, tree = getattr(self, 'pixels', None), getattr(self, 'tree', None)
+        x = getattr(self, 'x', None)
+        frames = pixels.frames if pixels else None
+        frame_files = 0
+        if frames:
+            try:
+                with os.scandir(frames.directory) as entries:
+                    frame_files = sum(e.name.endswith('.png') and e.is_file() for e in entries)
+            except OSError:
+                frame_files = None
+        try:
+            journal_bytes = os.fstat(self.journal.stream.fileno()).st_size
+        except (OSError, ValueError):
+            journal_bytes = None
+        return {"schema": 1,
+                "actions_retained": len(act.actions) if act else 0,
+                "lease_records": len(act.lease_state) if act else 0,
+                "removed_windows": len(self.cache.removed),
+                "frame_identities": len(frames.issued) if frames else 0,
+                "frame_files": frame_files,
+                "atspi_apps": len(tree.apps) if tree else 0,
+                "journal_bytes": journal_bytes,
+                "pending_x_requests": (sum(len(channel.pending) for channel in
+                                           (getattr(x, 'ax', None), getattr(x, 'inp_ax', None))
+                                           if channel is not None) if x else None)}
+
     def coverage(self):
         covered = self.covered()
         reason = None if covered else ("metadata_truncated" if self.x and self.x.uncovered else "refresh_pending")
@@ -1594,6 +1628,7 @@ class Worker:
                 return
             if method == "system.info":
                 result = self.health()
+                result["memory"] = self.memory_counters()
             elif method == "debug.tree_dump":
                 if not getattr(self, "tree", None) or params["window"] not in self.tree.raw:
                     raise RPCError("provider_degraded", "snapshot_unavailable")

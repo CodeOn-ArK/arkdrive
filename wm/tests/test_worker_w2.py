@@ -403,7 +403,7 @@ class FixRound4(Harness):
         # observed -> engine reconciliation, using only fake X and real journal.
         self.peer.waits = []
         self.w.peers = [self.peer]
-        self.w.x = NS(root=1, uncovered=set(), ax=NS(ask=lambda cls, cb, **kw:
+        self.w.x = NS(root=1, uncovered=set(), ax=NS(pending=[], ask=lambda cls, cb, **kw:
                       cb({"root_x": self.t.position["x"], "root_y": self.t.position["y"]})))
         self.w.observe(self.peer, 99, {"lease": "lease", **params})
         self.w.cache.commit()
