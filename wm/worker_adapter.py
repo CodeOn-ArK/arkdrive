@@ -17,7 +17,10 @@ import sys
 import time
 import uuid
 
-from packs import REGISTRY
+# Fixed for this adapter process, including its static MCP tool inventory.
+PACKS_ENABLED = os.environ.get('ARK_ACT_PACKS') != 'off'
+if PACKS_ENABLED:
+    from packs import REGISTRY
 
 MAX_FRAME = 256 * 1024
 
@@ -257,8 +260,9 @@ TOOLS = [
                                            'require': {'type': 'object', 'description': 'Optional guards: focus, modal, ref, window. Omission guards unchanged focus/modal.'},
                                            'timeout_ms': {'type': 'integer', 'minimum': 50, 'maximum': 5000}, 'id': {'type': 'string'}}, 'required': ['intent']}},
                                  deadline_ms={'type': 'integer', 'minimum': 1, 'maximum': 10000}), ['steps'])),
-    dict(name='use_skill', description=REGISTRY.description(),
-         inputSchema=schema(dict(name={'type': 'string'}, args={'type': 'object'}), ['name', 'args'])),
+    *([dict(name='use_skill', description=REGISTRY.description(),
+            inputSchema=schema(dict(name={'type': 'string'}, args={'type': 'object'}), ['name', 'args']))]
+      if PACKS_ENABLED else []),
     dict(name='wait', description='Wait without input for a worker predicate; returns fresh state and revision.',
          inputSchema=schema(dict(expect=PREDICATE, timeout_ms={'type': 'integer', 'minimum': 1, 'maximum': 30000}), ['expect', 'timeout_ms'])),
     dict(name='done', description='Finish the task and release the driver lease. Report only verified success.',
@@ -334,6 +338,8 @@ class Adapter:
 
     def update_pack(self, params, result):
         """Publish only settled focus; scoped windows never stand in for focus."""
+        if not PACKS_ENABLED:
+            return
         # Retain delivered deltas even while unsettled: the next settled
         # result can be unchanged and omit all of those window records.
         state = result.get('state', {})
@@ -356,6 +362,8 @@ class Adapter:
         self.active_pack = REGISTRY.for_class(focused.get('class', ''))
 
     def use_skill(self, arguments):
+        if not PACKS_ENABLED:
+            raise AdapterError('invalid_tool')
         name, args = arguments['name'], arguments['args']
         if not isinstance(name, str) or not isinstance(args, dict):
             raise AdapterError('invalid_arguments')
@@ -473,7 +481,7 @@ class Adapter:
                 # Return the original receipt/advice even if reconciliation fails.
         rendered = render_observe(result) if name == 'observe' else result
         content = [{'type': 'text', 'text': encoded(rendered).decode()}]
-        if name == 'observe' and self.active_pack is not None:
+        if PACKS_ENABLED and name == 'observe' and self.active_pack is not None:
             content.append(dict(type='text', text='[pack: ' + self.active_pack.NAME + ']\n' +
                                 self.active_pack.PLAYBOOK + '\n[/pack]'))
         if self.images == 'inline':
