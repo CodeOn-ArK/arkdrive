@@ -415,12 +415,15 @@ class Journal:
 
 class StateCache:
     """Immutable JSON metadata and per-facet revisions; no X calls here."""
+    REMOVED_LIMIT = 4096  # ~80 KiB at Step-0's 19.6 bytes/handle.
+
     def __init__(self, session, generation):
         self.session, self.generation = session, generation
         self.rev, self.next_window = 1, 1
         self.windows, self.removed = {}, {}
         self.stacking = []  # Client XIDs, bottom to top.
         self.tombstones = {}
+        self.history_floor, self.removed_elided = 1, 0
         self.focus, self.modal, self.pointer = None, [], None
         self.screen = None
         self.control = None
@@ -478,8 +481,39 @@ class StateCache:
         self.last_window = dict.fromkeys(self.windows, 1)
         self.removed.clear()
         self.tombstones.clear()
+        self.history_floor, self.removed_elided = 1, 0
         self.changed.clear()
         self.upserts.clear()
+
+    def removed_history(self):
+        # During an act the backing history is pinned, but observations must
+        # still fit the wire budget. Project the same tail without evicting.
+        rows = list(self.removed.items())
+        excess = max(0, len(rows) - self.REMOVED_LIMIT)
+        floor = max(self.history_floor, rows[excess - 1][1]) if excess else self.history_floor
+        return rows[excess:], floor, self.removed_elided + excess
+
+    def known_revision(self, since):
+        _, floor, _ = self.removed_history()
+        return type(since) is int and floor <= since <= self.rev
+
+    def prune_history(self):
+        """Only called at worker safe points, never during an active batch."""
+        if self.changed or self.upserts:
+            return  # Removal revisions must be committed before advancing floor.
+        excess = max(0, len(self.removed) - self.REMOVED_LIMIT)
+        for h in list(self.removed)[:excess]:
+            self.history_floor = max(self.history_floor, self.removed.pop(h))
+            self.tombstones.pop(h, None)
+            self.facets.pop('geometry[' + h + ']', None)
+        self.removed_elided += excess
+        self.last_window = {xid: rev for xid, rev in self.last_window.items() if xid in self.windows}
+        # Provider.prune_closed has discarded these publications. In particular
+        # tree facets must not survive indefinitely after unmap or forget.
+        mapped = {w['handle'] for w in self.windows.values() if w['mapped']}
+        for facet in list(self.facets):
+            if facet.startswith('tree[') and facet[5:-1] not in mapped:
+                del self.facets[facet]
 
     def selected(self, scope):
         if not isinstance(scope, dict) or any(k not in ("kind", "window", "handle") for k in scope):
@@ -508,7 +542,8 @@ class StateCache:
 
     def observe(self, scope, since, covered=True, pixel_tiles=None, tree_window=None):
         windows = self.selected(scope)
-        known = type(since) is int and 1 <= since <= self.rev
+        history, floor, elided = self.removed_history()
+        known = type(since) is int and floor <= since <= self.rev
         # Integer comparisons only. Conservative across scopes: a change in
         # another window can yield an empty delta, never a false unchanged.
         unchanged = known and covered and max((rev for facet, rev in self.facets.items()
@@ -526,7 +561,7 @@ class StateCache:
             target_handle = scope.get("window", scope.get("handle"))
             target = next((w for w in self.windows.values() if w["handle"] == target_handle),
                           self.tombstones.get(target_handle))
-            removed = [h for h, rev in self.removed.items() if (full or rev > since) and
+            removed = [h for h, rev in history if (full or rev > since) and
                        (kind == "session" or (kind == "window" and h == target_handle) or
                         (kind == "family" and target and self.tombstones[h]["family"] == target["family"]))]
             result["state"] = {
@@ -536,6 +571,8 @@ class StateCache:
                 "removed": removed,
                 "focus": self.focus, "modal": self.modal, "pointer": self.pointer,
                 "control": self.control, "screen": self.screen}
+            if full and kind == 'session':
+                result['state']['removed_elided'] = elided
         return result
 
 
@@ -1879,6 +1916,7 @@ class Worker:
             not state.get('snapshot', False) or state['publication'] != 'usable')
 
     def observation(self, params, wait_ocr=False):
+        self.prune_history()
         if not self.settle_pixels():
             raise ActError("provider_degraded", "capture_pending")
         channels = params.get("channels", ["auto"])
@@ -1928,7 +1966,7 @@ class Worker:
                     try:
                         state = self.act.lease_state.get(self.lease, {}) if getattr(self, "act", None) else {}
                         baseline = state.get("trees", {}).get(tree_window)
-                        tree_since = baseline if since is not None and baseline is not None and baseline <= since else None
+                        tree_since = baseline if not result['full'] and baseline is not None and baseline <= since else None
                         result["tree"] = tree.cache.page(tree_window, tree_since, params.get("cursor"), params.get("budget"),
                                                         dirty=tree_window in tree.dirty)
                         result["channels_used"].append("tree")
@@ -2006,7 +2044,8 @@ class Worker:
         if (tree and scope.get('kind', 'session') == 'window' and any(
                 w['handle'] == tree.target(scope) and w['mapped'] for w in self.cache.windows.values())):
             probe = tree.observe_probe(tree.target(scope))
-        full = since is None or since < 1 or since > self.cache.rev
+        self.prune_history()
+        full = not self.cache.known_revision(since)
         if full:
             pending = {"kind": "observe", "id": ident, "params": params,
                        "deadline": deadline, "pointer_pending": True,
@@ -2027,8 +2066,17 @@ class Worker:
             except OCRPending:
                 peer.waits.append(dict(kind='observe', id=ident, params=params, deadline=deadline))
                 return
-            self.observed(peer, params, result)
-            self.respond(peer, ident, result)
+            self.deliver_observation(peer, ident, params, result)
+
+    def deliver_observation(self, peer, ident, params, result):
+        # Check the actual JSON-RPC envelope before acknowledging reconciliation.
+        # Live windows/provider payloads have no total byte bound; never let an
+        # oversized full sample silently break the adapter's framing contract.
+        if len(json_bytes({'jsonrpc': '2.0', 'id': ident, 'result': result})) > MAX_FRAME:
+            self.respond(peer, ident, exc=RPCError('response_too_large', 'observe_frame_cap'))
+            return
+        self.observed(peer, params, result)
+        self.respond(peer, ident, result)
 
     def observed(self, peer, params, result):
         if getattr(self, "act", None):
@@ -2149,8 +2197,14 @@ class Worker:
                     continue
                 peer.waits.remove(item)
                 if item["kind"] == "observe":
-                    self.observed(peer, item["params"], result)
-                self.respond(peer, item["id"], result)
+                    self.deliver_observation(peer, item["id"], item["params"], result)
+                else:
+                    self.respond(peer, item["id"], result)
+
+    def prune_history(self):
+        act = getattr(self, 'act', None)
+        if not act or act.active is None:
+            self.cache.prune_history()
 
     def ingest(self):
         events = self.x.ax.pump()
@@ -2166,6 +2220,7 @@ class Worker:
             self.tree.tick()
         if getattr(self, 'ocr', None):
             self.ocr.tick()
+        self.prune_history()
 
     def run(self):
         failure = None

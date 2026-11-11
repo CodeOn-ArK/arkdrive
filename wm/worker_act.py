@@ -616,6 +616,7 @@ class Engine:
 
     def tick(self):
         self.prune_windows()
+        self.w.prune_history()
         if self.evdev:
             self.evdev.tick()
         if self.selftest:
@@ -632,6 +633,7 @@ class Engine:
                 next(self.active["runner"])
             except StopIteration:
                 self.active = None
+                self.w.prune_history()
 
     def stopping_tick(self):
         """Release-only shutdown. Interrupted actions stay durable/unknown."""

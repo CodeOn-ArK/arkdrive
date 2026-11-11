@@ -625,6 +625,7 @@ class Provider:
             self.unavailable.discard(h)
             self.dirty.discard(h)
             self.inventories = {k: v for k, v in self.inventories.items() if k[0] != h}
+        self.w.prune_history()
         # Retain app health/epochs until all flights (including forget) drain.
         # No process-liveness inference is needed: an app with no live windows
         # has no cached state to supervise, even if its process stays alive.
