@@ -26,7 +26,7 @@ from worker_tree import Wire, packet, MAX_IPC
 
 OCR_KINDS = {'ocr_text', 'ocr_text_present', 'ocr_text_absent'}
 IMAGE_LIMIT = 64 * 1024 * 1024
-PARAMETERS = ('eng', 'grey', 2, 60, 'sparse/line48')
+PARAMETERS = ('eng', 'grey', 2, 60, 'sparse/line48', 'glyph-v1')
 
 
 class PipePair:
@@ -75,7 +75,7 @@ def merge_lines(old, new, slab, damage):
 
 
 class Backend:
-    def __init__(self):
+    def __init__(self, datapath=None, scale=2, psm=None, shapes=True):
         from PIL import Image
         self.Image = Image
         self.lib = lib = C.CDLL('libtesseract.so.5')
@@ -94,8 +94,9 @@ class Backend:
         for name, (result, args) in signatures.items():
             fn = getattr(lib, name)
             fn.restype, fn.argtypes = result, args
+        self.scale, self.psm, self.shapes = scale, psm, shapes
         self.api = lib.TessBaseAPICreate()
-        if not self.api or lib.TessBaseAPIInit3(self.api, None, b'eng'):
+        if not self.api or lib.TessBaseAPIInit3(self.api, os.fsencode(datapath) if datapath else None, b'eng'):
             self.close()
             raise RuntimeError('ocr_init_failed')
         lib.TessBaseAPISetVariable(self.api, b'debug_file', b'/dev/null')
@@ -107,25 +108,28 @@ class Backend:
             self.api = None
 
     @staticmethod
-    def lines(tsv, rect):
+    def lines(tsv, rect, scale=2, min_conf=60):
         groups = OrderedDict()
         for row in tsv.splitlines()[1:]:
             fields = row.split('\t', 11)
             if len(fields) != 12 or fields[0] != '5':
                 continue
             conf = float(fields[10])
-            if conf < 60 or not fields[11].strip():
+            if conf < min_conf or not fields[11].strip():
                 continue
             left, top, width, height = map(int, fields[6:10])
             groups.setdefault(tuple(fields[1:5]), []).append((fields[11], left, top, width, height, conf))
         result = []
         for words in groups.values():
+            text = ' '.join(v[0] for v in words)
+            if not any(c.isalnum() for c in text):
+                continue
             x, y = min(v[1] for v in words), min(v[2] for v in words)
             right, bottom = max(v[1]+v[3] for v in words), max(v[2]+v[4] for v in words)
             # Round outwards after undoing preprocessing; never frame-scaled.
-            result.append(dict(text=' '.join(v[0] for v in words),
-                               box=[rect['x']+x//2, rect['y']+y//2,
-                                    math.ceil(right/2)-x//2, math.ceil(bottom/2)-y//2],
+            result.append(dict(text=text,
+                               box=[rect['x']+x//scale, rect['y']+y//scale,
+                                    math.ceil(right/scale)-x//scale, math.ceil(bottom/scale)-y//scale],
                                conf=min(v[5] for v in words)))
         return ordered(result)
 
@@ -134,12 +138,15 @@ class Backend:
         if w <= 0 or h <= 0 or len(rgb) != w*h*3 or len(rgb) > IMAGE_LIMIT:
             raise ValueError('ocr_image_invalid')
         image = self.Image.frombytes('RGB', (w, h), rgb).convert('L')
-        image = image.resize((w*2, h*2), self.Image.Resampling.BICUBIC)
+        source = image
+        scale = self.scale
+        image = image.resize((w*scale, h*scale), self.Image.Resampling.BICUBIC)
         raw = C.create_string_buffer(image.tobytes())
         lib, api = self.lib, self.api
-        lib.TessBaseAPISetPageSegMode(api, 7 if mode == 'line' or mode is None and h <= 48 else 11)
-        lib.TessBaseAPISetImage(api, raw, w*2, h*2, 1, w*2)
-        lib.TessBaseAPISetSourceResolution(api, 192)
+        lib.TessBaseAPISetPageSegMode(api, self.psm if self.psm is not None else
+                                   7 if mode == 'line' or mode is None and h <= 48 else 11)
+        lib.TessBaseAPISetImage(api, raw, w*scale, h*scale, 1, w*scale)
+        lib.TessBaseAPISetSourceResolution(api, 96*scale)
         text = None
         try:
             if lib.TessBaseAPIRecognize(api, None):
@@ -147,7 +154,16 @@ class Backend:
             text = lib.TessBaseAPIGetTsvText(api, 0)
             if not text:
                 raise RuntimeError('ocr_result_missing')
-            return self.lines(C.string_at(text).decode('utf-8'), rect)
+            tsv = C.string_at(text).decode('utf-8')
+            if self.shapes:
+                from worker_ocr_shapes import recognize
+                refined = recognize(source, self.lines(tsv, dict(x=0, y=0), scale, min_conf=0))
+                if refined is not None:
+                    for line in refined:
+                        line['box'][0] += rect['x']
+                        line['box'][1] += rect['y']
+                    return ordered(refined)
+            return self.lines(tsv, rect, scale)
         finally:
             if text:
                 lib.TessDeleteText(text)
@@ -378,6 +394,7 @@ class Provider:
                             raise ValueError('ocr_invalid_box')
                     if task['previous']:
                         lines = merge_lines(task['previous']['lines'], lines, task['slab'], task['damage'])
+                    lines = [l for l in lines if any(c.isalnum() for c in l['text'])]
                     value = dict(lines=ordered(lines), rows=task['rows'], columns=task['columns'], digest=task['digest'], rev=task['rev'])
                     self.remember(self.cache, task['key'], value)
                     self.remember(self.latest, task['identity'], value)

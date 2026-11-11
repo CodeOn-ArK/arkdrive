@@ -279,6 +279,56 @@ class PredicatesAndObservations(OCRHarness):
             result = self.w.observation(dict(since_rev=self.w.cache.rev))
         self.assertTrue(result['unchanged'])
 
+    def test_degradation_after_repeated_session_observes_still_serves_window_ocr(self):
+        since = self.w.cache.rev
+        for _ in range(5):
+            result = self.w.observation(dict(since_rev=since))
+            self.w.observed(self.peer, {}, result)
+            self.assertTrue(result['unchanged'])
+        self.degrade_tree()
+        params = dict(scope=dict(kind='window', handle=self.handle), since_rev=since)
+        with self.assertRaises(OCRPending):
+            self.w.observation(params, wait_ocr=True)
+        self.answer_ocr([line('Add to list'), line('Clicks: 0', y=170), line('Item 1', y=210)])
+        result = self.w.observation(params, wait_ocr=True)
+        self.assertFalse(result['unchanged'])
+        self.assertEqual(result['channels_used'], ['state', 'ocr'])
+        self.assertEqual(len(result['ocr']['lines']), 3)
+        self.w.observed(self.peer, params, result)
+        with patch.object(self.o, 'read', side_effect=AssertionError('already served')):
+            self.assertTrue(self.w.observation(params)['unchanged'])
+        # A healthy interval and a second degradation require fresh delivery,
+        # even when all source pixels stayed identical throughout.
+        self.p.apps[self.p.app(self.p.window(self.handle))].state = 'healthy'
+        self.w.observed(self.peer, params, self.w.observation(params))
+        self.degrade_tree()
+        self.assertIn('ocr', self.w.observation(params))
+
+    def test_healthy_window_stays_on_fast_path_with_degraded_neighbor(self):
+        with patch.object(self.w, 'providers', return_value=dict(atspi=dict(state='degraded'), ocr=self.o.health())), \
+                patch.object(self.o, 'read', side_effect=AssertionError('healthy OCR')):
+            for _ in range(5):
+                result = self.w.observation(dict(scope=dict(kind='window', handle=self.handle),
+                                                 since_rev=self.w.cache.rev))
+                self.assertTrue(result['unchanged'])
+        self.assertEqual(self.o.requests, 0)
+
+    def test_degraded_publication_with_pending_retry_still_bypasses_unchanged(self):
+        self.warm([line()])
+        with patch.object(self.p, 'status', return_value='degraded'), \
+                patch.object(self.p, 'readiness', return_value='pending'):
+            result = self.w.observation(dict(since_rev=self.w.cache.rev,
+                scope=dict(kind='window', handle=self.handle)))
+        self.assertFalse(result['unchanged'])
+        self.assertEqual(result['ocr']['lines'], [line()])
+
+    def test_symbol_only_lines_do_not_suppress_blind_frame(self):
+        self.warm([line('Add to list'), line('(|', y=160), line('|', y=200)])
+        self.degrade_tree()
+        result = self.w.observation({})
+        self.assertEqual(result['ocr']['lines'], [line('Add to list')])
+        self.assertEqual(len(result['frames']), 1)
+
     def test_short_observation_deadline_does_not_wait_for_region_budget(self):
         self.degrade_tree()
         with self.assertRaises(OCRPending):
@@ -469,6 +519,14 @@ class Breakers(OCRHarness):
 
 
 class BackendContracts(unittest.TestCase):
+    def test_symbol_only_lines_are_removed_but_unicode_text_is_retained(self):
+        header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+        texts = ('(|', '|', '...', '—', 'é', '３', 'Clicks: 0', '©')
+        tsv = header + '\n'.join(f'5\t1\t1\t1\t{i}\t1\t0\t{i*20}\t20\t10\t95\t{text}'
+                                  for i, text in enumerate(texts))
+        self.assertEqual([l['text'] for l in Backend.lines(tsv, dict(x=0, y=0))],
+                         ['é', '３', 'Clicks: 0'])
+
     def test_low_confidence_words_are_removed_before_line_boxes(self):
         header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
         rows = ['5\t1\t1\t1\t1\t1\t10\t20\t30\t12\t59\tNoise',
@@ -545,10 +603,7 @@ class RealChild(OCRHarness):
                 self.assertLessEqual(abs(a-e), 4)
         self.assertEqual([l['text'] for l in result[:3]], [v[0] for v in STRINGS[:3]])
 
-    @unittest.expectedFailure
     def test_fx_canvas_every_string_byte_exact_B6(self):
-        # Explicit gate finding: current eng model reads W0 as WO. Do not
-        # silently correct OCR evidence using fixture knowledge.
         self.assertEqual([l['text'] for l in self.read_real(self.real_child())], [v[0] for v in STRINGS])
 
     def test_200_partial_repaints_equal_fresh_full_read(self):
