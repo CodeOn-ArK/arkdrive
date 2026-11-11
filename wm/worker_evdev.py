@@ -103,6 +103,11 @@ class EvdevTransport:
         self.refresh_inflight = False
         self.stopping = False
         self.last_ack = None
+        self.instance = None
+        self.sequence_instance = None
+        # Wire codes are captured before submission, not recomputed from a
+        # possibly refreshed XKB table during crash cleanup.
+        self.held_codes = {'kbd': set(), 'ptr': set()}
 
     @property
     def raw(self):
@@ -144,12 +149,19 @@ class EvdevTransport:
         info = self.path.stat()
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o600:
             raise OSError('helper_socket_permissions')
+        token_path = Path(str(self.path) + '.instance')
+        token_info = token_path.stat()
+        token = token_path.read_text().strip()
+        if (token_info.st_uid != os.getuid() or token_info.st_mode & 0o777 != 0o600 or
+                len(token) != 32 or any(c not in '0123456789abcdef' for c in token)):
+            raise OSError('helper_instance_invalid')
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.setblocking(False)
             result = sock.connect_ex(str(self.path))
             if result not in (0, errno.EINPROGRESS, errno.EAGAIN):
                 raise OSError(result, 'helper_connect')
+            self.instance = token
             return sock
         except BaseException:
             try:
@@ -161,10 +173,18 @@ class EvdevTransport:
     def exchange(self, req):
         sock, sent, submitted = self.sock, 0, False
         try:
-            data, received = packet(req), bytearray()
             deadline = self.clock() + 0.25 + len(req.get('frames', [])) * req.get('gap_us', 0) / 1e6
             if sock is None:
                 sock = self.sock = self.connector()
+            if self.instance is not None:
+                previous = req.get('instance')
+                if previous is not None and previous != self.instance:
+                    # A new process has an EMPTY reply cache. Replaying ACT
+                    # here would duplicate a prefix; only cleanup can cross it.
+                    raise ChannelError('helper_restarted')
+                req['instance'] = self.instance
+                self.sequence_instance = self.instance
+            data, received = packet(req), bytearray()
             while True:
                 # X ingestion may retire this channel while I/O yields. Never
                 # dereference self.sock again or switch to a replacement stream.
@@ -200,6 +220,8 @@ class EvdevTransport:
                                 reply = json.loads(received[4:size + 4])
                                 if not isinstance(reply, dict) or type(reply.get('seq')) is not int or reply['seq'] != req['seq']:
                                     raise ChannelError('helper_seq_mismatch', True)
+                                if reply.get('error') == 'helper_restarted':
+                                    raise ChannelError('helper_restarted', submitted)
                                 return reply
                 except (BlockingIOError, InterruptedError):
                     pass
@@ -218,7 +240,7 @@ class EvdevTransport:
         self.refresh_inflight = _refresh
         self.frame_epoch = self.map_epoch if _map_epoch is None else _map_epoch
         try:
-            if self.health['state'] == 'down' and fields.get('op') != 'release_all':
+            if self.health['state'] == 'down' and fields.get('op') not in ('release_all', 'release_held'):
                 raise ChannelError(self.health['last_error'] or 'channel_down')
             return (yield from self._request(**fields))
         except ActError:
@@ -234,6 +256,8 @@ class EvdevTransport:
     def _request(self, **fields):
         self.seq += 1
         req = dict(seq=self.seq, **fields)
+        if self.instance is not None:
+            req['instance'] = self.instance
         # A reconnect uses the identical sequence and payload. The helper
         # caches replies across connections, so lost acknowledgements cannot
         # cause a second write. Only one reconnect in this generation.
@@ -470,9 +494,42 @@ class EvdevTransport:
     def release_all(self):
         try:
             reply = yield from self.request(op='release_all')
-            return reply.get('ok') is True
+            if reply.get('ok') is True:
+                return True
         except ChannelError:
-            return False
+            pass
+        return False
+
+    def recover_release(self):
+        """Bounded wait for sessiond's replacement; never submits ACT frames.
+
+        Keep evdev down for this generation. XTEST is available only after the
+        engine independently observes that the recorded holds are released.
+        """
+        if self.instance is None:
+            return False  # Unsupervised/legacy transport has no incarnation.
+        deadline, retry_at = self.clock() + 2, self.clock()
+        while self.clock() < deadline:
+            if self.clock() < retry_at:
+                yield
+                continue
+            self.close()
+            try:
+                # Establish the new incarnation before allocating its cleanup
+                # sequence. The dead helper's requests are never carried over.
+                self.sock = self.connector()
+                if self.sequence_instance != self.instance:
+                    self.seq = 0
+                    self.sequence_instance = self.instance
+                reply = yield from self.request(op='release_held', generation=self.w.generation,
+                    holds={dev: sorted(codes) for dev, codes in self.held_codes.items()})
+                if reply.get('ok') is True:
+                    return True
+            except Exception as exc:
+                self.down(self.failure(exc).reason)
+            retry_at = self.clock() + .02
+            yield
+        return False
 
     def send_frames(self, dev, frames, expected, gap_us, *, map_epoch=None):
         ack = self.last_ack = Ack(expected, self.sources, self.raw_seq)

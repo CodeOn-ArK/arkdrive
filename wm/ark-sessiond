@@ -24,7 +24,7 @@ WM = Path(__file__).resolve().parent
 RULE = Path("/etc/udev/rules.d/49-arkdrive-sessiond.rules")
 RULE_TEXT = ('SUBSYSTEM=="input", ATTR{name}=="ArkDrive *", ENV{ID_INPUT}="0", '
              'ENV{LIBINPUT_IGNORE_DEVICE}="1", ENV{ID_SEAT}="seat-arkdrive", TAG+="seat"\n')
-PID_FIELDS = ("pid_x", "pid_dbus", "pid_atspi_launcher", "pid_registryd", "mkdevs_pid")
+PID_FIELDS = ("pid_x", "pid_dbus", "pid_atspi_launcher", "pid_registryd", "mkdevs_pid", "mkdevs_supervisor_pid")
 
 
 def milliseconds(start):
@@ -127,8 +127,16 @@ class UnsafeTeardown(RuntimeError):
 
 
 def require_helper_dead(record):
-    if record['profile'] == 'xorg' and alive(record.get('mkdevs_pid')):
-        raise UnsafeTeardown('teardown aborted: mkdevs helper is still alive; refusing to signal Xorg')
+    if record['profile'] == 'xorg':
+        if record.get('mkdevs_supervisor_pid'):
+            # The record's child pid predates any respawns. Once the
+            # supervisor is dead this final pidfile is stable.
+            try:
+                record['mkdevs_pid'] = int((Path(record['session_dir']) / 'devices.json.pid').read_text())
+            except (OSError, ValueError):
+                raise UnsafeTeardown('cannot establish final helper pid; refusing to signal Xorg')
+        if any(alive(record.get(key)) for key in ('mkdevs_pid', 'mkdevs_supervisor_pid')):
+            raise UnsafeTeardown('teardown aborted: mkdevs helper is still alive; refusing to signal Xorg')
 
 
 def send_signal(record, pid, sig):
@@ -196,7 +204,14 @@ def teardown(record, records):
 
     if record["profile"] == "xorg":
         # A gate-write error aborts teardown before quit or any process signal.
-        close_control_gate(Path(record['session_dir']) / 'control')
+        directory = Path(record['session_dir'])
+        if record.get('mkdevs_supervisor_pid'):
+            with (directory / 'helper.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                close_control_gate(directory / 'control')
+                (directory / 'helper.stopping').touch()
+        else:
+            close_control_gate(directory / 'control')
         def quit_devices():
             try:
                 fd = os.open(Path(record["session_dir"]) / "cmd.fifo",
@@ -210,6 +225,20 @@ def teardown(record, records):
             finally:
                 os.close(fd)
         attempt(quit_devices)
+        supervisor = record.get('mkdevs_supervisor_pid')
+        if supervisor:
+            wait_exit([supervisor], 5)
+            if alive(supervisor):
+                attempt(lambda: send_signal(record, supervisor, signal.SIGKILL))
+                wait_exit([supervisor], 5)
+            if alive(supervisor):
+                raise UnsafeTeardown('mkdevs supervisor is still alive; refusing to signal Xorg')
+            try:
+                record['mkdevs_pid'] = int((directory / 'devices.json.pid').read_text())
+            except (OSError, ValueError):
+                # During failed startup there may never have been a child.
+                if record.get('mkdevs_pid'):
+                    raise UnsafeTeardown('cannot establish final helper pid; refusing to signal Xorg')
         helper = record.get('mkdevs_pid')
         wait_exit([helper], 5)
         if alive(helper):
@@ -305,12 +334,16 @@ def start_xorg(record, records, timings):
     directory = Path(record["session_dir"])
     fifo = directory / "cmd.fifo"
     os.mkfifo(fifo)
+    # Sessiond must retain write access to the fork/stop lock. Letting the
+    # privileged supervisor create it would leave a root-owned 0644 file.
+    (directory / 'helper.lock').touch(mode=0o600)
     helper = spawn(record, ["python3", WM / "mkdevs.py", "--fifo", fifo,
                     "--devices-json", directory / "devices.json", "--name-prefix",
                     f'ArkDrive {record["session"]}',
                     "--event-socket", directory / "input.sock",
                     "--owner-uid", str(os.getuid()),
-                    "--control", directory / "control"], "mkdevs.log", root=True)
+                    "--control", directory / "control", "--supervise"], "mkdevs.log", root=True)
+    record['mkdevs_supervisor_pid'] = int(wait_file(directory / 'devices.json.supervisor.pid', 10, helper))
     raw = wait_file(directory / "devices.json", 10, helper, record, "mkdevs_pid")
     record["mkdevs_pid"] = int((directory / "devices.json.pid").read_text())
     record["devices"] = json.loads(raw)
@@ -365,7 +398,7 @@ def start_session(profile):
                   "runtime_dir": str(directory / "runtime"),
                   "session_dir": str(directory), "created_at": time.time()}
         if profile == "xorg":
-            record.update(vt=None, devices={}, mkdevs_pid=None)
+            record.update(vt=None, devices={}, mkdevs_pid=None, mkdevs_supervisor_pid=None)
         timings = {}
         try:
             used = {r["display"] for r in records.values() if alive(r.get("pid_x"))}
@@ -378,7 +411,8 @@ def start_session(profile):
                 (directory / name).mkdir(parents=True, exist_ok=True)
             (directory / "runtime").chmod(0o700)
             # Session ids may be reused after stop; discard old helper outputs.
-            for name in ("devices.json", "devices.json.pid", "xorg.pid", "cmd.fifo", "input.sock"):
+            for name in ("devices.json", "devices.json.pid", "devices.json.supervisor.pid", "helper.stopping",
+                         "xorg.pid", "cmd.fifo", "input.sock", "input.sock.instance"):
                 path = directory / name
                 if path.exists():
                     path.unlink()

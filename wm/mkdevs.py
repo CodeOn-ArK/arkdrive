@@ -7,13 +7,17 @@ import errno
 import fcntl
 import glob
 import json
+import mmap
 import os
 from pathlib import Path
 import selectors
 import socket
+import signal
 import struct
 import threading
 import time
+import traceback
+import uuid
 
 from input_protocol import MAX_MESSAGE, control_snapshot, packet
 
@@ -32,13 +36,28 @@ BUS_VIRTUAL = 0x06
 
 class EventProtocol:
     """No device creation here: writers/grabs/clock are injectable for tests."""
-    def __init__(self, writers, gate, grab, sleep=time.sleep, *, frame_grab=None):
+    def __init__(self, writers, gate, grab, sleep=time.sleep, *, frame_grab=None,
+                 generation_state=None, instance=None):
         self.writers, self.gate, self.grab, self.sleep = writers, gate, grab, sleep
         self.frame_grab = frame_grab or grab
         self.held = {"kbd": set(), "ptr": set()}
         self.replies = {}
         self.high_seq = -1
-        self.generation = None
+        self.generation_state = generation_state
+        self._generation = None
+        self.instance = instance
+
+    @property
+    def generation(self):
+        if self.generation_state is not None:
+            return self.generation_state[:].rstrip(b'\0').decode() or None
+        return self._generation
+
+    @generation.setter
+    def generation(self, value):
+        if self.generation_state is not None:
+            self.generation_state[:] = value.encode()
+        self._generation = value
 
     @staticmethod
     def valid(req):
@@ -83,6 +102,11 @@ class EventProtocol:
         reply = {"seq": seq, "ok": False, "frames_written": 0, "error": "rejected"}
         if not isinstance(req, dict) or type(seq) is not int or seq < 0:
             return reply
+        if self.instance is not None:
+            if req.get('instance') != self.instance:
+                return dict(reply, error='helper_restarted')
+            req = dict(req)
+            del req['instance']
         payload = json.dumps(req, sort_keys=True, separators=(",", ":"))
         if seq in self.replies:
             previous, result = self.replies[seq]
@@ -98,6 +122,13 @@ class EventProtocol:
                             self.write(dev, [(EV_KEY, code, 0) for code in sorted(self.held[dev])])
                 else:
                     reply.update({dev: self.grab(dev) for dev in ("kbd", "ptr")})
+                reply.update(ok=True, error=None)
+            elif self.valid_release(req) and self.generation == req['generation']:
+                # Recovery is release-only, including with a closed control
+                # gate or lost grab. A new helper has no in-memory held set.
+                for dev, codes in req['holds'].items():
+                    if codes:
+                        self.write(dev, [(EV_KEY, code, 0) for code in codes])
                 reply.update(ok=True, error=None)
             elif self.valid(req) and self.generation in (None, req["generation"]):
                 epoch = self.gate(req["generation"])
@@ -132,6 +163,17 @@ class EventProtocol:
         if len(self.replies) > 4096:
             del self.replies[min(self.replies)]
         return reply
+
+    @staticmethod
+    def valid_release(req):
+        if set(req) != {'seq', 'op', 'generation', 'holds'} or req['op'] != 'release_held':
+            return False
+        holds = req['holds']
+        return (isinstance(holds, dict) and set(holds) == {'kbd', 'ptr'} and
+                all(isinstance(codes, list) and len(codes) <= 248 and
+                    all(type(c) is int and (1 <= c <= 248 and c != 99 if dev == 'kbd'
+                                           else 0x110 <= c <= 0x112) for c in codes)
+                    for dev, codes in holds.items()))
 
 
 def node_grab(node):
@@ -332,6 +374,114 @@ def make_dev(name, kind, owner_uid):
         raise
 
 
+class HelperSupervisor:
+    """Sessiond-owned device lifetime; children own only the event server.
+
+    Retaining the uinput open file descriptions keeps the SAME input devices
+    alive after SIGKILL. Only the generation pin is shared, never reply caches
+    or requests. The lock serializes fork against sessiond's stop marker.
+    """
+    def __init__(self, args, nodes, fds):
+        self.args, self.nodes, self.fds = args, nodes, fds
+        self.directory = Path(args.devices_json).parent
+        self.generation = mmap.mmap(-1, 32)
+        self.child = None
+        self.stopping = False
+
+    def start_child(self):
+        with (self.directory / 'helper.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self.stopping or (self.directory / 'helper.stopping').exists():
+                return False
+            if not all(Path(node).exists() for node in self.nodes.values()):
+                return False
+            # The previous child has been reaped before this is called.
+            Path(self.args.event_socket).unlink(missing_ok=True)
+            pid = os.fork()
+            if pid:
+                self.child = pid
+                # Publish under the fork/stop lock, including a child killed
+                # before it can publish socket readiness.
+                path = Path(self.args.devices_json + '.pid')
+                tmp = Path(str(path) + '.parent.tmp')
+                tmp.write_text(str(pid) + '\n')
+                tmp.replace(path)
+                return True
+            # Do not inherit the parent's flock/open description or handlers.
+            lock.close()
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            try:
+                self.serve_child()
+            except BaseException:
+                traceback.print_exc()
+            finally:
+                os._exit(1)
+
+    def serve_child(self):
+        args = self.args
+        instance = uuid.uuid4().hex
+        probes = {dev: FrameGrab(node) for dev, node in self.nodes.items()}
+        protocol = EventProtocol(dict(zip(('kbd', 'ptr'), map(device_writer, self.fds))),
+            lambda gen: control_snapshot(args.control, gen),
+            lambda dev: node_grab(self.nodes[dev]), frame_grab=lambda dev: probes[dev](),
+            generation_state=self.generation, instance=instance)
+        events = EventSocket(args.event_socket, args.owner_uid, protocol)
+        events.start()
+        # Publish after listen, atomically; stale tokens are refused by the
+        # server, including the metadata/socket replacement race.
+        path = Path(args.event_socket + '.instance')
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(instance + '\n')
+        os.chmod(tmp, 0o600)
+        os.chown(tmp, args.owner_uid, -1)
+        tmp.replace(path)
+        pid_path = Path(args.devices_json + '.pid')
+        pid_tmp = Path(str(pid_path) + '.child.tmp')
+        pid_tmp.write_text(str(os.getpid()) + '\n')
+        pid_tmp.replace(pid_path)
+        Path(args.devices_json).write_text(json.dumps(self.nodes) + '\n')
+        while events.thread.is_alive():
+            time.sleep(.05)
+
+    def run(self):
+        def stop(*_):
+            self.stopping = True
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        # Keep a nonblocking read/write FIFO open so quit is independent of
+        # child requests and death. No child inherits a separate FIFO reader.
+        fifo = os.open(self.args.fifo, os.O_RDWR | os.O_NONBLOCK)
+        pending = b''
+        try:
+            while not self.stopping:
+                try:
+                    pending += os.read(fifo, 4096)
+                except BlockingIOError:
+                    pass
+                if b'quit' in pending.split(b'\n') or (self.directory / 'helper.stopping').exists():
+                    break
+                if self.child is not None:
+                    exited, _ = os.waitpid(self.child, os.WNOHANG)
+                    if exited:
+                        self.child = None
+                if self.child is None and not self.start_child():
+                    break
+                time.sleep(.02)
+        finally:
+            self.stopping = True
+            if self.child is not None:
+                try:
+                    os.kill(self.child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(self.child, 0)
+                self.child = None
+            os.close(fifo)
+            self.generation.close()
+            Path(self.args.event_socket).unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fifo", required=True)
@@ -340,13 +490,16 @@ def main():
     parser.add_argument("--event-socket")
     parser.add_argument("--owner-uid", type=int)
     parser.add_argument("--control")
+    parser.add_argument("--supervise", action='store_true')
     args = parser.parse_args()
     plumbing = (args.event_socket, args.owner_uid, args.control)
     if any(value is not None for value in plumbing) and not all(
             value is not None for value in plumbing):
         parser.error("--event-socket, --owner-uid and --control must be supplied together")
+    if args.supervise and args.event_socket is None:
+        parser.error('--supervise requires event socket plumbing')
     devices_json = Path(args.devices_json)
-    Path(str(devices_json) + ".pid").write_text(str(os.getpid()) + "\n")
+    Path(str(devices_json) + ('.supervisor.pid' if args.supervise else '.pid')).write_text(str(os.getpid()) + "\n")
     if not os.path.exists(args.fifo):
         os.mkfifo(args.fifo)
     fds = []
@@ -358,6 +511,9 @@ def main():
             fd, node = make_dev(f"{args.name_prefix} {kind}", kind, args.owner_uid if args.owner_uid is not None else os.getuid())
             fds.append(fd)
             nodes[kind] = node
+        if args.supervise:
+            HelperSupervisor(args, nodes, fds).run()
+            return 0
         if args.event_socket is not None:
             for dev, node in nodes.items():
                 probes[dev] = FrameGrab(node)

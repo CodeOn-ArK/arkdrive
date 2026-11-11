@@ -218,6 +218,8 @@ class Engine:
         if self.fence_reason:
             return
         self.fence_reason = reason
+        if reason == 'F1:release_unconfirmed' and self.evdev and any(self.holds['evdev'].values()):
+            self.evdev.health['fenced'] = reason
         if journal:
             try:
                 self.durable("fence", reason=reason)
@@ -242,6 +244,8 @@ class Engine:
                     self.durable("fence_clear", previous=self.fence_reason, control_epoch=current["epoch"])
                     if not any(v for holds in self.holds.values() for v in holds.values()):
                         self.fence_reason = None
+                        if self.evdev:
+                            self.evdev.health.pop('fenced', None)
                 except ActError:
                     pass
             # New authority always needs a new attach and full observation.
@@ -983,14 +987,29 @@ class Engine:
             group = plan[offset:end]
             if not diagnostic:
                 self.gate(a)
+            elif self.fence_reason:
+                raise ActError('worker_fault', self.fence_reason)
             elif self.shutdown or (self.w.cache.control or {}).get("state") != "agent":
                 raise ActError("preempted")
             expected = [event for _, _, raw in group for event in raw]
+            prior_holds = {kind: set(codes) for kind, codes in holds.items()}
+            prior_wire_holds = set(self.evdev.held_codes[dev])
+            for device, frame, _ in group:
+                self.evdev.held_codes[device].update(code for typ, code, value in frame if typ == 1 and value == 1)
             for kind, detail in expected:
                 if kind in ("key_down", "button_down"):
                     holds["key" if kind == "key_down" else "button"].add(detail)
             gap = 2000 if dev == "kbd" else 0
             result = yield from self.evdev.send_frames(dev, [frame for _, frame, _ in group], expected, gap, map_epoch=epoch)
+            if result['dispatch_status'] == 'not_dispatched':
+                # A proven zero-write refusal (including a different worker
+                # generation's pin) adds no holds. Preserve earlier groups'
+                # holds, but do not fence a new worker for a rejected press.
+                for kind, codes in prior_holds.items():
+                    holds[kind].clear()
+                    holds[kind].update(codes)
+                self.evdev.held_codes[dev].clear()
+                self.evdev.held_codes[dev].update(prior_wire_holds)
             if dev == 'kbd':
                 r['evdev_map_epoch'] = epoch
             if not diagnostic and self.evdev.last_ack is not None:
@@ -1006,8 +1025,17 @@ class Engine:
                 # this macro and the batch without another route or replay.
                 raise ActError(result["reason"])
             for kind, detail in expected:
-                if kind in ("key_up", "button_up"):
+                if kind in ('key_down', 'button_down'):
+                    holds['key' if kind == 'key_down' else 'button'].add(detail)
+                elif kind in ("key_up", "button_up"):
                     holds["key" if kind == "key_up" else "button"].discard(detail)
+            for device, frame, _ in group:
+                for typ, code, value in frame:
+                    if typ == 1:
+                        if value:
+                            self.evdev.held_codes[device].add(code)
+                        else:
+                            self.evdev.held_codes[device].discard(code)
             offset = end
             if dev == "kbd" and offset < len(plan) and plan[offset][0] == dev:
                 yield from self.pause(gap/1e6, a if not diagnostic else None)
@@ -1018,8 +1046,27 @@ class Engine:
         if not any(holds.values()):
             return True
         events = [("key_up", c) for c in sorted(holds["key"])] + [("button_up", c) for c in sorted(holds["button"])]
-        self.durable_cleanup(a, events)
-        ok = yield from self.evdev.release_all()
+        snapshot = tuple(events)
+        previous = a.get('evdev_release')
+        if previous and not previous['cleanup']['confirmed'] and previous['holds'] == snapshot:
+            r['cleanup'] = previous['cleanup']
+            return previous['cleanup']['confirmed']
+        # Verification and finalization can both request cleanup. One attempt
+        # per unchanged hold set/action, with one durable outcome, even on F1.
+        try:
+            self.durable('release_armed', action_id=a['params']['action_id'], route='evdev', events=events,
+                         wire_holds={dev: sorted(codes) for dev, codes in self.evdev.held_codes.items()})
+        except ActError:
+            pass  # Release remains possible after F3.
+        self.evdev.health['release_pending'] = True
+        # A replacement's empty helper-local held set cannot prove release of
+        # the dead helper's presses. Always replay our recorded wire holds
+        # once a supervised transport has been retired.
+        ok = False
+        if self.evdev.health['state'] != 'down' or self.evdev.instance is None:
+            ok = yield from self.evdev.release_all()
+        if not ok:
+            ok = yield from self.evdev.recover_release()
         # The helper reply proves writes, not X consumption. Confirm release
         # independently on this session's X connection, even after gate closure.
         confirmed = False
@@ -1036,9 +1083,14 @@ class Engine:
                 break
             yield
         r["cleanup"] = {"released": events if confirmed else [], "unreleased": [] if confirmed else events, "confirmed": confirmed}
+        a['evdev_release'] = {'holds': snapshot, 'cleanup': r['cleanup']}
+        self.durable_cleanup(a, events, route='evdev', confirmed=confirmed, helper_instance=self.evdev.instance)
+        self.evdev.health.pop('release_pending', None)
         if confirmed:
             holds["key"].clear()
             holds["button"].clear()
+            for codes in self.evdev.held_codes.values():
+                codes.clear()
         else:
             self.fence("F1:release_unconfirmed")
         return confirmed
@@ -1076,10 +1128,10 @@ class Engine:
             yield
         return True
 
-    def durable_cleanup(self, a, events):
+    def durable_cleanup(self, a, events, **fields):
         # Release must remain possible even after F3; journal best effort only.
         try:
-            self.durable("release", action_id=a["params"]["action_id"], events=events)
+            self.durable("release", action_id=a["params"]["action_id"], events=events, **fields)
         except ActError:
             pass
 
@@ -1731,6 +1783,11 @@ class Engine:
                     origin = yield from self.query("pointer", deadline=self.clock() + 0.05)
                     probe = {"id": r["id"], "route": None, "attempts": [], "rev": {"dispatched": None}, "dispatch_status": "not_dispatched"}
                     x, y = origin["x"], origin["y"]
+                    if self.route == 'evdev' and self.evdev.health['state'] == 'down':
+                        # Cleanup has independently confirmed release. F2's
+                        # private liveness probe uses the surviving channel;
+                        # it must not turn honest evdev degradation into F2.
+                        self.route = 'xtest'
                     yield from self.send(a, probe, [("motion", 0, x + (1 if x + 1 < self.w.screen["w"] else -1), y), ("motion", 0, x, y)])
                     r["channel_probe"] = probe["attempts"]
                 except ActError as exc:
@@ -1965,6 +2022,8 @@ class Engine:
         self.channel = {"state": "down", "keyboard": "untested", "pointer": "down"}
         try:
             self.w.poll_control(force=True)
+            if self.fence_reason:
+                raise ActError('worker_fault', self.fence_reason)
             if (self.w.cache.control or {}).get("state") != "agent":
                 raise ActError("preempted")
             origin = yield from self.query("pointer", deadline=self.clock() + 0.2)
