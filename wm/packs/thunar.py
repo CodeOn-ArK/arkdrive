@@ -15,10 +15,10 @@ PLAYBOOK = (
     "goes paste-first and overwrites the session clipboard. "
     "Thunar-specific "
     'Create-folder example (replace <file-manager> and <folder-list-ref> with the observed window handle and container ref): '
-    '{"steps":[{"id":"1","target":"<file-manager>","intent":{"kind":"key","keys":["Control_L","Shift_L","n"]},"expect":{"kind":"dialog_present","match":{"title_re":"[Cc]reate.*[Ff]older"},"bind":{"dialog":"dialog","entry":{"role":"text"}}}},'
+    '{"steps":[{"id":"1","target":"<file-manager>","intent":{"kind":"key","keys":["Control_L","Shift_L","n"]},"expect":{"kind":"dialog_present","match":{"title_re":"[Cc]reate.*[Ff]older"},"bind":{"dialog":"dialog","entry":{"role":"text"},"create":{"role":"push_button","name":"Create"}}}},'
     '{"id":"2","target":{"from_step":"1","name":"entry"},"intent":{"kind":"text","text":"Reports","replace":true}},'
-    '{"id":"3","target":{"from_step":"1","name":"dialog"},"intent":{"kind":"key","keys":["Return"]},"expect":{"kind":"item_present","container":"<folder-list-ref>","name":"Reports"}}]}. '
-    'Step 1 verifies and binds the create dialog and its entry. Step 2 types into that bound entry; the worker supplies the strong whole-field text_equals expectation. Step 3 presses Return in the bound dialog and verifies the new item in the original folder listing. Bindings refer to verified earlier steps; do not invent refs for a dialog that has not appeared.'
+    '{"id":"3","target":{"from_step":"1","name":"create"},"intent":{"kind":"invoke"},"expect":{"kind":"item_present","container":"<folder-list-ref>","name":"Reports"}}]}. '
+    'Step 1 verifies and binds the create dialog, its entry and its Create button. Step 2 types into that bound entry; the worker supplies the strong whole-field text_equals expectation. Step 3 invokes the bound Create button and verifies the new item in the original folder listing. Bindings refer to verified earlier steps; do not invent refs for a dialog that has not appeared.'
 )
 
 
@@ -177,11 +177,12 @@ def create_folder(adapter, args):
                   intent=dict(kind='key', keys=['Control_L', 'Shift_L', 'n']),
                   expect=dict(kind='dialog_present', parent=window,
                               match=dict(title_re='[Cc]reate.*[Ff]older'),
-                              bind=dict(dialog='dialog', entry=dict(role='text')))),
+                              bind=dict(dialog='dialog', entry=dict(role='text'),
+                                        create=dict(role='push_button', name='Create')))),
              dict(id='2', target=dict(from_step='1', name='entry'), timeout_ms=3500,
                   intent=dict(kind='text', text=name, replace=True)),
-             dict(id='3', target=dict(from_step='1', name='dialog'), timeout_ms=3500,
-                  intent=dict(kind='key', keys=['Return']),
+             dict(id='3', target=dict(from_step='1', name='create'), timeout_ms=3500,
+                  intent=dict(kind='invoke'),
                   expect=dict(kind='item_present', container=data['tables'][0], name=name))]
     result = _shown(adapter, 'act', dict(steps=steps))
     if not _verified(result, ['1', '2', '3']):
@@ -192,7 +193,7 @@ def create_folder(adapter, args):
 def rename(adapter, args):
     if not _valid(args, ('old', 'new')):
         return dict(status='invalid_arguments')
-    listing, error = _observe(adapter)
+    listing, error = _ready_listing(adapter)
     if error:
         return error
     window, data = listing

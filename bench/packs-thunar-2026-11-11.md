@@ -185,3 +185,51 @@ skipped. Log: `wm/tests/.tmp/packs-thunar-fix2-full-suite.log`.
 **Raj's live skill gate re-run — NOT RUN.** No live session or display was
 opened or driven, including display `:0`. Nothing staged or committed.
 Existing unrelated checkout changes were preserved.
+
+## Fix round 3
+
+Raj's November 11 live probes found that Return leaves the Create New Folder
+dialog open in this Thunar/GTK build: the entry text remains verified, but no
+folder is created and the listing check reports `provider_degraded`.
+`thunar.create_folder` now adds `create: {role: "push_button", name: "Create"}`
+to step 1's dialog/entry bindings. Step 3 targets
+`{from_step: "1", name: "create"}` with `intent: {kind: "invoke"}`, without an
+action or keys field. It retains the original listing's `item_present`
+expectation and 3500 ms timeout. Steps 1–2 otherwise retain their behavior.
+The playbook's create-folder JSON example and explanation use the same
+Create-button binding and invocation.
+
+`thunar.rename` now calls `_ready_listing()` before resolving the old name,
+so icon view gets the Details-view switch and a fresh listing. Missing-name
+candidates come from that listing. The rename batch, including its proven
+Return commit, is unchanged. No worker or adapter changes.
+
+The headless pack test file has **39 passing tests**. Exact create-batch
+assertions cover all three bindings, the selector, the invoke-only commit,
+the original listing expectation and the timeouts. The parsed playbook
+example asserts the same binding and commit and rejects Return anywhere in
+the create example or its explanation. Fake-adapter rename tests assert the
+observe → Details act → observe sequence before resolving a visible target,
+five real-listing candidates for a missing target, or an empty listing.
+The successful path checks the fresh row/name-cell refs and revision before
+the rename act. The prior empty-listing short-circuit assertion was adjusted
+to account for the Details switch. The existing worked-example assertion in
+`wm/tests/test_worker_w5_fix2.py` now expects the Create-button binding and
+invoke commit; all 16 tests in that file pass.
+
+Full headless validation, with temporary paths in the checkout and bytecode
+disabled:
+
+```sh
+TMPDIR="$PWD/wm/tests/.tmp" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wm/tests
+```
+
+**1038 tests in 132.925 s: 1037 passed, 1 skipped**, exit 0,
+`OK (skipped=1)`. The existing sandbox-dependent ptrace/strace check remains
+skipped. Log: `wm/tests/.tmp/packs-thunar-fix3-full-suite-rerun.log`.
+The initial full run had only the old worked-example assertion failure;
+the complete rerun passed after that assertion was updated.
+
+**Raj's live skill gate re-run — NOT RUN.** No live session or display was
+opened or driven, including display `:0`. Nothing staged or committed.
+Existing unrelated checkout changes were preserved.

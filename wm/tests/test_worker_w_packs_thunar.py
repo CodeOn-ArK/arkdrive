@@ -96,6 +96,17 @@ class RegistryTests(unittest.TestCase):
         example, _ = json.JSONDecoder().raw_decode(thunar.PLAYBOOK[thunar.PLAYBOOK.index('{"steps":'):])
         self.assertEqual(len(example['steps']), 3)
 
+    def test_create_playbook_binds_and_invokes_create_button_without_return(self):
+        create_example = thunar.PLAYBOOK.split('Create-folder example', 1)[1]
+        example, _ = json.JSONDecoder().raw_decode(create_example[create_example.index('{"steps":'):])
+        self.assertEqual(example['steps'][0]['expect']['bind'],
+                         dict(dialog='dialog', entry=dict(role='text'),
+                              create=dict(role='push_button', name='Create')))
+        self.assertEqual(example['steps'][2], dict(id='3',
+            target=dict(from_step='1', name='create'), intent=dict(kind='invoke'),
+            expect=dict(kind='item_present', container='<folder-list-ref>', name='Reports')))
+        self.assertNotIn('Return', create_example)
+
 
 class ActivationTests(unittest.TestCase):
     def setUp(self):
@@ -248,18 +259,19 @@ class SkillTests(unittest.TestCase):
         self.assertEqual(self.acts[0]['control_epoch'], 3)
         self.assertNotIn('pending', self.adapter.state)
 
-    def test_create_batch_binds_dialog_and_entry_and_checks_original_container(self):
+    def test_create_batch_binds_dialog_entry_create_and_invokes_with_original_container(self):
         self.mutate = lambda: (self.directory / 'home/Reports').mkdir()
         self.assertEqual(thunar.create_folder(self.adapter, dict(name='Reports')), dict(status='success', verified=True))
         steps = self.acts[0]['steps']
         self.assertEqual(steps[0], dict(id='1', target='w1', timeout_ms=2000,
             intent=dict(kind='key', keys=['Control_L', 'Shift_L', 'n']),
             expect=dict(kind='dialog_present', parent='w1', match=dict(title_re='[Cc]reate.*[Ff]older'),
-                        bind=dict(dialog='dialog', entry=dict(role='text')))))
+                        bind=dict(dialog='dialog', entry=dict(role='text'),
+                                  create=dict(role='push_button', name='Create')))))
         self.assertEqual(steps[1], dict(id='2', target=dict(from_step='1', name='entry'), timeout_ms=3500,
             intent=dict(kind='text', text='Reports', replace=True)))
-        self.assertEqual(steps[2], dict(id='3', target=dict(from_step='1', name='dialog'), timeout_ms=3500,
-            intent=dict(kind='key', keys=['Return']), expect=dict(kind='item_present', container='n2', name='Reports')))
+        self.assertEqual(steps[2], dict(id='3', target=dict(from_step='1', name='create'), timeout_ms=3500,
+            intent=dict(kind='invoke'), expect=dict(kind='item_present', container='n2', name='Reports')))
         self.assertEqual(len(self.acts), 1)
         for step in (steps[0], steps[2]):
             predicate_schema(step['expect'])
@@ -269,13 +281,36 @@ class SkillTests(unittest.TestCase):
                  (('new',), thunar.create_folder, dict(name='new'), dict(status='collision')),
                  (('old', 'old'), thunar.rename, dict(old='old', new='new'), dict(status='ambiguous')),
                  (tuple('abcdef'), thunar.rename, dict(old='missing', new='new'),
-                  dict(status='not_found', candidates=list('abcde'))),
-                 ((), thunar.rename, dict(old='missing', new='new'), dict(status='not_found', candidates=[]))]
+                  dict(status='not_found', candidates=list('abcde')))]
         for names, run, args, expected in cases:
             with self.subTest(names=names):
                 self.observations = [listing(names)]
                 self.assertEqual(run(self.adapter, args), expected)
                 self.assertEqual(self.acts, [])
+
+    def test_rename_switches_icon_view_before_resolving_fresh_listing(self):
+        for names, expected in ((('other', 'old'), dict(status='success', verified=False)),
+                                (tuple('abcdef'), dict(status='not_found', candidates=list('abcde'))),
+                                ((), dict(status='not_found', candidates=[]))):
+            with self.subTest(names=names):
+                icon = listing(())
+                icon['tree']['lines'] = ['n1 frame "Files" @0,0,100,100']
+                self.observations = [icon, listing(names, rev=12)]
+                self.observes, self.acts = [], []
+                self.adapter.rpc.call.reset_mock()
+                self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')), expected)
+                calls = self.adapter.rpc.call.call_args_list
+                sequence = ['window.observe', 'window.act', 'window.observe']
+                if expected['status'] == 'success':
+                    sequence.append('window.act')
+                    self.assertEqual(self.acts[1]['steps'][0]['target'], dict(window='w1', ref='n6'))
+                    self.assertEqual(self.acts[1]['steps'][0]['require'], dict(selected_ref='n7'))
+                    self.assertEqual(self.acts[1]['base_rev'], 12)
+                self.assertEqual([call.args[0] for call in calls], sequence)
+                self.assertEqual(self.acts[0]['steps'], [dict(id='details', target='w1', timeout_ms=2000,
+                    intent=dict(kind='key', keys=['Control_L', '2']),
+                    expect=dict(kind='node_present', window='w1',
+                                selector=dict(provider='atspi', role='tree_table')))])
 
     def test_view_switch_once_then_fresh_resolution_and_collision(self):
         icon = listing(())
