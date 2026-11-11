@@ -168,6 +168,97 @@ class CacheAndIncremental(OCRHarness):
 
 
 class PredicatesAndObservations(OCRHarness):
+    def pending_live_shape(self, app_state, snapshot=False):
+        # Establish another app before registering the target as never-published.
+        self.later()
+        healthy = self.w.cache.handle(11)
+        self.w.x.window_pids[11] = 202
+        self.w.cache.set('focus', healthy)
+        self.w.cache.commit()
+        self.p.tick()
+        self.answer(self.raw, task=next(t for t in self.p.pending.values() if t['window'] == healthy))
+        if not snapshot:
+            self.p.cache.prune(self.handle)
+            self.p.probes.pop(self.handle, None)
+            self.p.layouts.pop(self.handle, None)
+        self.p.first_map[self.handle] = self.now
+        providers = self.w.providers()
+        app = providers['atspi']['apps']['101']
+        # Raj's system.info payload: no measured breach or completed snapshot.
+        app.update(state=app_state, reason=None, breaches=0, next_probe_ms=0)
+        app['window_status'][self.handle].update(state='pending', reason=None,
+                                               breaches=0, next_probe_ms=0)
+        # Only the Openbox pseudo-window may account for aggregate degradation.
+        providers['atspi']['apps']['Openbox'] = dict(pid=None, state='degraded', windows=[], window_status={})
+        providers['atspi']['state'] = 'degraded'
+        return healthy, providers
+
+    def check_live_shape_delivery(self, app_state, snapshot=False):
+        healthy, providers = self.pending_live_shape(app_state, snapshot)
+        self.now += 2.0
+        original_status, original_readiness = self.p.status, self.p.readiness
+        def status(h):
+            return ('usable' if snapshot else 'pending') if h == self.handle else original_status(h)
+        def readiness(h):
+            return 'pending' if h == self.handle else original_readiness(h)
+        with patch.object(self.w, 'providers', return_value=providers), \
+                patch.object(self.p, 'status', side_effect=status), \
+                patch.object(self.p, 'readiness', side_effect=readiness):
+            for _ in range(5):
+                params = dict(channels=['auto'], since_rev=self.w.cache.rev)
+                result = self.w.observation(params)
+                self.w.observed(self.peer, params, result)
+                self.assertNotIn('ocr', result)
+                self.assertEqual(result['providers']['atspi']['apps']['101']['state'], app_state)
+            params = dict(scope=dict(kind='window', window=self.handle),
+                          channels=['auto'], since_rev=self.w.cache.rev)
+            # Exercise the RPC fast path itself, not just the decision helper.
+            self.peer.waits = []
+            self.w.observe(self.peer, 77, params)
+            self.assertTrue(any(p['id'] == 77 for p in self.peer.waits))
+            self.assertEqual(self.o.requests, 1)
+            lines = [line('Add to list'), line('Clicks: 0', y=170), line('Item 1', y=210)]
+            self.answer_ocr(lines)
+            result = self.w.observation(params, wait_ocr=True)
+            self.assertFalse(result['unchanged'])
+            self.assertEqual(result['ocr']['lines'], lines)
+            self.w.observed(self.peer, params, result)
+            with patch.object(self.o, 'read', side_effect=AssertionError('already delivered / healthy OCR')):
+                for _ in range(3):
+                    result = self.w.observation(params)
+                    self.assertTrue(result['unchanged'])
+                    self.w.observed(self.peer, params, result)
+                self.assertTrue(self.w.observation(dict(scope=dict(kind='window', window=healthy),
+                                                       since_rev=self.w.cache.rev))['unchanged'])
+            self.assertEqual(self.o.requests, 1)
+
+    def test_live_pending_never_published_after_session_observes(self):
+        self.check_live_shape_delivery('pending')
+
+    def test_live_app_degraded_with_pending_window_after_session_observes(self):
+        self.check_live_shape_delivery('degraded')
+
+    def test_app_degraded_overrides_even_a_usable_publication(self):
+        self.check_live_shape_delivery('degraded', snapshot=True)
+
+    def test_pending_map_grace_is_two_seconds_even_on_a_changed_observe(self):
+        _, providers = self.pending_live_shape('pending')
+        # Observation can run before the provider has recorded this map.
+        mapped_at = self.p.first_map.pop(self.handle)
+        with patch.object(self.w, 'providers', return_value=providers), \
+                patch.object(self.p, 'status', return_value='pending'), \
+                patch.object(self.p, 'readiness', return_value='pending'):
+            params = dict(scope=dict(kind='window', window=self.handle), channels=['auto'])
+            for age in (0, 1.999):
+                self.now = mapped_at+age
+                with patch.object(self.o, 'read', side_effect=AssertionError('map grace OCR')):
+                    self.assertNotIn('ocr', self.w.observation(params))
+                    self.assertTrue(self.w.observation(dict(params, since_rev=self.w.cache.rev))['unchanged'])
+            self.assertEqual(self.p.first_map[self.handle], mapped_at)
+            self.now = mapped_at+2.0
+            with self.assertRaises(OCRPending):
+                self.w.observation(dict(params, since_rev=self.w.cache.rev), wait_ocr=True)
+
     def test_window_health_degradation_overrides_usable_publication(self):
         # Contract defence for a split publication/health view. The real
         # provider sequence below currently reports degraded in BOTH views;

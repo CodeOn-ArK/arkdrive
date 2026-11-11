@@ -35,18 +35,23 @@ FACES = ('Sans', 'Serif', 'Monospace')
 SIZES = (14, 18, 24, 32)
 FIXTURE = (('ArkDrive canvas', 24, 52), ('Alpha 123', 24, 112),
            ('Bravo 456', 260, 172), ('Target: W0', 24, 232))
-RENDER_MODES = ('original', 'live-full', 'live-medium', 'live-slight')
+RENDER_MODES = ('original', 'live-full', 'live-medium', 'live-slight',
+                'gray-none', 'gray-slight', 'gray-medium', 'gray-full')
 
 
 def font_options(mode):
     options = cairo.FontOptions()
     if mode != 'original':
-        options.set_antialias(cairo.ANTIALIAS_GRAY if mode == 'full-gray' else cairo.ANTIALIAS_SUBPIXEL)
+        options.set_antialias(cairo.ANTIALIAS_GRAY if mode == 'full-gray' or mode.startswith('gray-') else cairo.ANTIALIAS_SUBPIXEL)
         options.set_subpixel_order(cairo.SUBPIXEL_ORDER_RGB)
         options.set_hint_style({'live-full': cairo.HINT_STYLE_FULL,
                                 'live-medium': cairo.HINT_STYLE_MEDIUM,
                                 'live-slight': cairo.HINT_STYLE_SLIGHT,
-                                'full-gray': cairo.HINT_STYLE_FULL}[mode])
+                                'full-gray': cairo.HINT_STYLE_FULL,
+                                'gray-none': cairo.HINT_STYLE_NONE,
+                                'gray-slight': cairo.HINT_STYLE_SLIGHT,
+                                'gray-medium': cairo.HINT_STYLE_MEDIUM,
+                                'gray-full': cairo.HINT_STYLE_FULL}[mode])
         options.set_hint_metrics(cairo.HINT_METRICS_ON)
     return options
 
@@ -106,7 +111,9 @@ def measure(backend, corpus, line_mode=None, rendering='original'):
 def live_style_report(output, before=None):
     """Full cross product in each mode; retain exact outputs and regressions."""
     prior = json.loads(before.read_text()) if before else None
-    report = dict(cairo=cairo.cairo_version_string(), modes={})
+    if prior and 'modes' in prior:
+        prior = prior['modes']
+    report = dict(cairo=cairo.cairo_version_string(), comparison_before=str(before) if before else None, modes={})
     old, adopted = Backend(shapes=False), Backend()
     try:
         for mode in RENDER_MODES:
@@ -116,18 +123,85 @@ def live_style_report(output, before=None):
             current['baseline_exact'] = baseline['exact']
             current['regressions_base'] = [r['key'] for p, r in zip(baseline['results'], current['results'])
                                             if p['exact'] and not r['exact']]
-            if prior:
+            if prior and mode in prior:
                 assert [r['key'] for r in prior[mode]['results']] == [r['key'] for r in current['results']]
-                current['regressions_round1'] = [r['key'] for p, r in zip(prior[mode]['results'], current['results'])
+                current['regressions_before'] = [r['key'] for p, r in zip(prior[mode]['results'], current['results'])
                                                  if p['exact'] and not r['exact']]
             report['modes'][mode] = current
             print(mode, current['exact'], '/', current['total'],
                   'fixture', current['fixture'], 'median_ms', round(current['median_ms'], 2),
-                  'regressions', current.get('regressions_round1'), flush=True)
+                  'regressions', current.get('regressions_before'), flush=True)
             output.write_text(json.dumps(report, indent=2)+'\n')
     finally:
         old.close()
         adopted.close()
+
+
+REAL_CAPTURE = Path(__file__).parent/'fixtures/live_canvas_xvfb.png'
+REAL_SHA256 = '55736729c3fcbcbe99246b04dd91ef323ce5021a021eb4e61ee14d7df6beb52c'
+# Fixed source regions for scoring, never supplied to the glyph decoder as text.
+# Bravo's top is below the pointer; the entire W0 line is retained.
+REAL_LINES = (
+    ('ArkDrive canvas', (0, 25, 560, 65)),
+    ('Alpha 123', (0, 85, 560, 125)),
+    ('Bravo 456', (0, 152, 560, 185)),
+    ('Target: W0', (8, 200, 240, 248)),
+)
+
+
+def real_capture_report():
+    from PIL import Image, ImageChops
+    from worker_ocr_shapes import build_templates
+    image = Image.open(REAL_CAPTURE).convert('RGB')
+    configs = ('original', 'live-full', 'gray-none', 'gray-slight', 'gray-medium', 'gray-full')
+    lookup, _ = build_templates(configs)
+    crop = image.crop(REAL_LINES[-1][1]).convert('L')
+    mask = crop.point(lambda p: 255 if p < 128 else 0)
+    bb = mask.getbbox()
+    spans = []
+    for x in range(bb[0], bb[2]):
+        if mask.crop((x, 0, x+1, mask.height)).getbbox():
+            if spans and x == spans[-1][1]+1:
+                spans[-1][1] = x
+            else:
+                spans.append([x, x])
+    glyphs = []
+    # Labels are attached only after lookup, for the diagnostic table.
+    for left, right in spans:
+        glyph = mask.crop((left, 0, right+1, mask.height))
+        bounds = glyph.getbbox()
+        glyph = glyph.crop(bounds)
+        matches = lookup.get((glyph.size, glyph.tobytes()), {})
+        glyphs.append(dict(box=[left+8, bounds[1]+200, right-left+1, bounds[3]-bounds[1]],
+                           exact_configs=[c for c in configs if ('Sans', 24, c) in matches],
+                           all_matches=[dict(font=f, glyphs=v) for f, v in sorted(matches.items())],
+                           unmatched_anywhere=not bool(matches)))
+    for label, glyph in zip('Target:W0', glyphs):
+        glyph['label'] = label
+    synthetic, _ = render(FIXTURE, width=560, height=280, rendering='gray-full')
+    synthetic = Image.frombytes('RGB', (560, 280), synthetic).convert('L')
+    binary = synthetic.crop(REAL_LINES[-1][1]).point(lambda p: 255 if p < 128 else 0)
+    diff = ImageChops.difference(mask, binary)
+    backend = Backend()
+    raw = Backend(shapes=False)
+    results = []
+    try:
+        for expected, box in REAL_LINES:
+            part = image.crop(box)
+            rect = dict(x=box[0], y=box[1], w=part.width, h=part.height)
+            baseline = raw.read(part.tobytes(), rect, mode='line')
+            actual = backend.read(part.tobytes(), rect, mode='line')
+            results.append(dict(expected=expected, region=box, actual=actual, baseline=baseline,
+                                exact=[l['text'] for l in actual] == [expected],
+                                glyphs=backend.last_shapes.copy()))
+    finally:
+        backend.close()
+        raw.close()
+    return dict(source=str(REAL_CAPTURE), sha256=hashlib.sha256(REAL_CAPTURE.read_bytes()).hexdigest(),
+                dimensions=image.size, glyphs=glyphs, results=results,
+                gray_full_binary_diff_pixels=sum(p != 0 for p in diff.tobytes()),
+                exact=sum(r['exact'] for r in results),
+                false_glyph_accepts=sum(r['glyphs']['state'] == 'engaged' and not r['exact'] for r in results))
 
 
 def raster_diagnosis():
@@ -166,12 +240,16 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--best', type=Path, default=Path(__file__).parent/'fixtures/tessdata_best')
     parser.add_argument('--shapes-only', action='store_true')
-    parser.add_argument('--live-style', action='store_true', help='compare all four rendering modes')
+    parser.add_argument('--live-style', action='store_true', help='compare all eight rendering modes')
     parser.add_argument('--diagnose-rasters', action='store_true', help='record exact raster/atlas mismatch diagnostics')
+    parser.add_argument('--real-capture', action='store_true', help='diagnose and score the unmodified X capture')
     parser.add_argument('--before', type=Path, help='round-1 live-style outputs for regression scoring')
     parser.add_argument('--allow-missing-best', action='store_true',
                         help='exploratory local sweep; comparison remains incomplete')
     args = parser.parse_args()
+    if args.real_capture:
+        args.output.write_text(json.dumps(real_capture_report(), indent=2)+'\n')
+        return 0
     if args.diagnose_rasters:
         args.output.write_text(json.dumps(raster_diagnosis(), indent=2)+'\n')
         return 0

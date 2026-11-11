@@ -22,6 +22,7 @@ STATES = ('focused', 'selected', 'checked', 'expanded', 'editable', 'disabled')
 TREE_KINDS = {'node_present', 'node_absent', 'text_equals', 'text_contains', 'node_state',
               'item_present', 'item_absent', 'scroll_value'}
 MAX_IPC = 4 * 1024 * 1024
+MAP_GRACE = 2.0
 
 
 def encoded(value):
@@ -635,7 +636,7 @@ class Provider:
                     # Child measurements, never the interval between worker ticks.
                     breach = bool(row.get('breach', result.get('breach', False)))
                     deterministic = task['error'] and task['error'] not in ('timeout', 'application_unreachable')
-                    grace = now - self.first_map.get(task['window'], now) < 2
+                    grace = now - self.first_map.get(task['window'], now) < MAP_GRACE
                     if task['error'] in ('stale_rev', 'invalid_request', 'backend_unsupported',
                                          'preempted', 'precondition_failed'):
                         continue
@@ -700,7 +701,7 @@ class Provider:
                         (progress or {}).get('active_call_ms', 0), (progress or {}).get('max_call_ms', 0))/1000
                     if not task['breached'] and (legacy or (progress or {}).get('breach')):
                         task['breached'] = True
-                        if now - self.first_map.get(task['window'], now) >= 2:
+                        if now - self.first_map.get(task['window'], now) >= MAP_GRACE:
                             self.apps[task['app']].fail(now, app_elapsed)
                         self.unavailable.add(task['window'])
                     if self.ping is None:

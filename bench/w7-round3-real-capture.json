@@ -1,0 +1,1067 @@
+{
+  "source": "/home/ark/arkdrive/wm/tests/fixtures/live_canvas_xvfb.png",
+  "sha256": "55736729c3fcbcbe99246b04dd91ef323ce5021a021eb4e61ee14d7df6beb52c",
+  "dimensions": [
+    560,
+    280
+  ],
+  "glyphs": [
+    {
+      "box": [
+        24,
+        215,
+        13,
+        17
+      ],
+      "exact_configs": [
+        "original",
+        "live-full",
+        "gray-none",
+        "gray-slight",
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "T",
+              0,
+              13.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "T",
+              0,
+              13.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-none"
+          ],
+          "glyphs": [
+            [
+              "T",
+              0,
+              13.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              "T",
+              0,
+              13.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              "T",
+              0,
+              13.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "original"
+          ],
+          "glyphs": [
+            [
+              "T",
+              0,
+              13.0,
+              -17
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "T"
+    },
+    {
+      "box": [
+        38,
+        219,
+        11,
+        13
+      ],
+      "exact_configs": [
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "a",
+              1,
+              13.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "a",
+              1,
+              13.0,
+              -13
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "a"
+    },
+    {
+      "box": [
+        52,
+        219,
+        7,
+        13
+      ],
+      "exact_configs": [
+        "live-full",
+        "gray-none",
+        "gray-slight",
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            23,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            23,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            23,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            23,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            23,
+            "original"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-none"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              "r",
+              2,
+              10.0,
+              -13
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "r"
+    },
+    {
+      "box": [
+        61,
+        219,
+        12,
+        19
+      ],
+      "exact_configs": [
+        "gray-slight",
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "g",
+              1,
+              15.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "g",
+              1,
+              15.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              "g",
+              1,
+              15.0,
+              -13
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "g"
+    },
+    {
+      "box": [
+        76,
+        219,
+        11,
+        13
+      ],
+      "exact_configs": [
+        "original",
+        "live-full",
+        "gray-slight",
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "e",
+              1,
+              14.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "e",
+              1,
+              14.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              "e",
+              1,
+              14.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              "e",
+              1,
+              14.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "original"
+          ],
+          "glyphs": [
+            [
+              "e",
+              1,
+              14.0,
+              -13
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "e"
+    },
+    {
+      "box": [
+        90,
+        216,
+        7,
+        16
+      ],
+      "exact_configs": [
+        "original",
+        "live-full",
+        "gray-none",
+        "gray-slight",
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            23,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              8.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            23,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              8.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            23,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              8.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              9.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              9.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-none"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              9.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              9.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              9.0,
+              -16
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "original"
+          ],
+          "glyphs": [
+            [
+              "t",
+              1,
+              9.0,
+              -16
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "t"
+    },
+    {
+      "box": [
+        100,
+        219,
+        3,
+        13
+      ],
+      "exact_configs": [
+        "live-full",
+        "gray-slight",
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            23,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              6.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            23,
+            "original"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              6.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              6.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              6.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              6.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              6.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Serif",
+            23,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              7.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Serif",
+            23,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              7.0,
+              -13
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Serif",
+            23,
+            "live-full"
+          ],
+          "glyphs": [
+            [
+              ":",
+              2,
+              7.0,
+              -13
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": ":"
+    },
+    {
+      "box": [
+        110,
+        215,
+        22,
+        17
+      ],
+      "exact_configs": [
+        "gray-slight",
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "W",
+              0,
+              22.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "W",
+              0,
+              22.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-slight"
+          ],
+          "glyphs": [
+            [
+              "W",
+              0,
+              22.0,
+              -17
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "W"
+    },
+    {
+      "box": [
+        133,
+        215,
+        12,
+        17
+      ],
+      "exact_configs": [
+        "gray-medium",
+        "gray-full"
+      ],
+      "all_matches": [
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-full"
+          ],
+          "glyphs": [
+            [
+              "0",
+              1,
+              14.0,
+              -17
+            ]
+          ]
+        },
+        {
+          "font": [
+            "Sans",
+            24,
+            "gray-medium"
+          ],
+          "glyphs": [
+            [
+              "0",
+              1,
+              14.0,
+              -17
+            ]
+          ]
+        }
+      ],
+      "unmatched_anywhere": false,
+      "label": "0"
+    }
+  ],
+  "results": [
+    {
+      "expected": "ArkDrive canvas",
+      "region": [
+        0,
+        25,
+        560,
+        65
+      ],
+      "actual": [
+        {
+          "text": "ArkDrive canvas",
+          "box": [
+            24,
+            34,
+            180,
+            18
+          ],
+          "conf": 89.279884
+        }
+      ],
+      "baseline": [
+        {
+          "text": "ArkDrive canvas",
+          "box": [
+            24,
+            34,
+            180,
+            18
+          ],
+          "conf": 89.279884
+        }
+      ],
+      "exact": true,
+      "glyphs": {
+        "state": "abstained",
+        "reason": "content_gate"
+      }
+    },
+    {
+      "expected": "Alpha 123",
+      "region": [
+        0,
+        85,
+        560,
+        125
+      ],
+      "actual": [
+        {
+          "text": "Alpha 123",
+          "box": [
+            24,
+            94,
+            110,
+            24
+          ],
+          "conf": 100.0
+        }
+      ],
+      "baseline": [
+        {
+          "text": "Alpha 123",
+          "box": [
+            24,
+            94,
+            111,
+            24
+          ],
+          "conf": 96.644608
+        }
+      ],
+      "exact": true,
+      "glyphs": {
+        "state": "engaged",
+        "reason": null,
+        "lines": 1
+      }
+    },
+    {
+      "expected": "Bravo 456",
+      "region": [
+        0,
+        152,
+        560,
+        185
+      ],
+      "actual": [
+        {
+          "text": "Bravo 456",
+          "box": [
+            262,
+            155,
+            111,
+            17
+          ],
+          "conf": 100.0
+        }
+      ],
+      "baseline": [
+        {
+          "text": "Bravo 456",
+          "box": [
+            262,
+            155,
+            111,
+            17
+          ],
+          "conf": 94.999008
+        }
+      ],
+      "exact": true,
+      "glyphs": {
+        "state": "engaged",
+        "reason": null,
+        "lines": 1
+      }
+    },
+    {
+      "expected": "Target: W0",
+      "region": [
+        8,
+        200,
+        240,
+        248
+      ],
+      "actual": [
+        {
+          "text": "Target: W0",
+          "box": [
+            24,
+            215,
+            121,
+            23
+          ],
+          "conf": 100.0
+        }
+      ],
+      "baseline": [
+        {
+          "text": "Target: WO",
+          "box": [
+            24,
+            215,
+            121,
+            23
+          ],
+          "conf": 95.610771
+        }
+      ],
+      "exact": true,
+      "glyphs": {
+        "state": "engaged",
+        "reason": null,
+        "lines": 1
+      }
+    }
+  ],
+  "gray_full_binary_diff_pixels": 0,
+  "exact": 4,
+  "false_glyph_accepts": 0
+}

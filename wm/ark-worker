@@ -40,7 +40,7 @@ from worker_xtest import XTestTransport
 from worker_evdev import EvdevTransport
 from input_protocol import control_store
 from worker_pixels import Pixels, Shadow, intersect, bbox
-from worker_tree import Provider as TreeProvider
+from worker_tree import Provider as TreeProvider, MAP_GRACE
 from worker_ocr import Provider as OCRProvider
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
 STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
@@ -1662,24 +1662,44 @@ class Worker:
             raise RPCError("invalid_params")
         return time.monotonic() + ms / 1000
 
-    def ocr_window_health(self, handle, providers=None):
-        """Read this window's admission health, never a neighbour's aggregate."""
-        providers = self.providers() if providers is None else providers
-        for app in providers.get('atspi', {}).get('apps', {}).values():
-            detail = app.get('window_status', {}).get(handle)
-            if detail is not None:
-                return detail.get('state'), detail.get('reason')
-        return (None, None)
+    def ocr_tree_state(self, handle, providers=None):
+        """Observation-only tree view and delivery epoch, scoped to its app.
 
-    def ocr_tree_state(self, handle):
-        """Per-window fallback epoch, independent of pixel/cache revisions."""
+        Provider publication, admission and public health can lag each other.
+        Never use session aggregate severity: it includes unrelated windows.
+        """
         tree = getattr(self, 'tree', None)
         if tree is None:
-            return ('down',)
-        breaker = tree.apps.get(tree.app(tree.window(handle)))
-        return (tree.status(handle), tree.readiness(handle),
-                breaker.breaches if breaker else 0, tree.freshness(handle),
-                self.ocr_window_health(handle))
+            return dict(publication='down', readiness='down')
+        win = tree.window(handle)
+        app_key = tree.app(win)
+        providers = self.providers() if providers is None else providers
+        apps = providers.get('atspi', {}).get('apps', {})
+        app = apps.get(app_key)
+        if app is None:
+            app = next((a for a in apps.values() if handle in a.get('windows', ()) or
+                        handle in a.get('window_status', {})), {})
+        detail = app.get('window_status', {}).get(handle, {})
+        breaker = tree.apps.get(app_key)
+        usable = tree.probes.get(handle) == 'usable' and handle in tree.cache.windows
+        now = tree.clock()
+        mapped_at = tree.first_map.setdefault(handle, now)
+        return dict(publication=tree.status(handle), readiness=tree.readiness(handle),
+                    breaches=breaker.breaches if breaker else 0, freshness=tree.freshness(handle),
+                    app=(app.get('state'), app.get('reason'), app.get('breaches')),
+                    window=(detail.get('state'), detail.get('reason')),
+                    snapshot=usable,
+                    starting=not usable and now-mapped_at < MAP_GRACE)
+
+    @staticmethod
+    def ocr_tree_unusable(state):
+        """OBSERVE channel order; does not change act-verification readiness."""
+        if any(s in ('degraded', 'down') for s in (
+                state['publication'], state['readiness'],
+                state.get('app', (None,))[0], state.get('window', (None,))[0])):
+            return True
+        return not state.get('starting', False) and (
+            not state.get('snapshot', False) or state['publication'] != 'usable')
 
     def observation(self, params, wait_ocr=False):
         if not self.settle_pixels():
@@ -1756,19 +1776,18 @@ class Worker:
             if not handle:
                 handle = next((win['handle'] for win in wins if win['mapped'] and win['handle'] == self.cache.focus),
                               next((win['handle'] for win in wins if win['mapped']), None))
-            window_health = self.ocr_window_health(handle, result['providers'])
-            tree_degraded = bool(handle and (not tree or
-                tree.status(handle) in ('degraded', 'down') or
-                tree.readiness(handle) in ('degraded', 'down') or
-                window_health[0] in ('degraded', 'down')))
-            tree_usable = bool(tree and handle and not tree_degraded and tree.status(handle) == 'usable' and
-                               result.get('tree', {}).get('status') != 'degraded')
-            fallback = handle and any(c in ('auto', 'tree') for c in channels) and not tree_usable
-            if fallback and tree_degraded:
+            if handle and not any(w['handle'] == handle and w['mapped'] for w in self.cache.windows.values()):
+                handle = None
+            tree_state = self.ocr_tree_state(handle, result['providers']) if handle else None
+            tree_unusable = bool(handle and self.ocr_tree_unusable(tree_state))
+            tree_usable = bool(handle and not tree_unusable and
+                               tree_state['publication'] == 'usable' and tree_state.get('snapshot'))
+            fallback = handle and any(c in ('auto', 'tree') for c in channels) and tree_unusable
+            if fallback:
                 state = self.act.lease_state.get(self.lease, {}) if getattr(self, 'act', None) else {}
                 region = intersect(rect, pixels.window(handle)['geometry'])
                 served = state.get('ocr_trees', {}).get(handle)
-                if served != (self.ocr_tree_state(handle), region):
+                if served != (tree_state, region):
                     result['unchanged'] = False
             if not result['unchanged'] and handle and ('ocr' in channels or fallback):
                 lines = ocr.read(handle, rect)

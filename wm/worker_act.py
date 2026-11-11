@@ -281,7 +281,8 @@ class Engine:
         if state and peer is self.w.lease_peer and params.get('lease', token) == token:
             # A delivered healthy interval rearms fallback even when recovery
             # reset the breaker's counters and no pixels/tree nodes changed.
-            if tree.get('window') and tree.get('status') == 'usable':
+            if (tree.get('window') and tree.get('status') == 'usable' and
+                    not self.w.ocr_tree_unusable(self.w.ocr_tree_state(tree['window'], result.get('providers')))):
                 state.get('ocr_trees', {}).pop(tree['window'], None)
         if (state and peer is self.w.lease_peer and params.get('lease', token) == token
                 and 'ocr' in result):
@@ -289,7 +290,7 @@ class Engine:
             handle = result['ocr']['window']
             rect, _ = self.w.pixels.region(params)
             region = intersect(rect, self.w.pixels.window(handle)['geometry'])
-            state.setdefault('ocr_trees', {})[handle] = (self.w.ocr_tree_state(handle), region)
+            state.setdefault('ocr_trees', {})[handle] = (self.w.ocr_tree_state(handle, result.get('providers')), region)
         if state and peer is self.w.lease_peer and params.get("lease", token) == token and "rev" in tree:
             baselines = state.setdefault("trees", {})
             pages = state.setdefault("tree_pages", {})

@@ -26,6 +26,48 @@ class Corpus(unittest.TestCase):
             self.assertIsNone(recognize(Image.new('L', (30, 30), 255), [dict(text='lengthy')]))
             self.assertIsNone(recognize(Image.new('L', (30, 30), 255), [dict(text='(|')]))
 
+    def test_compact_atlas_preserves_every_rgb_raster_and_metric(self):
+        from worker_ocr_shapes import templates, build_templates, ATLAS_RENDERINGS
+        # All faces, sizes and characters: tight cells and GRAY alpha rendering
+        # must preserve the reference black-on-white RGB rasters exactly.
+        actual, spaces = templates()
+        rgb, rgb_spaces = build_templates(ATLAS_RENDERINGS, alpha_gray=False)
+        self.assertEqual(actual, rgb)
+        self.assertEqual(spaces, rgb_spaces)
+
+    def test_real_xvfb_capture_exact_with_unmodified_whole_w0_line(self):
+        import hashlib
+        from PIL import Image
+        from ocr_corpus import REAL_CAPTURE, REAL_SHA256, REAL_LINES
+        self.assertEqual(hashlib.sha256(REAL_CAPTURE.read_bytes()).hexdigest(), REAL_SHA256)
+        source = Image.open(REAL_CAPTURE).convert('RGB')
+        self.assertEqual(source.size, (560, 280))
+        from unittest.mock import patch
+        from worker_ocr_shapes import templates, recognize
+        lookup, spaces = templates()
+        round2 = {k: {f: v for f, v in fonts.items() if f[2] in ('original', 'live-full')}
+                  for k, fonts in lookup.items()}
+        round2 = {k: v for k, v in round2.items() if v}
+        with patch('worker_ocr_shapes.templates', return_value=(round2, spaces)):
+            diag = {}
+            self.assertIsNone(recognize(source.crop(REAL_LINES[-1][1]).convert('L'),
+                                        [dict(text='a1')], diag))
+            self.assertEqual(diag['reason'], 'raster_miss')
+            self.assertEqual((diag['glyphs'], diag['unmatched']), (9, 4))
+        backend = Backend()
+        states = []
+        try:
+            for expected, box in REAL_LINES:
+                with self.subTest(text=expected):
+                    crop = source.crop(box)
+                    actual = backend.read(crop.tobytes(), dict(x=box[0], y=box[1],
+                                          w=crop.width, h=crop.height), mode='line')
+                    self.assertEqual([l['text'] for l in actual], [expected])
+                    states.append(backend.last_shapes['state'])
+            self.assertEqual(states, ['abstained', 'engaged', 'engaged', 'engaged'])
+        finally:
+            backend.close()
+
     def test_default_meets_corpus_and_fixture_adoption_bar(self):
         from unittest.mock import patch
         from worker_ocr_shapes import templates
@@ -37,7 +79,10 @@ class Corpus(unittest.TestCase):
         original_lookup = {key: {f: v for f, v in fonts.items() if f[2] == 'original'}
                            for key, fonts in lookup.items()}
         original_lookup = {k: v for k, v in original_lookup.items() if v}
-        old, round1, adopted = Backend(shapes=False), Backend(), Backend()
+        round2_lookup = {key: {f: v for f, v in fonts.items() if f[2] in ('original', 'live-full')}
+                         for key, fonts in lookup.items()}
+        round2_lookup = {k: v for k, v in round2_lookup.items() if v}
+        old, round1, round2, adopted = Backend(shapes=False), Backend(), Backend(), Backend()
         try:
             for mode in RENDER_MODES:
                 with self.subTest(rendering=mode):
@@ -46,11 +91,13 @@ class Corpus(unittest.TestCase):
                     baseline = measure(old, corpus, rendering=mode)
                     with patch('worker_ocr_shapes.templates', return_value=(original_lookup, spaces)):
                         prior = measure(round1, corpus, rendering=mode)
+                    with patch('worker_ocr_shapes.templates', return_value=(round2_lookup, spaces)):
+                        prior2 = measure(round2, corpus, rendering=mode)
                     current = measure(adopted, corpus, rendering=mode)
                     self.assertTrue(current['fixture_exact'], current['fixture'])
                     self.assertEqual(current['fixture_glyphs']['state'], 'engaged')
                     self.assertGreaterEqual(current['rate'], .98)
-                    for reference in (baseline, prior):
+                    for reference in (baseline, prior, prior2):
                         self.assertFalse([r for p, r in zip(reference['results'], current['results'])
                                           if p['exact'] and not r['exact']])
                     self.assertFalse([r for r in current['results']
@@ -59,6 +106,7 @@ class Corpus(unittest.TestCase):
         finally:
             old.close()
             round1.close()
+            round2.close()
             adopted.close()
 
 

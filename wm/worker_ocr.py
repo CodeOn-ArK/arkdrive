@@ -26,7 +26,7 @@ from worker_tree import Wire, packet, MAX_IPC
 
 OCR_KINDS = {'ocr_text', 'ocr_text_present', 'ocr_text_absent'}
 IMAGE_LIMIT = 64 * 1024 * 1024
-PARAMETERS = ('eng', 'grey', 2, 60, 'sparse/line48', 'glyph-v2')
+PARAMETERS = ('eng', 'grey', 2, 60, 'sparse/line48', 'glyph-v3')
 
 
 class PipePair:
@@ -95,6 +95,9 @@ class Backend:
             fn = getattr(lib, name)
             fn.restype, fn.argtypes = result, args
         self.scale, self.psm, self.shapes = scale, psm, shapes
+        if shapes:
+            from worker_ocr_shapes import prepare_templates
+            prepare_templates()
         self.api = lib.TessBaseAPICreate()
         if not self.api or lib.TessBaseAPIInit3(self.api, os.fsencode(datapath) if datapath else None, b'eng'):
             self.close()
