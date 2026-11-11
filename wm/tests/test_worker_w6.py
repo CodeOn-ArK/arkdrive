@@ -1621,7 +1621,9 @@ class EngineW6(base.Harness):
         self.assertEqual(r['steps'][0]['written'], 1)
         self.assertEqual(self.t.log, [('key_down', 50), ('key_up', 50)])
         self.assertTrue(r['steps'][0]['cleanup']['confirmed'])
-        self.assertEqual(self.evdev.health['state'], 'down')
+        self.assertEqual(r['reason'], 'preempted')
+        self.assertEqual(self.evdev.health['state'], 'up')
+        self.assertIsNone(self.e.fence_reason)
 
     def test_all_channels_failing_does_not_start(self):
         self.ack_evdev = self.t.ack = False

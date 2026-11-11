@@ -1432,9 +1432,23 @@ class Worker:
                 # The read-only mapping is held for the generation. Use pread
                 # for W1 polling so truncation cannot SIGBUS the daemon before
                 # it can report the malformed page as a closed control gate.
-                raw = os.pread(self.control_file.fileno(), 64, 0)
-                if raw != os.pread(self.control_file.fileno(), 64, 0):
-                    raw = b""
+                raw = b""
+                for _ in range(3):
+                    first = os.pread(self.control_file.fileno(), 64, 0)
+                    latest = os.pread(self.control_file.fileno(), 64, 0)
+                    if first == latest:
+                        raw = latest
+                        break
+                    try:
+                        closing = decode_control(latest, self.generation)
+                    except ValueError:
+                        continue
+                    # A valid closing snapshot can only remove authority.
+                    # A pause racing these reads is preemption, not a corrupt
+                    # page/F4. Opening authority still requires stable reads.
+                    if closing['state'] != STATES['agent']:
+                        raw = latest
+                        break
         except OSError:
             raw = b""
         if raw == self.control_raw:

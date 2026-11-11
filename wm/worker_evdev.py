@@ -557,8 +557,10 @@ class EvdevTransport:
                 self.down('grab_lost')
                 return result
             if written < len(frames):
+                preempted = reply['error'] == 'gate_closed'
                 if written:
-                    result.update(dispatch_status='accepted', accepted=True, reason='channel_down')
+                    result.update(dispatch_status='accepted', accepted=True,
+                                  reason='preempted' if preempted else 'channel_down')
                 elif reply.get('may_have_written'):
                     result.update(dispatch_status='unknown', accepted=None, reason='channel_down')
                 else:
@@ -573,7 +575,10 @@ class EvdevTransport:
                         yield from self.request(op='grab_check')
                     except ChannelError:
                         pass
-                self.down(reply['error'] or 'helper_partial_write')
+                # A closed authority page is a designed stop, not a broken
+                # helper/device. Keep the channel for the next attached epoch.
+                if not preempted:
+                    self.down(reply['error'] or 'helper_partial_write')
                 return result
             deadline = started + 0.15 + max(0, len(frames)-1)*gap_us/1e6
             while True:

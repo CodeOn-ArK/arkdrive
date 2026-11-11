@@ -1000,6 +1000,7 @@ class Engine:
         # after entry cannot establish that its buffered prefix was empty.
         attempt.update(dispatch_status="unknown", accepted=None)
         previous_dispatch_rev = r["rev"]["dispatched"]
+        interrupted = None
         try:
             for event in events:
                 self.w.poll_control(force=True)
@@ -1030,7 +1031,15 @@ class Engine:
                 r["rev"]["dispatched"] = r["rev"]["dispatched"] or self.w.cache.rev
                 if ack.complete:
                     attempt.update(dispatch_status="accepted", accepted=True)
-            raise
+            if exc.reason != 'preempted' or not attempt['written']:
+                raise
+            # A worker-stopped prefix is not a failed channel. Its XI2
+            # events can still be queued on ev when the gate closes on inp.
+            # Release immediately, then use the normal bounded ack path for
+            # exactly that prefix before publishing its dispatch status.
+            interrupted = exc
+            a['preempted'] = True
+            yield from self.release(a, r)
         except (OSError, RuntimeError) as exc:
             attempt["error"] = str(exc)
             attempt["reason"] = "channel_down"
@@ -1058,6 +1067,8 @@ class Engine:
         attempt.update(ended_ns=int(self.clock() * 1e9), server_ack=ack.receipt(),
                        dispatch_status="accepted" if ack.complete else "unknown", accepted=True if ack.complete else None)
         r["dispatch_status"] = self.aggregate(r["attempts"])
+        if interrupted is not None:
+            raise interrupted
         if not ack.complete:
             attempt["reason"] = "input_unacknowledged"
             if cleanup:
@@ -1456,7 +1467,9 @@ class Engine:
             return
         r['_route_learned'] = True
         attempts = [v for v in r['attempts'] if v['route'] == route]
-        acknowledged = bool(attempts) and all(
+        # Acknowledging an abandoned prefix does not establish rejection of
+        # the requested macro. Preemption must not poison the learned route.
+        acknowledged = r.get('reason') != 'preempted' and bool(attempts) and all(
             v['dispatch_status'] == 'accepted' and v.get('server_ack') is not None and
             v['server_ack']['expected'] > 0 and v['server_ack']['seen'] == v['server_ack']['expected']
             for v in attempts)
