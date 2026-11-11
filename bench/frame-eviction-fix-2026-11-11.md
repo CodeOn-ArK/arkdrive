@@ -36,12 +36,3 @@ TMPDIR="$PWD/wm/tests/.tmp-frame-eviction-2026-11-11" \
 ```
 
 The guest-VM acceptance run remains Raj's. No staging or commits.
-
-## Verifier addendum (Raj, 2026-11-11)
-
-Full suite re-run by Raj on ArK2: 770 tests, OK (zero skips outside the
-sandbox). Guest acceptance in the generic Debian 13 VM (the environment
-where the defect was found): worker_pixels.py + test_worker_w3.py synced
-into the guest's ~/arkdrive; all 7 FrameQuotaTests PASS, including
-test_oldest_evicted_receipt_reference_protected (deterministic failure
-pre-fix) and the new equal-mtime regression. Fix closed.

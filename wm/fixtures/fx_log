@@ -119,7 +119,7 @@ class Fixture:
         has_key, keycode = event.get_keycode()
         has_button, button = event.get_button()
         has_root, root_x, root_y = event.get_root_coords()
-        self.write("input", event=event.type.value_nick,
+        self.write("rejected_input" if rejected else "input", event=event.type.value_nick,
                    keycode=keycode if has_key else None,
                    button=button if has_button else None,
                    root_x=root_x if has_root else None,

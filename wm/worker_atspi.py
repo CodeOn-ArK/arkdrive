@@ -346,6 +346,10 @@ class Backend:
         raw = walk(frame)
         if raw is None:
             raw = dict(key=self.key(frame), role='frame', showing=False, visible=False)
+        try:
+            raw['toolkit'] = str(self.read(self.read(frame, 'app'), 'toolkitName'))
+        except (AttributeError, NotImplementedError):
+            raw['toolkit'] = 'unknown'
         with self.lock:
             current = self.freshness(window, app_id)
             raw['dirty'] = current != version
@@ -398,7 +402,7 @@ class Backend:
         # A real application round trip, independent of the cached tree.
         return dict(name=self.read(obj, 'name'))
 
-    def invoke(self, task):
+    def mutation_node(self, task):
         self.begin()
         with self.lock:
             objects, app, version = self.objects.get(task['window'], ({}, None, None))
@@ -414,6 +418,21 @@ class Backend:
         role, name = canonical_role(self.call(obj.getRoleName)), self.read(obj, 'name')
         if task.get('role', role) != role or task.get('name', name) != name:
             raise ValueError('stale_rev')
+        return obj
+
+    def set_text(self, task):
+        obj = self.mutation_node(task)
+        states = self.call(obj.getState)
+        if not self.call(states.contains, self.a.STATE_EDITABLE):
+            raise ValueError('backend_unsupported')
+        if task.get('focused_required') and not self.call(states.contains, self.a.STATE_FOCUSED):
+            raise ValueError('precondition_failed')
+        editable = self.call(obj.queryEditableText)
+        check_authority(task)
+        return dict(accepted=bool(self.call(editable.setTextContents, task['text'])))
+
+    def invoke(self, task):
+        obj = self.mutation_node(task)
         action = self.call(obj.queryAction)
         names = [self.call(action.getName, i) for i in range(self.read(action, 'nActions'))]
         requested = task.get('action')

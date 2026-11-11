@@ -1480,15 +1480,15 @@ class EngineW6(base.Harness):
         sock.send = fail_events
         return sock
 
-    def test_unexpected_evdev_fault_mid_batch_returns_channel_down(self):
+    def test_unexpected_evdev_zero_write_fault_advances_to_xtest(self):
         self.evdev.connector = self.event_fault_socket
         r = self.run_action(self.params([self.move(100, 2), self.key()]))
         first = r['steps'][0]
         self.assertEqual((first['reason'], first['dispatch_status'], first['written']),
-                         ('channel_down', 'not_dispatched', 0))
+                         (None, 'accepted', 0))
+        self.assertEqual([v['route'] for v in first['attempts']], ['evdev', 'xtest'])
         self.assertEqual(first['attempts'][0]['error'], 'helper_transport_error:RuntimeError')
-        self.assertEqual(r['steps'][1]['reason'], 'not_reached')
-        self.assertEqual(r['advice'], 'do_not_retry')
+        self.assertEqual(first['effect']['status'], 'verified')
         self.assertEqual(self.evdev.health['last_error'], 'helper_transport_error:RuntimeError')
         self.assertEqual(self.evdev.health['state'], 'down')
 
@@ -1547,10 +1547,14 @@ class EngineW6(base.Harness):
         r = self.run_action(self.params([self.move(100, 2), self.key()]))
         step = r['steps'][0]
         self.assertEqual((step['reason'], step['dispatch_status'], step['written']),
-                         ('channel_down', 'accepted' if written else 'not_dispatched', written))
+                         ('channel_down' if written else None, 'accepted', written))
         self.assertEqual(step['attempts'][0]['frames_written'], written)
         self.assertEqual(step['attempts'][0]['error'], 'grab_lost')
-        self.assertEqual(r['steps'][1]['reason'], 'not_reached')
+        if written:
+            self.assertEqual(r['steps'][1]['reason'], 'not_reached')
+        else:
+            self.assertEqual([v['route'] for v in step['attempts']], ['evdev', 'xtest'])
+            self.assertEqual(step['effect']['status'], 'verified')
         self.assertEqual(self.w.channels()['evdev']['last_error'], 'grab_lost')
         self.assertEqual(self.evdev.health['state'], 'down')
         self.assertFalse(self.evdev.health['grab'])
@@ -1558,12 +1562,13 @@ class EngineW6(base.Harness):
         self.assertIn('release_all', [req.get('op') for req in self.log])
         self.assertEqual(self.evdev.reconnects, 0)
         self.assertEqual(self.w.counters['retries'], 0)
-        self.assertEqual(r['advice'], 'do_not_retry')
+        if written:
+            self.assertEqual(r['advice'], 'do_not_retry')
 
     def test_grab_lost_partial_batch_never_replays(self):
         self.check_grab_lost_batch(1)
 
-    def test_grab_lost_zero_batch_never_replays(self):
+    def test_grab_lost_zero_batch_advances_to_xtest(self):
         self.check_grab_lost_batch(0)
 
     def application_release(self):
@@ -1587,7 +1592,7 @@ class EngineW6(base.Harness):
         self.assertEqual(r['status'], 'success')
         self.assertEqual(r['steps'][0]['route'], 'evdev')
         self.assertTrue(any(req.get('frames') == [[[2, 8, 1]]] for req in self.log))
-        self.assertEqual(r['steps'][0]['attempts'][-1]['server_ack']['seen'], 2)
+        self.assertEqual(r['steps'][0]['attempts'][-1]['input_groups'][-1]['server_ack']['seen'], 2)
 
     def test_drag_frames_release_and_reach_endpoint(self):
         self.application_release()

@@ -11,6 +11,8 @@ import time
 from collections import deque
 from pathlib import Path
 
+from worker_routes import RouteTable, ladder
+
 
 class ActError(Exception):
     def __init__(self, reason, detail=None):
@@ -195,6 +197,9 @@ class Engine:
         self.actions = {}
         self.seq = 0
         self.evdev = None
+        from worker_paste import Clipboard
+        self.clipboard = Clipboard(worker)
+        self.routes = RouteTable(worker.state / "route-table.json", worker.generation)
         self.route = "xtest"
         self.fence_reason = None
         self.pending_effects = []
@@ -212,7 +217,7 @@ class Engine:
         except OSError:
             self.boot_id = None
         digest = hashlib.sha256()
-        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_evdev.py", "worker_keymap.py", "input_protocol.py", "worker_pixels.py", "worker_tree.py", "worker_atspi.py", "openbox-rc.xml"):
+        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_evdev.py", "worker_keymap.py", "worker_routes.py", "worker_paste.py", "input_protocol.py", "worker_pixels.py", "worker_tree.py", "worker_atspi.py", "openbox-rc.xml"):
             digest.update(name.encode() + Path(__file__).with_name(name).read_bytes())
         self.build_id = digest.hexdigest()
         try:
@@ -978,6 +983,8 @@ class Engine:
                     any(self.w.cache.facets.get(f, 1) > r["macro_rev"] for f in ("focus", "modal"))):
                 raise ActError("unexpected_state")
             self.arm(a, r)
+            if r.get("target_resolved"):
+                self.route_snapshot(r, r["target_resolved"])
         if self.route == "evdev" and not cleanup:
             return (yield from self.send_evdev(a, r, events))
         ack = Ack([(k, d) for k, d, *xy in events], self.t.sources, self.t.raw_seq)
@@ -1215,8 +1222,10 @@ class Engine:
         # separate fallback for keyboard release; buttons require raw ack.
         held_keys = set(holds["key"])
         self.durable_cleanup(a, events)
+        cleanup_receipt = {'id': r['id'], 'attempts': [], 'rev': {'dispatched': None},
+                           'dispatch_status': 'not_dispatched'}
         try:
-            ok = yield from self.send(a, r, events, cleanup=True)
+            ok = yield from self.send(a, cleanup_receipt, events, cleanup=True)
         except ActError:
             ok = False
         if not ok and held_keys and not any(k.startswith("button") for k, d in events):
@@ -1226,6 +1235,7 @@ class Engine:
             except ActError:
                 ok = False
         r["cleanup"] = {"released": events if ok else [], "unreleased": [] if ok else events, "confirmed": ok}
+        r['cleanup']['attempts'] = cleanup_receipt['attempts']
         if not ok:
             holds["key"].update(held_keys)
             holds["button"].update(d for k, d in events if k == "button_up")
@@ -1323,20 +1333,217 @@ class Engine:
                     raise
             yield
 
+    def route_context(self, s, handle):
+        intent, kind = s['intent'], s['intent']['kind']
+        win = self.window(handle) or {}
+        tree = getattr(self.w, 'tree', None)
+        raw = getattr(tree, 'raw', {}).get(handle, {})
+        nodes = getattr(getattr(tree, 'cache', None), 'windows', {}).get(handle, {}).get('nodes', {})
+        node = s.get('_node')
+        if kind == 'text' and node is None:
+            focused = [n for n in nodes.values() if 'focused' in n.get('states', []) and
+                       'editable' in n.get('states', []) and 'disabled' not in n.get('states', [])]
+            if len(focused) == 1:
+                node = s['_fallback_node'] = dict(focused[0])
+        app = win.get('app_build') or win.get('app') or win.get('class') or 'unknown'
+        identity = dict(profile_hash=self.w.profile_hash, app_build=app,
+                        toolkit=raw.get('toolkit', win.get('toolkit', 'unknown')),
+                        surface_role=(node or {}).get('role', raw.get('role', win.get('type', 'unknown'))),
+                        operation=kind, input_class='keyboard' if kind in ('key', 'text') else 'pointer')
+        routes = ladder(self.w.record['profile'], kind, intent.get('via', 'auto'),
+                        all(self.t.character(c) is not None for c in intent.get('text', '')),
+                        len(intent.get('text', '')), node is not None and 'editable' in node.get('states', []),
+                        isinstance(s.get('target'), dict) and 'ref' in s['target'] and
+                        bool((node or {}).get('actions')))
+        requested = intent.get('route', 'auto')
+        if requested not in ('auto', 'input'):
+            routes = [route for route in routes if route == ('paste' if requested == 'clipboard' else requested)]
+        apps = self.w.profile_data.get('applications', {})
+        policy = apps.get(app, apps.get(win.get('class'), {})) if isinstance(apps, dict) else {}
+        try:
+            key = self.routes.entry(identity, routes, policy.get('synthetic_input') == 'rejected')
+            # A new generation's successful physical selftest is recovery proof.
+            for route in routes:
+                state = self.routes.entries[key]['states'][route]
+                healthy = (route == 'xtest' and self.channel['state'] == 'ok' or
+                           route == 'evdev' and self.evdev and self.evdev.health['state'] == 'up' or
+                           route == 'paste' and self.clipboard.health['state'] in ('ok', 'unavailable') or
+                           route == 'atspi' and tree and tree.healthy(handle))
+                if state['state'] == 'down' and state.get('generation') != self.w.generation and healthy:
+                    self.routes.flip(key, route, 'ok')
+        except OSError as exc:
+            raise ActError('worker_fault', 'route_table_unavailable') from exc
+        return key, routes
+
+    def route_flip(self, key, route, state):
+        try:
+            self.routes.flip(key, route, state)
+        except OSError as exc:
+            raise ActError('worker_fault', 'route_table_unavailable') from exc
+
+    def family_stamp(self, handle):
+        cache = self.w.cache
+        win = self.window(handle)
+        if not win:
+            return None
+        family = win['family']
+        members = [v for v in cache.windows.values() if v['family'] == family]
+        stamp = {}
+        pixels = getattr(self.w, 'pixels', None)
+        for member in members:
+            h = member['handle']
+            stamp[h] = (copy.deepcopy(member), cache.last_window.get(member['xid'], 0))
+            for name in ('geometry['+h+']', 'tree['+h+']'):
+                stamp[name] = cache.facets.get(name, 1)
+            if pixels:
+                g = member['geometry']
+                for tile in pixels.tiles(dict(x=g['x'], y=g['y'], w=g['w'], h=g['h'])):
+                    name = pixels.facet(tile)
+                    stamp[name] = cache.facets.get(name, 1)
+        for h, old in cache.tombstones.items():
+            if old.get('family') == family:
+                stamp['removed:'+h] = cache.removed.get(h)
+        return stamp
+
+    def route_snapshot(self, r, handle):
+        # The first actual dispatch, after focus/position setup, is the baseline.
+        if '_family_before' not in r:
+            r['_family_before'] = self.family_stamp(handle)
+            r['_focus_dispatch'] = self.w.cache.focus == handle
+
+    def learn_route(self, r, handle):
+        key, route = r.get('_route_key'), r.get('route')
+        if key is None or route is None:
+            return
+        r['_route_learned'] = True
+        attempts = [v for v in r['attempts'] if v['route'] == route]
+        acknowledged = bool(attempts) and all(
+            v['dispatch_status'] == 'accepted' and v.get('server_ack') is not None and
+            v['server_ack']['expected'] > 0 and v['server_ack']['seen'] == v['server_ack']['expected']
+            for v in attempts)
+        try:
+            flipped = self.routes.result(key, route, verified=r['effect']['status'] == 'verified',
+                acknowledged=acknowledged, focused_before=r.get('_focus_dispatch', False),
+                focused_after=self.w.cache.focus == handle,
+                no_change=r.get('_family_before') is not None and r['_family_before'] == self.family_stamp(handle),
+                effect=r['effect']['status'], recover=r['dispatch_status'] != 'unknown')
+        except OSError as exc:
+            raise ActError('worker_fault', 'route_table_unavailable') from exc
+        if flipped:
+            r['route_change'] = {'from': 'xtest', 'to': self.routes.next(key, r['_routes']),
+                                 'reason': 'synthetic_input_rejected_suspect'}
+            self.w.counters['route_changes'] += 1
+
+    def route_exhausted(self, key, r, kind):
+        if kind == 'invoke':
+            raise ActError('provider_degraded')
+        if self.routes.state(key, 'xtest') == 'rejected':
+            r['escalate'] = 'relaunch_on_xorg' if self.w.record['profile'] == 'xvfb' else 'restart_session'
+            raise ActError('backend_unsupported', 'xtest_rejected')
+        raise ActError('backend_unsupported')
+
+    @staticmethod
+    def rung_attempt(route, groups, error, started, ended):
+        if len(groups) == 1:
+            result = groups[0]
+            result['route'] = route
+            return result
+        statuses = [g['dispatch_status'] for g in groups]
+        acked = [g['server_ack'] for g in groups if g.get('server_ack')]
+        status = 'unknown' if 'unknown' in statuses else 'accepted' if 'accepted' in statuses else 'not_dispatched'
+        return dict(route=route, started_ns=started, ended_ns=ended, dispatch_status=status,
+                    accepted=True if status == 'accepted' else False if status == 'not_dispatched' else None,
+                    written=sum(g.get('written', 0) for g in groups), expected=sum(g.get('expected', 0) for g in groups),
+                    written_prefix=dict(events=sum(g.get('written', 0) for g in groups)),
+                    server_ack=dict(expected=sum(v['expected'] for v in acked), seen=sum(v['seen'] for v in acked),
+                                    source=acked[-1]['source']) if acked else None,
+                    frames_written=sum(g.get('frames_written', 0) for g in groups),
+                    provider_result=None, error=next((g['error'] for g in groups if g.get('error')), None),
+                    reason=error.reason if error else None, input_groups=groups)
+
     def dispatch(self, a, s, r, handle, point):
-        intent, k = s["intent"], s["intent"]["kind"]
-        physical = k in ("key", "text", "click", "scroll", "move", "drag")
-        requested = intent.get("route", "auto")
-        self.route = "evdev" if physical and self.evdev and self.evdev.health["state"] == "up" and requested != "xtest" else "xtest"
-        if self.route == "evdev":
+        kind = s['intent']['kind']
+        if kind == 'wait':
+            return
+        key, routes = self.route_context(s, handle)
+        r['_route_key'], r['_routes'] = key, routes
+        if (self.w.record['profile'] == 'xorg' and kind in ('key', 'text', 'click', 'scroll', 'move', 'drag') and
+                self.routes.state(key, 'xtest') == 'rejected' and
+                (not self.evdev or self.evdev.health['state'] == 'down')):
+            self.route_exhausted(key, r, kind)
+        initial = self.routes.next(key, routes)
+        if routes and initial != routes[0]:
+            r.setdefault('route_change', {'from': routes[0], 'to': initial, 'reason': 'learned_route'})
+        if initial is None:
+            self.route_exhausted(key, r, kind)
+        for route in routes[routes.index(initial):]:
+            if self.routes.state(key, route) in ('down', 'rejected'):
+                continue
+            if r.get('_rung_count', 0) >= 3:
+                break
+            r['_rung_count'] = r.get('_rung_count', 0) + 1
+            offset, started, error = len(r['attempts']), int(self.clock()*1e9), None
+            r['route'] = route
+            try:
+                yield from self.dispatch_rung(a, s, r, handle, point, route)
+            except ActError as exc:
+                error = exc
+            finally:
+                groups = r['attempts'][offset:]
+                attempt = self.rung_attempt(route, groups, error, started, int(self.clock()*1e9))
+                r['attempts'][offset:] = [attempt]
+                if route == 'paste':
+                    attempt.update(clipboard_overwritten=r.get('clipboard_overwritten', False),
+                                   selection_requested=r.get('selection_requested', False))
+                    self.clipboard.attempt = attempt
+                    attempt['input_route'] = self.route
+                r['route'] = route
+                r['dispatch_status'] = self.aggregate(r['attempts'])
+            if error is None:
+                return
+            status = attempt['dispatch_status']
+            if status == 'unknown':
+                if error.reason == 'input_unacknowledged':
+                    self.route_flip(key, route, 'suspect')
+                raise error
+            if error.reason in ('channel_down', 'backend_unsupported', 'provider_degraded'):
+                self.route_flip(key, route, 'down')
+            # Only proof of zero delivery permits a non-idempotent replay.
+            # Unknown and acknowledged absence of effect never change rungs.
+            if (status != 'not_dispatched' or r['dispatch_status'] != 'not_dispatched' or
+                    error.reason not in ('channel_down', 'backend_unsupported', 'provider_degraded')):
+                raise error
+            next_route = self.routes.next(key, routes[routes.index(route)+1:])
+            if next_route is None or r['_rung_count'] >= 3:
+                # Keep ordinary channel failures when no rejection escalation applies.
+                if route != 'atspi' and self.routes.state(key, 'xtest') == 'rejected':
+                    self.route_exhausted(key, r, kind)
+                raise error
+            r['route_change'] = {'from': route, 'to': next_route, 'reason': error.reason}
+            self.w.counters['route_changes'] += 1
+        self.route_exhausted(key, r, kind)
+
+    def dispatch_rung(self, a, s, r, handle, point, route):
+        intent, k = s['intent'], s['intent']['kind']
+        self.route = route if route in ('evdev', 'xtest') else 'xtest'
+        if route == 'paste':
+            key = r['_route_key']
+            physical = ['evdev', 'xtest'] if self.w.record['profile'] == 'xorg' else ['xtest']
+            self.route = next((v for v in physical if
+                              (v == 'xtest' and self.channel['state'] == 'ok' or
+                               v == 'evdev' and self.evdev and self.evdev.health['state'] == 'up')), None)
+            if self.route is None:
+                raise ActError('backend_unsupported', 'paste_input_unavailable')
+        if self.route == 'evdev':
+            if not self.evdev or self.evdev.health['state'] != 'up':
+                raise ActError('channel_down')
             self.evdev.guard(intent)
             yield from self.wait_evdev(a)
             r['evdev_intent_epoch'] = self.evdev.map_epoch
-            if not a.get("evdev_grab_checked"):
-                a["evdev_grab_checked"] = True
+            if not a.get('evdev_grab_checked'):
+                a['evdev_grab_checked'] = True
                 if not (yield from self.evdev.grab_check()):
-                    self.route = "xtest"
-        route = "atspi" if k == "invoke" else "wm" if k in ("focus_window", "close_window") else self.route
+                    raise ActError('channel_down')
         # Resolve the entire macro before positioning/focusing/arming it.
         end = self.point(intent["to"], r["rev"]["base"]) if k == "drag" else None
         if end is not None:
@@ -1344,28 +1551,34 @@ class Engine:
         codes = self.mapped_keys(intent["keys"]) if k == "key" else []
         mods = self.mapped_keys(intent.get("modifiers", []))
         text, insertion_keys = None, None
-        if k == "text":
+        if k == "text" and route not in ("paste", "atspi"):
             text = [self.t.character(c) for c in intent["text"]]
             if any(v is None for v in text):
                 raise ActError("backend_unsupported", "unmappable_text")
+        if k == "text" and route != "atspi":
             select_all = self.mapped_keys(self.t.select_all(handle)) if intent["replace"] else []
             if (s.get("_node") and "focused" not in s["_node"].get("states", []) and not intent["replace"]):
                 insertion_keys = (self.mapped_keys(["Control_L", "Home"]), self.mapped_keys(["Right"]),
                                   self.mapped_keys(["Shift_L", "Right"]))
-        if route == "evdev":
-            all_codes = codes + mods
-            if k == "text":
+        paste_codes = []
+        if route == 'paste':
+            try:
+                paste_codes = self.mapped_keys(['Control_L', 'v'])
+            except ActError as exc:
+                raise ActError('backend_unsupported', 'unmappable_paste_shortcut') from exc
+        if route != "atspi" and self.route == "evdev":
+            all_codes = codes + mods + paste_codes
+            if route == "paste":
+                all_codes += select_all
+            if k == "text" and route != "paste":
                 all_codes += select_all + [c for group in text for c in group]
                 if insertion_keys:
                     all_codes += [c for group in insertion_keys for c in group]
             if any(self.evdev.keycodes.get(c) in (None, 99) for c in all_codes):
                 raise ActError("invalid_request", "unmapped_evdev_key")
-        requested = intent.get("route", "auto")
-        if requested not in ("auto", "input", route) or intent.get("via") == "paste":
-            raise ActError("backend_unsupported")
         if k == "wait":
             return
-        if route == "xtest" and self.channel["state"] != "ok":
+        if route not in ("atspi", "wm") and self.route == "xtest" and self.channel["state"] != "ok":
             raise ActError("channel_down")
         if point and handle is not None:
             facet = "geometry[" + handle + "]"
@@ -1373,20 +1586,31 @@ class Engine:
         if s.get("_node"):
             yield from self.current_tree_ref(a, handle, s["_node"]["ref"], r["rev"]["base"])
             r["tree_guard"] = (handle, s["_node"]["ref"])
-        if k == "invoke":
+        if route == "atspi":
+            node = s.get("_node") or s.get("_fallback_node")
+            if node is None or k == "text" and "editable" not in node.get("states", []):
+                raise ActError("backend_unsupported")
+            node = yield from self.current_tree_ref(a, handle, node["ref"], r["rev"]["base"])
+            if k == "text" and "editable" not in node.get("states", []):
+                raise ActError("backend_unsupported")
+            if k == 'text' and not s.get('_node') and 'focused' not in node.get('states', []):
+                raise ActError('precondition_failed')
+            yield from self.focus(a, r, handle)
+            self.route_snapshot(r, handle)
+            fields = dict(text=intent["text"], focused_required=not bool(s.get('_node'))) if k == "text" else dict(action=intent.get("action"))
             self.gate(a)
             self.arm(a, r)
             attempt = {"route": "atspi", "dispatch_status": "not_dispatched", "accepted": None,
                        "written": 0, "expected": 1, "written_prefix": {}, "server_ack": None,
                        "provider_result": None, "error": None, "reason": None,
                        "started_ns": int(self.clock()*1e9), "ended_ns": None}
-            task = self.w.tree.request("invoke", handle, key=s["_node"]["key"], action=intent.get("action"),
-                                       role=s["_node"]["role"], name=s["_node"].get("name", ""),
+            task = self.w.tree.request("set_text" if k == "text" else "invoke", handle, key=node["key"],
+                                       role=node["role"], name=node.get("name", ""), **fields,
                                        control=str(self.w.sd / "control"), generation=self.w.generation,
                                        epoch=a["params"]["control_epoch"], deadline=min(a["deadline"], a["step_deadline"]))
+            r["attempts"].append(attempt)
             if task is None:
                 raise ActError("provider_degraded")
-            r["attempts"].append(attempt)
             r["route"] = "atspi"
             r["rev"]["dispatched"] = self.w.cache.rev
             attempt["dispatch_status"] = r["dispatch_status"] = "unknown"
@@ -1438,6 +1662,15 @@ class Engine:
             r["macro_focus"], r["macro_modal"] = self.w.cache.focus, list(self.w.cache.modal)
             r["macro_rev"] = self.w.cache.rev
             yield from self.position(a, r, point, handle)
+        self.route_snapshot(r, handle)
+        if route == 'paste':
+            self.gate(a)
+            self.arm(a, r)
+            yield from self.clipboard.own(intent['text'], handle, lambda: self.gate(a), r)
+            if intent['replace']:
+                yield from self.send(a, r, self.key_events(self.mapped_keys(self.t.select_all(handle))))
+            yield from self.send(a, r, self.key_events(paste_codes))
+            return
         if k in ("focus_window", "close_window"):
             self.gate(a)
             self.arm(a, r)
@@ -1853,6 +2086,7 @@ class Engine:
                     r['predicate_class'] = predicate_class(effective)
                     r["effect"].update(predicate_class=r["predicate_class"], expect_source=r["expect_source"])
                     r["focus"]["after"], r["modal"]["after"] = self.w.cache.focus, list(self.w.cache.modal)
+                    self.learn_route(r, handle)
                     if a["preempted"]:
                         raise ActError("preempted")
                     if r["effect"]["status"] != "verified":
@@ -1882,9 +2116,14 @@ class Engine:
                         r["disposition"] = "executed"
                     else:
                         r["effect"] = self.evaluated_effect('not_observed', r['expect'])
+                    if exc.reason == 'input_unacknowledged' and r.get('_route_key'):
+                        self.route_flip(r['_route_key'], r['route'], 'suspect')
                     stop_reason = exc.reason
                     break
                 finally:
+                    self.clipboard.attempt = self.clipboard.step_evidence = None
+                    if not r.get('_route_learned') and r.get('_route_key'):
+                        self.learn_route(r, r.get('target_resolved'))
                     a.pop("step_deadline", None)
                     r["focus"]["after"], r["modal"]["after"] = self.w.cache.focus, list(self.w.cache.modal)
                     r["timing_ms"]["total"] = (self.clock() - started) * 1000
@@ -1910,20 +2149,25 @@ class Engine:
                     self.gate(a)
                     origin = yield from self.query("pointer", deadline=self.clock() + 0.05)
                     probe = {"id": r["id"], "route": None, "attempts": [], "rev": {"dispatched": None}, "dispatch_status": "not_dispatched"}
+                    r['channel_probe'] = probe['attempts']
                     x, y = origin["x"], origin["y"]
-                    if self.route == 'evdev' and self.evdev.health['state'] == 'down':
-                        # Cleanup has independently confirmed release. F2's
-                        # private liveness probe uses the surviving channel;
-                        # it must not turn honest evdev degradation into F2.
+                    if (self.route == 'evdev' and self.evdev.health['state'] == 'down' and
+                            r.get('reason') != 'input_unacknowledged'):
+                        # Preserve the independent F2 liveness check after a
+                        # helper failure; incomplete raw ack probes its own route.
                         self.route = 'xtest'
                     yield from self.send(a, probe, [("motion", 0, x + (1 if x + 1 < self.w.screen["w"] else -1), y), ("motion", 0, x, y)])
                     r["channel_probe"] = probe["attempts"]
                 except ActError as exc:
                     if exc.reason in ("input_unacknowledged", "channel_down"):
-                        if r.get("route") == "evdev" and self.evdev:
+                        if self.route == "evdev" and self.evdev:
                             self.evdev.down("input_unacknowledged")
+                            if r.get("_route_key"):
+                                self.route_flip(r["_route_key"], r["route"], "down")
                         else:
                             self.channel["state"] = "down"
+                            if r.get("_route_key"):
+                                self.route_flip(r["_route_key"], r["route"], "down")
                         self.fence("F2:probe_failed")
         else:
             self.unknown_streak = 0
@@ -1972,6 +2216,8 @@ class Engine:
                                          "rev": self.w.cache.rev})
         for s in steps:
             s.pop("windows_before", None)
+            for field in ('_route_key', '_routes', '_rung_count', '_family_before', '_focus_dispatch', '_route_learned'):
+                s.pop(field, None)
             if s['effect'].get('fallback_from') == 'tree':
                 s['predicate_class'] = predicate_class(s['effect']['predicate'])
             s["effect"].update(predicate_class=s["predicate_class"], expect_source=s["expect_source"])

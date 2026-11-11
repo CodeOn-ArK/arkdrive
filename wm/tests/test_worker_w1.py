@@ -458,7 +458,7 @@ class XEventTests(unittest.TestCase):
 
     def test_synthetic_x_event_stream_map_focus_geometry_unmap_destroy(self):
         cache = w.StateCache("s1", GEN)
-        worker = NS(cache=cache, x_errors=[])
+        worker = NS(cache=cache, x_errors=[], generation=GEN)
         xs = w.XState.__new__(w.XState)
         xs.w, xs.root = worker, NS(id=1)
         xs.atoms = {name: i + 100 for i, name in enumerate(w.ATOM_NAMES)}

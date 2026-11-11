@@ -251,17 +251,19 @@ class Recovery(base.Harness):
         self.drain()
         self.assertIsNone(self.e.fence_reason)
 
-    def test_other_worker_generation_stays_refused_without_phantom_holds_or_f1(self):
+    def test_other_worker_generation_zero_write_uses_xtest_without_phantom_holds_or_f1(self):
         self.helper.generation = 'f' * 32
         self.evdev.instance = OLD
         self.evdev.connector = lambda: w6.MemorySocket(self.helper.handle, self.log, fragment=65536)
         r = self.killed_text()
-        self.assertEqual(r['steps'][0]['reason'], 'channel_down')
-        self.assertEqual(r['steps'][0]['dispatch_status'], 'not_dispatched')
-        self.assertFalse(self.t.log)
+        self.assertEqual([a['route'] for a in r['steps'][0]['attempts']], ['evdev', 'xtest'])
+        self.assertEqual(r['steps'][0]['attempts'][0]['dispatch_status'], 'not_dispatched')
+        self.assertEqual(r['steps'][0]['dispatch_status'], 'accepted')
+        self.assertTrue(self.t.log)
         self.assertIsNone(self.e.fence_reason)
         self.assertFalse(any(self.e.holds['evdev'].values()))
         self.assertFalse(any(self.evdev.held_codes.values()))
+        self.reconcile()
         following = self.run_action(self.params([self.move(30, 30)], action_id='following', base_rev=self.w.cache.rev))
         self.assertEqual(following['status'], 'success')
         self.assertEqual(following['steps'][0]['route'], 'xtest')

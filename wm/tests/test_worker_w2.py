@@ -850,8 +850,9 @@ class FixRound2(Harness):
     def assert_one_click(self, receipt):
         self.assertEqual([ev for ev in self.t.log if ev[0].startswith("button")],
                          [("button_down", 1), ("button_up", 1)])
-        # These are motion, down and up, not three click-macro dispatches.
-        self.assertEqual(len(receipt["steps"][0]["attempts"]), 3)
+        # W8 groups motion/down/up under one bounded route attempt.
+        self.assertEqual(len(receipt["steps"][0]["attempts"]), 1)
+        self.assertEqual(len(receipt["steps"][0]["attempts"][0]["input_groups"]), 3)
         self.assertTrue(all(t["server_ack"]["seen"] == t["server_ack"]["expected"]
                             for t in receipt["steps"][0]["attempts"]))
         self.assertEqual(self.w.counters["retries"], 0)
@@ -1513,7 +1514,7 @@ class Dispatch(Harness):
         self.assertEqual(self.t.down, set())
 
     def test_unmappable_text_no_prefix_and_no_focus_or_motion(self):
-        r = self.run_action(self.params([self.key(intent={"kind": "text", "text": "aa😀aa", "replace": True})]))
+        r = self.run_action(self.params([self.key(intent={"kind": "text", "text": "aa😀aa", "replace": True, "via": "keys"})]))
         self.assertEqual((r["reason"], r["steps"][0]["detail"]), ("backend_unsupported", "unmappable_text"))
         self.assertFalse(r["dispatched"])
         self.assertFalse(self.t.log)

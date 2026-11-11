@@ -42,6 +42,7 @@ from input_protocol import control_store
 from worker_pixels import Pixels, Shadow, intersect, bbox
 from worker_tree import Provider as TreeProvider, MAP_GRACE
 from worker_ocr import Provider as OCRProvider
+from worker_paste import ATOMS as PASTE_ATOMS
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
 STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
 PAGE = struct.Struct("<4sI16sQIIQ16s")
@@ -53,7 +54,7 @@ ATOM_NAMES = ("_NET_SUPPORTING_WM_CHECK", "WM_S0", "_NET_CLIENT_LIST",
               "_NET_ACTIVE_WINDOW", "_NET_WM_NAME", "WM_NAME", "WM_CLASS",
               "WM_TRANSIENT_FOR", "WM_CLIENT_LEADER", "_NET_WM_STATE",
               "_NET_WM_STATE_MODAL", "_NET_WM_WINDOW_TYPE",
-              "_NET_WM_WINDOW_TYPE_DIALOG", "_NET_WM_PID", "_NET_CLOSE_WINDOW", "_NET_RESTACK_WINDOW")
+              "_NET_WM_WINDOW_TYPE_DIALOG", "_NET_WM_PID", "_NET_CLOSE_WINDOW", "_NET_RESTACK_WINDOW", *PASTE_ATOMS)
 
 
 def utc():
@@ -952,6 +953,26 @@ class XState:
             cancelled = True
         return cancel
 
+    def app_build(self, pid, identity):
+        # Metadata work, never an executable launch. Cache each binary identity;
+        # unknown/foreign PIDs retain the window identity plus generation so
+        # unmeasured builds cannot inherit an earlier generation's hints.
+        cache = getattr(self, 'build_hashes', None)
+        if cache is None:
+            self.build_hashes = cache = {}
+        try:
+            if not pid or not marked(pid, self.w.state, self.w.sid):
+                return identity + ':unmeasured:' + self.w.generation
+            path = Path(f'/proc/{pid}/exe')
+            info = path.stat()
+            key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            if key not in cache:
+                with path.open('rb') as binary:
+                    cache[key] = hashlib.file_digest(binary, 'sha256').hexdigest()
+            return cache[key]
+        except OSError:
+            return identity + ':unmeasured:' + self.w.generation
+
     def snapshot(self, wid, values):
         a, g, p = (values[n] for n in ("attributes", "geometry", "position"))
         if not a or not g or not p:
@@ -987,6 +1008,7 @@ class XState:
         family = (f"x:{transient}" if transient else f"x:{leader}" if leader else
                   f"pid:{pid}" if pid else (focused["family"] if popup and focused else fallback or f"x:{wid}"))
         self.w.cache.upsert(wid, {"xid": wid, "family": family,
+            "app_build": self.app_build(pid, classes[-1] if classes else "unknown"),
             "app": classes[-1] if classes else "", "title": text("_NET_WM_NAME") or text("WM_NAME"),
             "class": classes[-1] if classes else "", "instance": classes[0] if classes else "",
             "geometry": {"x": p["x"], "y": p["y"], "w": g["width"], "h": g["height"]},
@@ -1030,6 +1052,7 @@ class XState:
     def events(self, events):
         if getattr(self.w, "act", None):
             self.w.act.t.events(events)
+            self.w.act.clipboard.events(events)
             if self.w.act.evdev:
                 self.w.act.evdev.events(events)
         damage_rects = []
@@ -1149,11 +1172,16 @@ class Worker:
         return int((time.monotonic() - self.started) * 1000)
 
     def setup_action_profile(self):
-        # W2 fixed development profile. No route learning or app classifier.
+        # Session record may carry the launcher's canonical profile JSON.
         self.profile_data = {"schema": 1, "backend": self.record.get("profile"),
                              "keymap": "server", "locale": "C.UTF-8", "wm": "openbox",
                              "input": {"inter_key_delay_us": 0},
                              "shortcuts": {"select_all": ["Control_L", "a"]}}
+        profile_path = self.sd / 'profile.json'
+        if 'profile_data' in self.record:
+            self.profile_data = self.record['profile_data']
+        elif profile_path.exists():
+            self.profile_data = json.loads(profile_path.read_text())
         self.profile_hash = hashlib.sha256(canonical(self.profile_data).encode()).hexdigest()
         self.development_flags = FLAGS
 
@@ -1220,7 +1248,8 @@ class Worker:
                           "grab": False, "keyboard": "untested", "recompiles": 0, "last_error":
                           None if self.record["profile"] == "xorg" else "backend_unsupported",
                           "reason": "not_implemented" if self.record["profile"] == "xorg" else "backend_unsupported"},
-                "paste": {"state": "unavailable", "reason": "not_implemented"},
+                "paste": dict(self.act.clipboard.health) if getattr(self, "act", None) else
+                         {"state": "unavailable", "reason": "not_created"},
                 "atspi": self.tree.health()["atspi"] if getattr(self, "tree", None) else
                          {"state": "down", "reason": "provider_unavailable"}}
 
