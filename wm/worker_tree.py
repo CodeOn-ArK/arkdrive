@@ -981,11 +981,16 @@ class Provider:
             return value, False
         window = self.predicate_window(p)
         node = self.resolve(window, p.get('ref', p.get('selector')), missing=True)
-        # A missing node alone is not contrary state evidence. Focus is
-        # exclusive within the window, so another focused node is positive
-        # evidence even if the original node has disappeared.
-        contrary = node is not None or (p['state'] == 'focused' and p.get('value', True) and
-                    any('focused' in n.get('states', []) for n in self.snapshot(window)['nodes'].values()))
+        # A present node's different state can still be propagating after
+        # input; like a missing node, it is unmet, not contrary evidence.
+        # Focus is exclusive within the window, so a DIFFERENT holder is
+        # positive contrary evidence even if the target has disappeared.
+        # Selection cardinality is not exposed by our snapshots: another
+        # selected node cannot establish exclusive selection here.
+        contrary = (p['state'] == 'focused' and p.get('value', True) and
+                    any(n['ref'] != (node['ref'] if node else None) and
+                        'focused' in n.get('states', [])
+                        for n in self.snapshot(window)['nodes'].values()))
         return value, contrary
 
     def requirements(self, req, window, base, completed=False):

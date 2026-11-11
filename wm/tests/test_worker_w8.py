@@ -472,12 +472,27 @@ class PostDispatchVerification(tree_tests.ProviderHarness):
         self.assertEqual(self.samples, [(False, False), (False, False)])
         self.assertGreater(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
 
-    def test_freshness_negative_control_old_false_is_premature_contradiction(self):
-        # By-construction replay of the reported classification: permit the
-        # pre-dispatch page to decide contrary state. The same click now fails
-        # before either server refresh or the delayed focused snapshot.
+    def old_holder_then_target_focuses(self):
+        self.raw['children'][1]['states'] = ['focused']
+        self.p.cache.update(self.handle, self.raw, 1)
+        self.step_expect = self.predicate()
+        def focus():
+            self.raw['children'][1]['states'] = []
+            self.raw['children'][0]['states'].append('focused')
+            self.publish(self.raw)
+        self.sample_then(focus)
+        return self.run_action(self.params([self.click()]))
+
+    def test_old_other_holder_then_new_target_focus_verifies(self):
+        result = self.old_holder_then_target_focuses()
+        self.assertEqual(result['effect']['status'], 'verified', result)
+        self.assertEqual(self.samples, [(False, False), (False, False)])
+
+    def test_freshness_negative_control_old_other_holder_is_premature_contradiction(self):
+        # Round 2: old target-state absence is no longer contrary even if the
+        # gate is bypassed. Use a positive old holder to pin the freshness gate.
         with patch.object(self.p, 'effect_fresh', return_value=True):
-            result = self.focused_after_two_old_samples()
+            result = self.old_holder_then_target_focuses()
         self.assertEqual((result['effect']['status'], result['reason']),
                          ('contradicted', 'effect_contradicted'))
         self.assertFalse(self.samples)
@@ -493,16 +508,47 @@ class PostDispatchVerification(tree_tests.ProviderHarness):
                          ('contradicted', 'effect_contradicted'), result)
         self.assertEqual(self.samples, [(False, False), (False, False)])
         self.assertGreater(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
+        self.assertLess(result['steps'][0]['timing_ms']['total'], 300)
 
-    def test_new_snapshot_target_definitively_false_still_contradicts(self):
+    def test_new_snapshot_target_state_absent_until_budget_is_not_observed(self):
+        # Replaces round 1's "definitively false" contradiction assertion:
+        # a newer snapshot can still contain a pre-effect state bit.
         self.step_expect = self.predicate()
+        started = self.now
         def changed():
             self.raw['children'][1]['name'] = 'Changed after dispatch'
             self.publish(self.raw)
         self.sample_then(changed)
         result = self.run_action(self.params([self.click()]))
         self.assertEqual((result['effect']['status'], result['reason']),
-                         ('contradicted', 'effect_contradicted'), result)
+                         ('not_observed', 'timeout'), result)
+        self.assertGreaterEqual(self.now - started, .3)
+        self.assertGreaterEqual(result['steps'][0]['timing_ms']['total'], 300)
+        self.assertGreater(len(self.samples), 2)
+        self.assertTrue(all(sample == (False, False) for sample in self.samples))
+        self.assertGreater(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
+
+    def test_new_snapshot_state_absent_then_present_verifies(self):
+        # Live shape: both deciding trees are post-dispatch. The first is
+        # genuinely newer but still lacks the asynchronously propagated bit.
+        expect = self.predicate()
+        facets = []
+        def refresh():
+            if not facets:
+                self.raw['children'][1]['name'] = 'First post-dispatch snapshot'
+            else:
+                self.raw['children'][0]['states'].append('focused')
+            self.publish(self.raw)
+            dispatched = self.e.active['receipt']['steps'][0]['rev']['dispatched']
+            facets.append(self.w.cache.facets['tree['+self.handle+']'])
+            self.samples.append(self.e.verification_verdict(expect, False, dispatched))
+        self.t.refresh_hook = refresh
+        result = self.run_action(self.params([dict(self.click(), timeout_ms=4000)]))
+        self.assertEqual((result['status'], result['effect']['status']), ('success', 'verified'), result)
+        self.assertEqual(self.samples, [(False, False), (True, False)])
+        self.assertTrue(all(facet > result['rev']['dispatched'] for facet in facets))
+        self.assertGreater(facets[1], facets[0])
+        self.assertLess(result['steps'][0]['timing_ms']['total'], 4000)
 
     def test_new_snapshot_missing_target_other_node_focused_contradicts(self):
         self.step_expect = self.predicate()
@@ -544,6 +590,40 @@ class PostDispatchVerification(tree_tests.ProviderHarness):
         result = self.run_action(self.params([self.click(self.step_expect)]))
         self.assertEqual((result['status'], result['effect']['status']), ('success', 'verified'), result)
         self.assertEqual(self.samples, [(False, False), (False, False)])
+
+    def test_text_equals_post_dispatch_different_throughout_times_out(self):
+        self.step_expect = dict(kind='text_equals', window=self.handle, ref=self.refs()['entry'], value='done')
+        def different_text():
+            self.raw['children'][0]['text'] = 'still different'
+            self.publish(self.raw)
+        self.sample_then(different_text)
+        result = self.run_action(self.params([self.click(self.step_expect)]))
+        self.assertEqual((result['effect']['status'], result['reason']), ('not_observed', 'timeout'), result)
+        self.assertEqual(result['steps'][0]['dispatch_status'], 'accepted')
+        self.assertGreaterEqual(result['steps'][0]['timing_ms']['total'], 300)
+        self.assertGreater(len(self.samples), 2)
+        self.assertTrue(all(sample == (False, False) for sample in self.samples))
+        self.assertGreater(self.w.cache.facets['tree['+self.handle+']'], result['rev']['dispatched'])
+
+    def test_fresh_tree_mismatches_are_unmet_across_predicates(self):
+        entry, root = self.refs()['entry'], self.refs()['root']
+        dispatched = self.w.cache.rev
+        self.raw['children'][1]['states'] = ['selected']
+        self.publish(self.raw)
+        predicates = [dict(kind='node_state', ref=entry, state=state) for state in
+                      ('focused', 'selected', 'checked', 'expanded', 'disabled')]
+        predicates += [dict(kind='node_state', ref=entry, state=state, value=False)
+                       for state in ('enabled', 'editable')]
+        predicates += [dict(kind='text_equals', ref=entry, value='different'),
+            dict(kind='text_contains', ref=entry, value='different'),
+            dict(kind='node_present', ref='n99999'), dict(kind='node_absent', ref=entry),
+            dict(kind='item_present', container=root, name='Missing'),
+            dict(kind='item_absent', container=root, name='Input'),
+            dict(kind='scroll_value', ref=entry, axis='y', value=3)]
+        for p in predicates:
+            with self.subTest(predicate=p):
+                self.assertEqual(self.e.verification_verdict(dict(p, window=self.handle), False, dispatched),
+                                 (False, False))
 
     def test_every_tree_predicate_ignores_even_true_old_page(self):
         predicates = [self.predicate(),
