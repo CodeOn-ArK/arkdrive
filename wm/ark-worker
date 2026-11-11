@@ -43,6 +43,7 @@ from worker_pixels import Pixels, Shadow, intersect, bbox
 from worker_tree import Provider as TreeProvider, MAP_GRACE
 from worker_ocr import Provider as OCRProvider
 from worker_paste import ATOMS as PASTE_ATOMS
+from worker_housekeeping import cap_logs, matches_instance
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
 STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
 PAGE = struct.Struct("<4sI16sQIIQ16s")
@@ -153,6 +154,12 @@ def session_record(records, sid, state):
     if not r["_x_starttime"]:
         raise RuntimeError("x_server_dead")
     sd = state / "run" / sid
+    if r.get('instance'):
+        if not re.fullmatch(r'[0-9a-f]{32}', r['instance']):
+            raise RuntimeError('session_path_mismatch')
+        sd = sd / r['instance']
+        if not matches_instance(sd, r['instance']):
+            raise RuntimeError('session_path_mismatch')
     if Path(r["session_dir"]).resolve() != sd.resolve():
         raise RuntimeError("session_path_mismatch")
     for key, name in (("home", "home"), ("runtime_dir", "runtime")):
@@ -168,12 +175,15 @@ def session_record(records, sid, state):
 def session_env(r, state):
     # Deliberately allowlist; inherited host buses, HOME, DISPLAY, XAUTHORITY,
     # SESSION_MANAGER and desktop activation variables never reach children.
-    return {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8", "DISPLAY": f':{r["display"]}',
             "HOME": r["home"], "XDG_RUNTIME_DIR": r["runtime_dir"],
             "DBUS_SESSION_BUS_ADDRESS": r["bus_address"],
             "AT_SPI_BUS_ADDRESS": r["atspi_address"],
             "ARK_SESSIOND": str(state), "ARK_SESSION_ID": r["session"]}
+    if r.get('instance'):
+        env['ARK_SESSION_INSTANCE'] = r['instance']
+    return env
 
 
 def encode_control(generation, epoch=1, state=0, flags=0, lease_hash=bytes(16)):
@@ -235,8 +245,9 @@ class ActionOffsets:
 
 
 class Journal:
-    def __init__(self, path, session, generation):
+    def __init__(self, path, session, generation, instance=None):
         self.path, self.session, self.generation = path, session, generation
+        self.instance = instance
         self.stream = path.open("ab")
         self.index, self.index_error = {}, False
         try:
@@ -281,6 +292,8 @@ class Journal:
     def append(self, kind, **fields):
         value = {"ts": utc(), "type": kind, "session": self.session,
                  "generation": self.generation, **fields}
+        if self.instance is not None:
+            value['instance'] = self.instance
         self.stream.seek(0, os.SEEK_END)
         offset = self.stream.tell()
         self.stream.write(json_bytes(value) + b"\n")
@@ -344,42 +357,137 @@ class Journal:
     def reconciliation(row):
         return {key: row[key] for key in ("step_id", "rev", "effect")}
 
+    RETENTION_SECONDS = 90 * 24 * 60 * 60
+
+    def _recovery(self, archives=False):
+        """Two streaming passes; retain only unfinished intents/own effects.
+
+        Pass two reapplies acknowledgements so file mtime/order cannot make a
+        cross-generation reconciliation precede its source. Resolved request
+        and receipt payloads never accumulate, nor do resolved-ID sets.
+        """
+        actions, generations, recent = {}, {}, {}
+        paths = sorted(self.path.parent.glob("*.jsonl"))
+        self.recovery_peak_actions = 0
+
+        def rows():
+            for path in paths:
+                with path.open("rb") as stream:
+                    for line in stream:
+                        row = json.loads(line)
+                        if not line.endswith(b"\n") or not isinstance(row, dict):
+                            raise ValueError("journal_unavailable")
+                        if archives or (row.get("session") == self.session and
+                                row.get('instance') == self.instance):
+                            yield path, row
+
+        def acknowledge(row):
+            source = (row.get("action_generation", row["generation"]), row["action_id"])
+            action = actions.get(source)
+            if action is None:
+                return
+            if row['type'] == 'reconciled':
+                if action.get('intent') is None:
+                    actions.pop(source)
+                else:
+                    action['acknowledged'] = True
+            elif action.get('intent') is None:
+                action['effects'] = [e for e in action['effects'] if e['step_id'] != row['step_id']]
+                if not action['effects']:
+                    actions.pop(source)
+
+        for path, row in rows():
+            kind, gen = row.get("type"), row.get("generation")
+            meta = generations.setdefault(gen, dict(path=path, closed=False, latest=0, sources=set()))
+            stamp = datetime.fromisoformat(row['ts'].replace('Z', '+00:00')).timestamp()
+            meta['latest'] = max(meta['latest'], stamp)
+            # Only a terminal marker counts; any later append revokes closure.
+            meta['closed'] = kind == 'generation_closed'
+            key = (gen, row.get("action_id"))
+            if kind == "intent":
+                actions[key] = dict(ts=row['ts'], intent=row, armed=[])
+            elif kind == "step_armed" and key in actions:
+                actions[key]['armed'].append(row['step_id'])
+            elif kind == "receipt":
+                receipts = recent.setdefault((row.get('session'), row.get('instance')), [])
+                receipts.append((row['ts'], gen))
+                receipts.sort(key=lambda r: r[0])
+                del receipts[:-50]
+                if key in actions:
+                    effects = [e for e in row['receipt']['pending_effects']
+                               if e['action_id'] == key[1]]
+                    if effects:
+                        actions[key] = dict(ts=actions[key]['ts'], intent=None, effects=effects)
+                    else:
+                        actions.pop(key)
+            elif kind in ('reconciled', 'reconciliation'):
+                meta['sources'].add(row.get('action_generation', gen))
+                acknowledge(row)
+            self.recovery_peak_actions = max(self.recovery_peak_actions, len(actions))
+        incomplete = {key[0] for key, a in actions.items() if a.get('intent') is not None}
+        for key, action in list(actions.items()):
+            if action.get('intent') is not None:
+                effects = recover_receipt(action['intent'], action['armed'])['pending_effects']
+                if not effects or action.get('acknowledged'):
+                    actions.pop(key)
+                else:
+                    actions[key] = dict(ts=action['ts'], intent=None, effects=effects)
+        for _, row in rows():
+            if row.get('type') in ('reconciled', 'reconciliation'):
+                acknowledge(row)
+        pending = [dict(effect, generation=key[0])
+                   for key, action in sorted(actions.items(), key=lambda item: item[1]['ts'])
+                   for effect in action['effects']]
+        blocked = incomplete | {key[0] for key in actions}
+        return pending, generations, blocked, {gen for receipts in recent.values() for _, gen in receipts}
+
     def unresolved(self):
-        """Recover admission blockers across generations, without replaying input."""
-        actions, reconciled, proven = {}, set(), set()
-        paths = sorted(self.path.parent.glob("*.jsonl"), key=lambda p: p.stat().st_mtime_ns)
-        for path in paths:
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    row = json.loads(line)
-                    if row.get("session") != self.session:
-                        continue
-                    kind = row.get("type")
-                    key = (row.get("generation"), row.get("action_id"))
-                    if kind == "intent":
-                        actions[key] = {"intent": row, "armed": [], "receipt": None}
-                    elif kind == "step_armed" and key in actions:
-                        actions[key]["armed"].append(row["step_id"])
-                    elif kind == "receipt" and key in actions:
-                        actions[key]["receipt"] = row["receipt"]
-                    elif kind in ("reconciled", "reconciliation"):
-                        source = (row.get("action_generation", row["generation"]), row["action_id"])
-                        if kind == "reconciled":
-                            reconciled.add(source)
-                        else:
-                            proven.add((*source, row["step_id"]))
-        pending = []
-        # Stable journal order breaks ties between intents with the same timestamp.
-        for key, action in sorted(actions.items(), key=lambda item: item[1]["intent"]["ts"]):
-            if key in reconciled:
-                continue
-            receipt = action["receipt"]
-            if receipt is None:
-                receipt = recover_receipt(action["intent"], action["armed"])
-            for effect in receipt["pending_effects"]:
-                if effect["action_id"] == key[1] and (*key, effect["step_id"]) not in proven:
-                    pending.append(dict(effect, generation=key[0]))
-        return pending
+        """Recover admission blockers across generations, without input replay."""
+        return self._recovery()[0]
+
+    def prune_history(self, now=None):
+        """Delete only reconciled, terminally closed archives after 90 days.
+
+        Preserve generations supplying the last 50 receipt pins, even when
+        idle for >90 days. This keeps startup frame evidence protection intact.
+        Never invoked on a verification/input path.
+        """
+        now = time.time() if now is None else now
+        _, generations, blocked, pinned = self._recovery(archives=True)
+        eligible = set()
+        for gen, meta in generations.items():
+            path = meta['path']
+            if (gen != self.generation and meta['closed'] and gen not in blocked | pinned
+                    and now - max(meta['latest'], path.stat().st_mtime) >= self.RETENTION_SECONDS):
+                eligible.add(gen)
+        # An acknowledgement in a newer archive may be the only proof that
+        # an older, unclean archive was reconciled. Never discard that proof
+        # while retaining its source (and resurrect its blockers on restart).
+        while True:
+            keep = {gen for gen in eligible if any(source != gen and source in generations
+                    and source not in eligible for source in generations[gen]['sources'])}
+            if not keep:
+                break
+            eligible -= keep
+        removed = []
+        while eligible:
+            # Source first: a crash between unlinks cannot remove the sole
+            # acknowledgement of a source archive that is still present.
+            ready = {gen for gen in eligible if not
+                     ((generations[gen]['sources'] - {gen}) & eligible)}
+            if not ready:
+                break  # Cyclic/invalid provenance is conservatively retained.
+            for gen in sorted(ready):
+                generations[gen]['path'].unlink()
+                removed.append(gen)
+                eligible.remove(gen)
+        if removed:
+            fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return removed
 
     @staticmethod
     def history_action(path, action_id):
@@ -584,8 +692,9 @@ class RPCError(Exception):
 
 class AsyncX:
     """python-xlib nonblocking reply pump (0.33); no reply()/sync() calls."""
-    def __init__(self, connection, fatal):
+    def __init__(self, connection, fatal, budget=None):
         self.connection, self.fatal = connection, fatal
+        self.budget = budget if budget is not None else XBudget()
         self.pending = []
         connection.set_error_handler(self.on_error)
 
@@ -594,8 +703,13 @@ class AsyncX:
         self.fatal.append(exc)
 
     def ask(self, cls, callback, *, optional=False, error_callback=None, **args):
+        if self.budget.count >= self.budget.limit:
+            self.budget.overloaded = True
+            return False
         req = cls(display=self.connection.display, defer=True, **args)
         self.pending.append((req, callback, optional, error_callback))
+        self.budget.count += 1
+        return True
 
     def pump(self):
         events = []
@@ -603,6 +717,8 @@ class AsyncX:
             events.append(self.connection.next_event())
         pending, self.pending = self.pending, []
         for req, callback, optional, error_callback in pending:
+            if req._error is not None or req._data is not None:
+                self.budget.count -= 1
             if req._error is not None:
                 if error_callback is not None:
                     error_callback(req._error)
@@ -630,6 +746,13 @@ def prop_values(reply):
     return reply["value"][1] if reply and reply.get("property_type") else []
 
 
+class XBudget:
+    LIMIT = 2048
+
+    def __init__(self):
+        self.limit, self.count, self.overloaded = self.LIMIT, 0, False
+
+
 class XState:
     def __init__(self, worker):
         self.w = worker
@@ -642,7 +765,8 @@ class XState:
         # These explicit names cannot fall back to the host DISPLAY. The
         # initial X protocol handshake is inside python-xlib's constructor.
         self.ev = display.Display(f':{worker.record["display"]}')
-        self.ax = AsyncX(self.ev, worker.x_errors)
+        self.budget = XBudget()
+        self.ax = AsyncX(self.ev, worker.x_errors, self.budget)
         self.inp = display.Display(f':{worker.record["display"]}')
         self.inp.set_error_handler(self.ax.on_error)
         self.ev.display.socket.setblocking(False)
@@ -669,7 +793,7 @@ class XState:
                         opcode=self.ev.display.get_extension_major(name),
                         major_version=major, minor_version=minor)
         # Negotiate on inp too before its reserved XTEST use in W2.
-        self.inp_ax = AsyncX(self.inp, worker.x_errors)
+        self.inp_ax = AsyncX(self.inp, worker.x_errors, self.budget)
         self.inp_ax.ask(xtest.GetVersion, lambda d: None,
                          opcode=self.inp.display.get_extension_major("XTEST"),
                          major_version=2, minor_version=2)
@@ -846,6 +970,12 @@ class XState:
             return
         if wid in self.refreshing:
             self.again.add(wid)
+            return
+        budget = getattr(self, 'budget', None)
+        if budget and (budget.overloaded or budget.count > budget.limit - 20):
+            # A metadata group needs 12 initial requests and up to 8 ancestry
+            # probes. Do not grow refresh bookkeeping for rejected groups.
+            budget.overloaded = True
             return
         self.refreshing.add(wid)
         def finished():
@@ -1258,6 +1388,7 @@ class Peer:
         self.sock = sock
         self.incoming, self.outgoing = bytearray(), bytearray()
         self.waits = []
+        self.retire_at = None
 
 
 class Worker:
@@ -1277,7 +1408,12 @@ class Worker:
         self.ocr = None
         self.resync_baseline = None
         self.setup_action_profile()
-        self.journal = Journal(state / "acts" / (generation + ".jsonl"), self.sid, generation)
+        self.journal = Journal(state / "acts" / (generation + ".jsonl"), self.sid, generation,
+                               record.get('instance'))
+        try:
+            self.journal.prune_history()
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # Engine recovery below owns F3; never delete corrupt history.
         self.counters = dict.fromkeys(("batches", "steps", "verified", "not_observed", "contradicted",
                                       "unknown", "retries", "route_changes", "resync_drift", "false_closes"), 0)
         self.x_errors, self.screen = [], {}
@@ -1290,6 +1426,7 @@ class Worker:
         self.stop_reason, self.stop_deadline = "requested", None
         self.watchdog, self.control_due = 0, 0
         self.control_raw = None
+        self.log_due = 0
         self.control_file = (self.sd / "control").open("rb")
         info = os.fstat(self.control_file.fileno())
         self.control_identity = (info.st_dev, info.st_ino)
@@ -1469,7 +1606,8 @@ class Worker:
 
     def covered(self):
         return bool(self.x and self.x.initialised and not self.x.ax.pending
-                    and not self.x.refreshing and not self.x.uncovered and time.monotonic() < self.watchdog)
+                    and not self.x_busy() and not self.x.refreshing and not self.x.uncovered
+                    and time.monotonic() < self.watchdog)
 
     def start_openbox(self):
         for version in ("gtk-3.0", "gtk-4.0"):
@@ -1654,12 +1792,18 @@ class Worker:
         self.selector.register(sock, selectors.EVENT_READ, peer)
 
     def disconnect(self, peer):
+        if peer not in self.peers:
+            return
+        peer.retire_at = time.monotonic() + 5
         if peer is self.lease_peer:
             self.lease_peer = None
-            self.lease_until = time.monotonic() + 5
+            self.lease_until = peer.retire_at
         self.peers.discard(peer)
         self.selector.unregister(peer.sock)
         peer.sock.close()
+        peer.incoming.clear()
+        peer.outgoing.clear()
+        peer.waits.clear()
 
     def respond(self, peer, ident, result=None, exc=None):
         if peer not in self.peers:
@@ -1719,6 +1863,12 @@ class Worker:
     def expire_lease(self):
         if self.lease_peer is None and self.lease_until is not None and time.monotonic() >= self.lease_until:
             self.release_lease()
+        if getattr(self, 'act', None):
+            self.act.retire_leases()
+
+    def x_busy(self):
+        budget = getattr(getattr(self, 'x', None), 'budget', None)
+        return bool(budget and (budget.overloaded or budget.count >= budget.limit))
 
     def release_lease(self):
         if getattr(self, 'pixels', None):
@@ -1743,6 +1893,8 @@ class Worker:
             if "id" not in msg:
                 return  # No side effects for JSON-RPC notifications in W1.
             method = msg["method"]
+            if method in ('window.observe', 'window.wait') and self.x_busy():
+                raise RPCError('queue_full')
             if method == "window.act":
                 if not self.settle_pixels():
                     if len(peer.waits) >= 8:
@@ -2040,7 +2192,7 @@ class Worker:
         if since is not None and (type(since) is not int or since < 0):
             raise RPCError("invalid_params")
         self.cache.selected(params.get("scope", {"kind": "session"}))
-        if len(peer.waits) >= 8:
+        if len(peer.waits) >= 8 or self.x_busy():
             raise RPCError("queue_full")
         probe = None
         tree = getattr(self, 'tree', None)
@@ -2221,6 +2373,16 @@ class Worker:
         if self.x_errors:
             raise RuntimeError("worker_fault: " + str(self.x_errors[0]))
         self.x.events(events)
+        budget = getattr(self.x, 'budget', None)
+        if budget and budget.overloaded and not budget.count:
+            # A rejected metadata group has no complete snapshot. Discard its
+            # bookkeeping and force a fresh global refresh after the X drain;
+            # never report partial sampling as complete coverage.
+            self.x.refreshing.clear()
+            self.x.again.clear()
+            self.resync_baseline = None
+            self.watchdog = 0
+            budget.overloaded = False
         self.poll_control()
         self.cache.commit(bool(events))
         if getattr(self, 'act', None):
@@ -2230,6 +2392,9 @@ class Worker:
         if getattr(self, 'ocr', None):
             self.ocr.tick()
         self.prune_history()
+        if time.monotonic() >= getattr(self, 'log_due', 0):
+            cap_logs(self.sd)
+            self.log_due = time.monotonic() + 1
 
     def run(self):
         failure = None
@@ -2360,29 +2525,37 @@ class Worker:
             self.openbox.wait()
         if self.stop_deadline is None:
             self.begin_stop()
+        stopped = False
         try:
-            self.journal.append("worker_stop", reason=self.stop_reason, error=failure)
+            try:
+                self.journal.append("worker_stop", reason=self.stop_reason, error=failure)
+                stopped = True
+            finally:
+                if self.socket_bound:
+                    self.socket_path.unlink(missing_ok=True)
+                if self.published:
+                    (self.sd / "worker.json").unlink(missing_ok=True)
+                self.control_page.close()
+                self.control_file.close()
+                if getattr(self, "pixels", None):
+                    self.pixels.shadow.close()
+                if self.act and self.act.evdev:
+                    self.act.evdev.close()
+                if self.x:
+                    self.x.close()
+                signal.set_wakeup_fd(-1)
+                self.selector.close()
+                os.close(self.wake_r)
+                os.close(self.wake_w)
+                if self.ready_fd is not None:
+                    self.notify({"session": self.sid, "state": "failed",
+                                 "error": failure or "worker_stopped"})
+            if (stopped and failure is None and self.published and self.act and not self.act.fence_reason
+                    and not self.act.active and not self.act.queue
+                    and all(a.get('final') for a in self.act.actions.values())):
+                self.journal.append('generation_closed')
         finally:
             self.journal.close()
-            if self.socket_bound:
-                self.socket_path.unlink(missing_ok=True)
-            if self.published:
-                (self.sd / "worker.json").unlink(missing_ok=True)
-            self.control_page.close()
-            self.control_file.close()
-            if getattr(self, "pixels", None):
-                self.pixels.shadow.close()
-            if self.act and self.act.evdev:
-                self.act.evdev.close()
-            if self.x:
-                self.x.close()
-            signal.set_wakeup_fd(-1)
-            self.selector.close()
-            os.close(self.wake_r)
-            os.close(self.wake_w)
-            if self.ready_fd is not None:
-                self.notify({"session": self.sid, "state": "failed",
-                             "error": failure or "worker_stopped"})
 
 
 def worker_metadata(sd, state, sid):

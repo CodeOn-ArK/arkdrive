@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import time
 
 from input_protocol import close_control_gate
+from worker_housekeeping import cap_logs, reclaim_scratch, matches_instance
 
 
 STATE = Path(os.path.expanduser("~/.local/state/ark-sessiond")).absolute()
@@ -24,7 +26,7 @@ WM = Path(__file__).resolve().parent
 RULE = Path("/etc/udev/rules.d/49-arkdrive-sessiond.rules")
 RULE_TEXT = ('SUBSYSTEM=="input", ATTR{name}=="ArkDrive *", ENV{ID_INPUT}="0", '
              'ENV{LIBINPUT_IGNORE_DEVICE}="1", ENV{ID_SEAT}="seat-arkdrive", TAG+="seat"\n')
-PID_FIELDS = ("pid_x", "pid_dbus", "pid_atspi_launcher", "pid_registryd", "mkdevs_pid", "mkdevs_supervisor_pid")
+PID_FIELDS = ("pid_x", "pid_dbus", "pid_atspi_launcher", "pid_registryd", "mkdevs_pid", "mkdevs_supervisor_pid", "pid_log_guard")
 
 
 def milliseconds(start):
@@ -38,6 +40,8 @@ def locked_registry():
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = STATE / "sessions.json"
         records = json.loads(path.read_text()) if path.exists() else {}
+        for record in records.values():
+            cap_logs(record['session_dir'])
         yield records
 
 
@@ -91,12 +95,18 @@ def session_env(record):
         env["DBUS_SESSION_BUS_ADDRESS"] = record["bus_address"]
     if record.get("atspi_address"):
         env["AT_SPI_BUS_ADDRESS"] = record["atspi_address"]
+    if record.get('instance'):
+        env['ARK_SESSION_INSTANCE'] = record['instance']
+    else:
+        env.pop('ARK_SESSION_INSTANCE', None)
     return env
 
 
 def root_command(record, cmd):
     return ["sudo", "-n", "env", f"ARK_SESSIOND={STATE}",
-            f'ARK_SESSION_ID={record["session"]}', *map(str, cmd)]
+            f'ARK_SESSION_ID={record["session"]}',
+            *([f'ARK_SESSION_INSTANCE={record["instance"]}'] if record.get('instance') else []),
+            *map(str, cmd)]
 
 
 def execute(record, cmd, *, root=False, **kwargs):
@@ -110,6 +120,7 @@ def execute(record, cmd, *, root=False, **kwargs):
 
 
 def spawn(record, cmd, log, *, root=False):
+    cap_logs(record['session_dir'])
     command = root_command(record, cmd) if root else list(map(str, cmd))
     with (Path(record["session_dir"]) / "logs" / log).open("ab") as stream:
         return subprocess.Popen(command, env=session_env(record),
@@ -158,6 +169,8 @@ SCAN_CODE = r'''
 import json, os, pathlib, sys
 markers = {os.fsencode("ARK_SESSIOND=" + sys.argv[1]),
            os.fsencode("ARK_SESSION_ID=" + sys.argv[2])}
+if len(sys.argv) > 4:
+    markers.add(os.fsencode("ARK_SESSION_INSTANCE=" + sys.argv[4]))
 excluded = {os.getpid(), os.getppid(), int(sys.argv[3])}
 pids = []
 for entry in pathlib.Path("/proc").iterdir():
@@ -175,9 +188,12 @@ print(json.dumps(pids))
 def marked_pids(record):
     if record["profile"] == "xorg":
         return json.loads(execute(record, ["python3", "-c", SCAN_CODE,
-                              str(STATE), record["session"], str(os.getpid())], root=True))
+                              str(STATE), record["session"], str(os.getpid()),
+                              *([record['instance']] if record.get('instance') else [])], root=True))
     markers = {os.fsencode(f"ARK_SESSIOND={STATE}"),
                os.fsencode(f'ARK_SESSION_ID={record["session"]}')}
+    if record.get('instance'):
+        markers.add(os.fsencode(f'ARK_SESSION_INSTANCE={record["instance"]}'))
     pids = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
@@ -255,6 +271,7 @@ def teardown(record, records):
         time.sleep(1)
         for pid in marked_pids(record):
             attempt(lambda pid=pid: send_signal(record, pid, signal.SIGKILL))
+        wait_exit(pids, 1)
     except UnsafeTeardown:
         raise
     except Exception as exc:
@@ -275,10 +292,18 @@ def teardown(record, records):
                 except PermissionError:
                     execute(record, ["rm", "-f", str(path)], root=True)
             attempt(remove)
-    records.pop(record["session"], None)
-    save_registry(records)
     if errors:
         raise RuntimeError("; ".join(errors))
+    # A successful signal is not proof of process death. Preserve the registry
+    # and all scratch on any surviving PID, failed scan or incomplete teardown.
+    survivors = [pid for pid in pids if alive(pid)] + marked_pids(record)
+    if survivors:
+        raise UnsafeTeardown('session processes still alive; retaining scratch and registry')
+    if record.get('instance') and not matches_instance(record['session_dir'], record['instance']):
+        raise UnsafeTeardown('session instance mismatch; retaining scratch and registry')
+    reclaim_scratch(record)
+    records.pop(record["session"], None)
+    save_registry(records)
 
 
 def wait_display(record, process=None):
@@ -390,8 +415,9 @@ def start_session(profile):
     start = time.monotonic()
     with locked_registry() as records:
         sid = f's{max((int(s[1:]) for s in records), default=0) + 1}'
-        directory = STATE / "run" / sid
-        record = {"session": sid, "profile": profile, "display": None,
+        instance = secrets.token_hex(16)
+        directory = STATE / "run" / sid / instance
+        record = {"session": sid, "instance": instance, "profile": profile, "display": None,
                   "pid_x": None, "pid_dbus": None, "bus_address": None,
                   "atspi_address": None, "pid_atspi_launcher": None,
                   "pid_registryd": None, "home": str(directory / "home"),
@@ -409,7 +435,12 @@ def start_session(profile):
                 raise RuntimeError("no free display in 91..120")
             for name in ("home", "runtime", "logs"):
                 (directory / name).mkdir(parents=True, exist_ok=True)
+            (directory / '.instance').write_text(instance + '\n')
             (directory / "runtime").chmod(0o700)
+            record['pid_log_guard'] = subprocess.Popen(
+                ['python3', str(WM / 'worker_housekeeping.py'), '--guard', str(directory),
+                 '--instance', instance], env=session_env(record), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True).pid
             # Session ids may be reused after stop; discard old helper outputs.
             for name in ("devices.json", "devices.json.pid", "devices.json.supervisor.pid", "helper.stopping",
                          "xorg.pid", "cmd.fifo", "input.sock", "input.sock.instance"):

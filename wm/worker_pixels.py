@@ -172,22 +172,23 @@ class Frames:
         self.receipts.append(self.references(receipt))
         self.evict()
 
-    def restore(self, state, session):
+    def restore(self, state, session, instance=None):
         # Surviving files and the last 50 durable session receipts survive restart.
         rows = []
         for path in sorted((Path(state) / 'acts').glob('*.jsonl')):
-            recent = deque(maxlen=50)
             with path.open() as stream:
                 for line in stream:
                     try:
                         row = json.loads(line)
                     except ValueError:
                         break
-                    if row.get('session') == session and row.get('type') == 'receipt':
-                        recent.append(row)
-            rows.extend(recent)
-        for row in sorted(rows, key=lambda r: r.get('ts', ''))[-50:]:
-            self.receipts.append(self.references(row['receipt']))
+                    if (row.get('session') == session and row.get('type') == 'receipt'
+                            and row.get('instance') == instance):
+                        rows.append((row.get('ts', ''), self.references(row['receipt'])))
+                        rows.sort(key=lambda r: r[0])
+                        del rows[:-50]
+        for _, references in rows:
+            self.receipts.append(references)
         self.evict()
 
     def evict(self, extra=0, protect=(), extra_files=0):
@@ -254,7 +255,7 @@ class Pixels:
         self.hashes = [None] * len(self.rects)
         self.dirty, self.serial, self.pending, self.failure = {}, 0, False, None
         self.frames = Frames(worker.sd / 'driver/frames')
-        self.frames.restore(worker.state, worker.sid)
+        self.frames.restore(worker.state, worker.sid, getattr(worker, 'record', {}).get('instance'))
         self.mark([self.bounds])
 
     def facet(self, tile):
@@ -312,9 +313,11 @@ class Pixels:
                 self.failure = str(exc)
             finally:
                 self.pending = False
-        self.w.x.ax.ask(request.GetImage, captured, drawable=self.w.x.root,
+        accepted = self.w.x.ax.ask(request.GetImage, captured, drawable=self.w.x.root,
                         x=rect['x'], y=rect['y'], width=rect['w'], height=rect['h'],
                         format=X.ZPixmap, plane_mask=0xffffffff)
+        if accepted is False:
+            self.pending = False  # Dirty tiles remain; retry after backpressure.
         return False
 
     def window(self, handle):

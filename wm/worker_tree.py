@@ -720,11 +720,15 @@ class Provider:
                             self.dirty_due[h] = now + .04
                         self.dirty.add(h)
                     removed = row.get('removed')
-                    if removed:
+                    if removed or row.get('removed_all'):
                         for h in handles:
                             snap = self.cache.windows.get(h)
                             if snap:
-                                invalid = {r for r, n in snap['nodes'].items() if n['key'] == removed}
+                                # A global fallback can subsume many removal
+                                # identities. Retire identity continuity too,
+                                # so a reused bus/path cannot inherit a ref.
+                                invalid = {r for r, n in snap['nodes'].items()
+                                           if row.get('removed_all') or n['key'] == removed}
                                 for _ in range(len(snap['nodes'])):
                                     more = {r for r, n in snap['nodes'].items() if n.get('parent') in invalid}
                                     if more <= invalid:

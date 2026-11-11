@@ -23,6 +23,93 @@ from pathlib import Path
 
 ROLE_NAMES = {'button': 'push_button'}
 EVENT_DEBOUNCE = .04
+EVENT_LIMIT = 256
+EVENT_BYTES = 256 * 1024
+
+
+class Results:
+    """Owner-thread queue: coalesce only within the current result barrier.
+
+    Removal identities are never merged away: conflicting removals promote to
+    the existing global invalidation. A job result seals the event segment.
+    The pump drains before running another job, so at most one MAX_IPC job
+    result can accompany the bounded notification segment.
+    """
+    def __init__(self):
+        self.rows = deque()
+        self.events = {}
+        self.bytes = 0
+        self.global_event = False
+        self.jobs = 0
+        self.job_bytes = 0
+
+    def put(self, row):
+        if row.get('event') != 'changed':
+            size = len(encoded(row))
+            if self.jobs or size > MAX_IPC - 4:
+                raise ValueError('tree_ipc_backpressure')
+            self.jobs += 1
+            self.job_bytes += size
+            self.rows.append(row)
+            self.events = {}
+            self.global_event = False
+            return
+        if self.global_event:
+            if row.get('removed'):
+                global_row = self.events[(None, None)]
+                self.bytes -= len(encoded(global_row))
+                global_row['removed_all'] = True
+                self.bytes += len(encoded(global_row))
+            return
+        key = (row.get('app'), row.get('window'))
+        prior = self.events.get(key)
+        if prior == row:
+            return
+        size = len(encoded(row))
+        if (row.get('global_invalidation') or
+                prior is not None and prior.get('removed') != row.get('removed') or
+                len(self.rows) >= EVENT_LIMIT or self.bytes + size > EVENT_BYTES):
+            # Only replace notifications after the last job-result barrier.
+            removed = bool(row.get('removed') or any(e.get('removed') for e in self.events.values()))
+            for event in self.events.values():
+                self.rows.pop()
+                self.bytes -= len(encoded(event))
+            self.events.clear()
+            row = dict(event='changed', global_invalidation=True)
+            if removed:
+                row['removed_all'] = True
+            key = (None, None)
+            self.global_event = True
+            size = len(encoded(row))
+        elif prior is not None:
+            return
+        self.rows.append(row)
+        self.events[key] = row
+        self.bytes += size
+
+    def get_nowait(self):
+        if not self.rows:
+            raise queue.Empty
+        row = self.rows.popleft()
+        if row.get('event') != 'changed':
+            self.jobs -= 1
+            self.job_bytes -= len(encoded(row))
+        if row.get('event') == 'changed':
+            self.bytes -= len(encoded(row))
+            key = (row.get('app'), row.get('window'))
+            if self.events.get(key) is row:
+                del self.events[key]
+                if row.get('global_invalidation'):
+                    self.global_event = False
+        return row
+
+    def qsize(self):
+        return len(self.rows)
+
+    def peek(self):
+        return self.rows[0] if self.rows else None
+
+
 EVENT_CLASSES = (
     'object:children-changed', 'object:property-change', 'object:state-changed',
     'object:text-changed', 'object:text-caret-moved', 'object:text-selection-changed',
@@ -511,7 +598,7 @@ def main(fd):
     from gi.repository import GLib
     pyatspi.setTimeout(250, 2000)
     backend = Backend(pyatspi)
-    wire, results = Wire(socket.socket(fileno=fd)), queue.Queue()
+    wire, results = Wire(socket.socket(fileno=fd)), Results()
     flights, jobs = {}, deque()
     loop = GLib.MainLoop()
 
@@ -568,10 +655,14 @@ def main(fd):
             # Never wait for another thread or iterate a nested main context.
             # If a call wedges this context, the parent still expires flights
             # and restarts the child without waiting for a child reply.
-            if jobs:
+            # No second job/result until the previous barrier is drained.
+            if jobs and not results.jobs:
                 work(jobs.popleft())
             backend.flush_events(results)
             for _ in range(256):
+                head = results.peek()
+                if head is not None and len(encoded(head)) + 4 + len(getattr(wire, 'output', b'')) > MAX_IPC:
+                    break  # Drain transport first; retain the ordered result.
                 try:
                     result = results.get_nowait()
                 except queue.Empty:

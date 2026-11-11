@@ -194,7 +194,8 @@ class Signals(unittest.TestCase):
              patch('worker_atspi.threading.Thread', side_effect=AssertionError('no binding threads')):
             atspi.main(123)
         self.assertEqual(entries, [])
-        self.assertIn(dict(event='changed', app='42'), wire.sent)
+        # The global invalidation subsumes the app notification in this turn.
+        self.assertNotIn(dict(event='changed', app='42'), wire.sent)
         self.assertIn(dict(event='changed', global_invalidation=True), wire.sent)
 
 

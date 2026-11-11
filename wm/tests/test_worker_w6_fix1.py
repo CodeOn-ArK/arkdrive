@@ -54,6 +54,8 @@ class Teardown(unittest.TestCase):
         self.log.append(('signal', pid, sig))
         if pid == 105 and sig == signal.SIGKILL and self.behavior != 'immortal':
             self.death_at = self.now + .1  # Prove wait after SIGKILL too.
+        elif pid != 105 and sig == signal.SIGKILL:
+            self.living.discard(pid)  # Step 5 verifies every process has exited.
 
     def close_gate(self, path):
         self.assertEqual(path, self.gate)

@@ -519,7 +519,7 @@ class XEventTests(unittest.TestCase):
         ev.screen.return_value.root = root
         requests = []
         class Deferred:
-            def __init__(self, connection, fatal):
+            def __init__(self, connection, fatal, budget=None):
                 self.pending = []
                 self.on_error = Mock()
             def ask(self, cls, cb, **kwargs):

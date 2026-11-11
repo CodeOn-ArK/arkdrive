@@ -231,7 +231,7 @@ class Engine:
         self.build_id = digest.hexdigest()
         try:
             self.pending_effects = self.w.journal.unresolved()
-        except (OSError, ValueError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             self.fence("F3:journal_unavailable", journal=False)
 
     def durable(self, kind, **fields):
@@ -296,6 +296,32 @@ class Engine:
                 entries = state.get(field, {})
                 for handle in set(entries) - live:
                     entries.pop(handle, None)
+
+    def retire_leases(self):
+        """Keep admission state until queued/active acts release their lease.
+
+        Final/uncertain actions may remain for reconciliation, but do not need
+        to retain a disconnected peer or its transport buffers.
+        """
+        running = list(self.queue) + ([self.active] if self.active else [])
+        tokens = {a['params'].get('lease') for a in running}
+        running_peers = {id(a.get('peer')) for a in running}
+        now = time.monotonic()
+        for token, state in list(self.lease_state.items()):
+            if token == self.w.lease or token in tokens:
+                continue
+            peer = state.get('peer')
+            retire_at = getattr(peer, 'retire_at', None)
+            if retire_at is not None and now < retire_at:
+                continue
+            del self.lease_state[token]
+        # A live peer may have completed/released its lease before disconnect.
+        # Its uncertain receipt can outlive that lease record, too.
+        for action in self.actions.values():
+            peer = action.get('peer')
+            retire_at = getattr(peer, 'retire_at', None)
+            if retire_at is not None and now >= retire_at and id(peer) not in running_peers:
+                action['peer'] = None
 
     def observed(self, peer, params, result):
         token = self.w.lease
@@ -537,7 +563,7 @@ class Engine:
             reason = "precondition_failed"
         elif p["base_rev"] < state["observed"] or p["base_rev"] > self.w.cache.rev:
             reason = "stale_rev"
-        elif len(self.queue) >= 8:
+        elif len(self.queue) >= 8 or getattr(self.w, 'x_busy', lambda: False)():
             reason = "queue_full"
         if reason:
             receipt.update(reason=reason, advice=self.advice(reason, "not_dispatched"), needs_human=bool(self.fence_reason))
@@ -615,6 +641,7 @@ class Engine:
             self.action_stubs.popitem(last=False)
 
     def tick(self):
+        self.retire_leases()
         self.prune_windows()
         self.w.prune_history()
         if self.evdev:
