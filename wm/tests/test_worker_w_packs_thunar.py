@@ -113,6 +113,8 @@ class RegistryTests(unittest.TestCase):
         self.assertIn('Thunar-specific Create-folder example', thunar.PLAYBOOK)
         for text in ('Ctrl+2', 'empty names', 'F2', 'Return', 'modal', '27+', 'virtualized', 'via:"keys"', '200'):
             self.assertIn(text, thunar.PLAYBOOK)
+        self.assertIn("A file must be selected before F2; the skill's batch clicks the name cell first.",
+                      thunar.PLAYBOOK)
         example, _ = json.JSONDecoder().raw_decode(thunar.PLAYBOOK[thunar.PLAYBOOK.index('{"steps":'):])
         self.assertEqual(len(example['steps']), 2)
 
@@ -272,11 +274,15 @@ class SkillTests(unittest.TestCase):
         self.adapter.rpc.call.side_effect = rpc
 
     def test_exact_rename_batch_row_target_name_cell_guard_and_oracle(self):
+        self.observations = [listing()]
+        self.observations[0]['tree']['lines'][3] = self.observations[0]['tree']['lines'][3].replace(' [selected]', '')
         (self.directory / 'home/old').touch()
         self.mutate = lambda: (self.directory / 'home/old').rename(self.directory / 'home/new')
         result = shown(self.adapter.call('use_skill', dict(name='thunar.rename', args=dict(old='old', new='new'))))
         self.assertEqual(result, dict(status='success', verified=True))
         expected = [
+            dict(id='0', target=dict(window='w1', ref='n4'), intent=dict(kind='click'), timeout_ms=2000,
+                 expect=dict(kind='node_state', window='w1', ref='n4', state='selected')),
             dict(id='1', target=dict(window='w1', ref='n3'), require=dict(selected_ref='n4'),
                  intent=dict(kind='key', keys=['F2']), timeout_ms=2000,
                  expect=dict(kind='dialog_present', parent='w1', role='rename',
@@ -345,10 +351,10 @@ class SkillTests(unittest.TestCase):
                             value['steps'][0]['dispatch_status'] = dispatch if len(self.acts) == 2 else retry_dispatch
                         return value
                     with patch.object(self.adapter.rpc, 'call', side_effect=rpc), \
-                            patch.object(thunar, '_oracle') as oracle:
+                            patch.object(thunar, '_oracle', return_value=False) as oracle:
                         self.assertEqual(thunar.create_folder(self.adapter, dict(name='new')),
                                          dict(status='failed', detail='provider_degraded'))
-                        oracle.assert_not_called()
+                        oracle.assert_called_once_with(self.adapter, dict(name='new'), 'new')
                     retried = dispatch == 'not_dispatched'
                     self.assertEqual(len(self.acts), 3 if retried else 2)
                     self.assertEqual(len(self.observes), 5 if retried else 3)
@@ -403,6 +409,7 @@ class SkillTests(unittest.TestCase):
                 self.assertEqual(len(self.acts), 1)
 
     def test_collision_not_found_ambiguity_short_circuit_without_act(self):
+        (self.directory / 'new').touch()  # Would falsely confirm either skill's end state.
         cases = [(('old', 'new'), thunar.rename, dict(old='old', new='new'), dict(status='collision')),
                  (('new',), thunar.create_folder, dict(name='new'), dict(status='collision')),
                  (('old', 'old'), thunar.rename, dict(old='old', new='new'), dict(status='ambiguous')),
@@ -410,8 +417,12 @@ class SkillTests(unittest.TestCase):
                   dict(status='not_found', candidates=list('abcde')))]
         for names, run, args, expected in cases:
             with self.subTest(names=names):
+                args = dict(args, dir=str(self.directory))
                 self.observations = [listing(names)]
-                self.assertEqual(run(self.adapter, args), expected)
+                self.assertTrue(thunar._oracle(self.adapter, args, 'new', 'old'))
+                with patch.object(thunar, '_oracle', wraps=thunar._oracle) as oracle:
+                    self.assertEqual(run(self.adapter, args), expected)
+                    oracle.assert_not_called()
                 self.assertEqual(self.acts, [])
 
     def test_rename_switches_icon_view_before_resolving_fresh_listing(self):
@@ -429,8 +440,9 @@ class SkillTests(unittest.TestCase):
                 sequence = ['window.observe', 'window.act', 'window.observe']
                 if expected['status'] == 'success':
                     sequence.append('window.act')
-                    self.assertEqual(self.acts[1]['steps'][0]['target'], dict(window='w1', ref='n6'))
-                    self.assertEqual(self.acts[1]['steps'][0]['require'], dict(selected_ref='n7'))
+                    self.assertEqual(self.acts[1]['steps'][0]['target'], dict(window='w1', ref='n7'))
+                    self.assertEqual(self.acts[1]['steps'][1]['target'], dict(window='w1', ref='n6'))
+                    self.assertEqual(self.acts[1]['steps'][1]['require'], dict(selected_ref='n7'))
                     self.assertEqual(self.acts[1]['base_rev'], 12)
                 self.assertEqual([call.args[0] for call in calls], sequence)
                 self.assertEqual(self.acts[0]['steps'], [dict(id='details', target='w1', timeout_ms=2000,
@@ -574,22 +586,141 @@ class SkillTests(unittest.TestCase):
                 self.assertEqual(len(self.observes), 1)
                 self.assertEqual(self.acts, [])
 
-    def test_unknown_contradicted_and_failed_never_replay_or_run_oracle(self):
+    def test_unknown_contradicted_and_failed_consult_oracle_without_replay(self):
         for run, args in ((thunar.rename, dict(old='old', new='new')),
                           (thunar.create_folder, dict(name='new'))):
             for status in ('unknown', 'contradicted', 'failed'):
                 with self.subTest(skill=run.__name__, status=status):
                     self.status, self.acts = status, []
-                    with patch.object(thunar, '_oracle') as oracle:
+                    with patch.object(thunar, '_oracle', return_value=False) as oracle:
                         self.assertEqual(run(self.adapter, args), dict(status=status))
-                        oracle.assert_not_called()
+                        oracle.assert_called_once_with(self.adapter, args,
+                            *(['new', 'old'] if run is thunar.rename else ['new']))
                     self.assertEqual(len(self.acts), 1)
                     self.assertNotIn('pending', self.adapter.state)
 
+    def test_uncertain_final_mutation_uses_filesystem_or_preserves_original_outcome(self):
+        original = self.adapter.rpc.call.side_effect
+        for run, fields in ((thunar.rename, dict(old='old', new='new')),
+                            (thunar.create_folder, dict(name='new'))):
+            for status in ('unknown', 'contradicted', 'failed', 'success'):
+                for confirms in (False, True):
+                    for explicit_dir in (False, True):
+                        with self.subTest(skill=run.__name__, status=status,
+                                          confirms=confirms, explicit_dir=explicit_dir):
+                            with tempfile.TemporaryDirectory(dir=self.directory) as temp:
+                                directory = Path(temp) if explicit_dir else self.directory / 'home'
+                                old, new = directory / 'old', directory / 'new'
+                                old.touch()
+                                args = dict(fields, **({'dir': str(directory)} if explicit_dir else {}))
+                                self.acts, self.creating, self.status = [], False, 'success'
+                                def mutate():
+                                    if confirms:
+                                        if run is thunar.rename:
+                                            old.rename(new)
+                                        else:
+                                            new.mkdir()
+                                self.mutate = mutate
+                                def rpc(method, params, **kwargs):
+                                    value = original(method, params, **kwargs)
+                                    if method == 'window.act' and (
+                                            run is thunar.rename or params['steps'][0]['id'] == '3'):
+                                        value.update(status=status, reason='provider_degraded')
+                                        value['steps'][-1]['effect']['status'] = 'unknown'
+                                    return value
+                                try:
+                                    with patch.object(self.adapter.rpc, 'call', side_effect=rpc), \
+                                            patch.object(thunar, '_oracle', wraps=thunar._oracle) as oracle:
+                                        result = shown(self.adapter.call('use_skill',
+                                            dict(name='thunar.' + run.__name__, args=args)))
+                                        outcome_status = 'unverified' if status == 'success' else status
+                                        expected = (dict(status='success', verified=True,
+                                            detail='filesystem oracle confirms; batch outcome was ' + outcome_status)
+                                            if confirms else dict(status=outcome_status, detail='provider_degraded'))
+                                        self.assertEqual(result, expected)
+                                        oracle.assert_called_once_with(self.adapter, args,
+                                            *(['new', 'old'] if run is thunar.rename else ['new']))
+                                    self.assertEqual(len(self.acts), 1 if run is thunar.rename else 2)
+                                finally:
+                                    old.unlink(missing_ok=True)
+                                    if new.is_dir():
+                                        new.rmdir()
+                                    else:
+                                        new.unlink(missing_ok=True)
+
+    def test_uncertain_rename_requires_old_absent_even_when_new_exists(self):
+        (self.directory / 'home/old').touch()
+        self.status = 'contradicted'
+        self.mutate = lambda: (self.directory / 'home/new').touch()
+        self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
+                         dict(status='contradicted'))
+        self.assertEqual(len(self.acts), 1)
+
+    def test_create_uncertain_first_act_or_target_resolution_consults_oracle(self):
+        original = self.adapter.rpc.call.side_effect
+        for phase in ('first_act', 'targets'):
+            for confirms in (False, True):
+                with self.subTest(phase=phase, confirms=confirms):
+                    self.acts, self.creating = [], False
+                    self.commit_observations = [listing()]  # Dialog missing after act 1.
+                    def rpc(method, params, **kwargs):
+                        value = original(method, params, **kwargs)
+                        if method == 'window.act':
+                            if confirms:
+                                (self.directory / 'home/new').mkdir()
+                            if phase == 'first_act':
+                                value.update(status='unknown', reason='provider_degraded')
+                        return value
+                    with patch.object(self.adapter.rpc, 'call', side_effect=rpc):
+                        result = thunar.create_folder(self.adapter, dict(name='new'))
+                    status = 'unknown' if phase == 'first_act' else 'listing_unavailable'
+                    expected = (dict(status='success', verified=True,
+                        detail='filesystem oracle confirms; batch outcome was ' + status) if confirms else
+                        dict(status=status, detail='provider_degraded' if phase == 'first_act' else 'create dialog missing'))
+                    self.assertEqual(result, expected)
+                    self.assertEqual(len(self.acts), 1)
+                    if confirms:
+                        (self.directory / 'home/new').rmdir()
+
+    def test_precheck_failures_ignore_falsely_confirming_filesystem(self):
+        (self.directory / 'new').mkdir()
+        for run, fields in ((thunar.rename, dict(old='old', new='new')),
+                            (thunar.create_folder, dict(name='new'))):
+            for failure in ('invalid_arguments', 'listing_unavailable', 'observe_required'):
+                with self.subTest(skill=run.__name__, failure=failure):
+                    args = dict(fields, dir=str(self.directory))
+                    value = listing()
+                    if failure == 'invalid_arguments':
+                        args['extra'] = True
+                    elif failure == 'listing_unavailable':
+                        value['tree']['window'] = 'other'
+                    else:
+                        value['settled'] = False
+                    self.observations = [value]
+                    self.assertTrue(thunar._oracle(self.adapter, args, 'new', 'old'))
+                    with patch.object(thunar, '_oracle', wraps=thunar._oracle) as oracle:
+                        self.assertEqual(run(self.adapter, args), dict(status=failure))
+                        oracle.assert_not_called()
+                    self.assertEqual(self.acts, [])
+
+    def test_rename_receipt_must_verify_selection_step_too(self):
+        original = self.adapter.rpc.call.side_effect
+        def rpc(method, params, **kwargs):
+            value = original(method, params, **kwargs)
+            if method == 'window.act':
+                value['steps'] = value['steps'][1:]
+            return value
+        with patch.object(self.adapter.rpc, 'call', side_effect=rpc):
+            self.assertEqual(thunar.rename(self.adapter, dict(old='old', new='new')),
+                             dict(status='unverified'))
+
     def test_uncertain_details_switch_stops_before_mutation(self):
+        (self.directory / 'home/new').touch()  # Oracle would confirm, but this is a pre-check.
         self.observations = [listing(())]
         self.status = 'unknown'
-        self.assertEqual(thunar.create_folder(self.adapter, dict(name='new')), dict(status='unknown'))
+        with patch.object(thunar, '_oracle', wraps=thunar._oracle) as oracle:
+            self.assertEqual(thunar.create_folder(self.adapter, dict(name='new')), dict(status='unknown'))
+            oracle.assert_not_called()
         self.assertEqual(len(self.acts), 1)
 
     def test_oracles_require_both_rename_paths_and_respect_explicit_dir(self):
@@ -762,7 +893,7 @@ class EntryPointTests(unittest.TestCase):
                         return listing(rev=value['rev'])
                     if method == 'window.act':
                         actions.append(params)
-                        if params['steps'][0]['intent'].get('keys') == ['F2']:
+                        if params['steps'][0]['id'] == '0':
                             (directory / 'home/old').rename(directory / 'home/new')
                         elif params['steps'][0]['intent']['kind'] == 'invoke':
                             (directory / 'home/Reports').mkdir()

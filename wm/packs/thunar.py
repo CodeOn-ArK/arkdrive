@@ -9,6 +9,7 @@ PLAYBOOK = (
     "Files are exposed in the tree only in Details view (Ctrl+2); icon view shows no file items. "
     "Rows are table cells with empty names; the file name is in a child name cell. "
     "F2 with the name cell selected opens the rename dialog; commit with Return. "
+    "A file must be selected before F2; the skill's batch clicks the name cell first. "
     "The dialog is modal for the whole session. At about 27+ entries, rows below the viewport "
     "are virtualized and absent from the tree until scrolled into view. "
     'Inside a copy→paste interval, pin text steps via:"keys": auto text over 200 characters '
@@ -129,7 +130,7 @@ def _verified(result, ids):
 
 
 def _outcome(result):
-    # Unknown/contradicted remains that status even after auto-reconciliation.
+    # Preserve the batch outcome unless the skill's filesystem oracle confirms.
     # No receipt, action journal, or evidence escapes the skill projection.
     value = dict(status='unverified' if result.get('status') == 'success' else result.get('status', 'unknown'))
     if result.get('reason'):
@@ -175,6 +176,14 @@ def _oracle(adapter, args, name, old=None):
         return (directory / name).exists() and (old is None or not (directory / old).exists())
     except (OSError, ValueError):
         return False
+
+
+def _uncertain_outcome(adapter, args, outcome, *names):
+    """After mutation starts, filesystem evidence can settle an uncertain result."""
+    if _oracle(adapter, args, *names):
+        return dict(status='success', verified=True,
+                    detail=f"filesystem oracle confirms; batch outcome was {outcome['status']}")
+    return outcome
 
 
 def _create_targets(adapter, window):
@@ -251,11 +260,11 @@ def create_folder(adapter, args):
                   intent=dict(kind='text', text=name, replace=True))]
     result = _shown(adapter, 'act', dict(steps=steps))
     if not _verified(result, ['1', '2']):
-        return _outcome(result)
+        return _uncertain_outcome(adapter, args, _outcome(result), name)
     for attempt in range(2):
         targets, error = _create_targets(adapter, window)
         if error:
-            return error
+            return _uncertain_outcome(adapter, args, error, name)
         dialog, create_ref, container = targets
         result = _shown(adapter, 'act', dict(steps=[dict(id='3',
             target=dict(window=dialog, ref=create_ref), require=dict(modal=dialog),
@@ -266,7 +275,7 @@ def create_folder(adapter, args):
             break
         if attempt == 0 and _commit_not_dispatched(adapter, result):
             continue  # Only a receipt proving no dispatch permits one fresh-target retry.
-        return _outcome(result)
+        return _uncertain_outcome(adapter, args, _outcome(result), name)
     return dict(status='success', verified=_oracle(adapter, args, name))
 
 
@@ -285,7 +294,10 @@ def rename(adapter, args):
     if any(item['name'] == args['new'] for item in data['items']):
         return dict(status='collision')
     item = matches[0]
-    steps = [dict(id='1', target=dict(window=window, ref=item['row']), timeout_ms=2000,
+    steps = [dict(id='0', target=dict(window=window, ref=item['ref']), timeout_ms=2000,
+                  intent=dict(kind='click'),
+                  expect=dict(kind='node_state', window=window, ref=item['ref'], state='selected')),
+             dict(id='1', target=dict(window=window, ref=item['row']), timeout_ms=2000,
                   require=dict(selected_ref=item['ref']), intent=dict(kind='key', keys=['F2']),
                   expect=dict(kind='dialog_present', parent=window, role='rename',
                               bind=dict(dialog='dialog', entry=dict(role='text')))),
@@ -298,8 +310,8 @@ def rename(adapter, args):
                       dict(kind='node_present', window=window, selector=dict(provider='atspi',
                            role='table_cell', name=args['new']))]))]
     result = _shown(adapter, 'act', dict(steps=steps))
-    if not _verified(result, ['1', '2', '3']):
-        return _outcome(result)
+    if not _verified(result, ['0', '1', '2', '3']):
+        return _uncertain_outcome(adapter, args, _outcome(result), args['new'], args['old'])
     return dict(status='success', verified=_oracle(adapter, args, args['new'], args['old']))
 
 

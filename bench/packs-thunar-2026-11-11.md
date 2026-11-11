@@ -296,3 +296,53 @@ skipped. Log: `wm/tests/.tmp/packs-thunar-fix4-full-suite.log`.
 **Raj's live skill gate re-run — NOT RUN.** No live session or display was
 opened or driven, including display `:0`. Nothing staged or committed.
 Existing unrelated checkout changes were preserved.
+
+## Fix round 5
+
+Raj's November 11 live gate confirmed that create-folder and its collision
+short-circuit work, and rename's `not_found` returns real candidates. Rename
+still failed its F2 selection precondition for pre-existing files, and create
+could report `unknown` / `provider_degraded` after the folder was already on
+disk when the post-commit tree verification degraded.
+
+The rename batch now starts with step `0`: click the name-cell
+`{window, ref}`, then verify `node_state` / `selected` with a 2000 ms timeout.
+Steps `1`–`3` retain their existing F2, bound text and Return shapes, including
+the F2 `selected_ref` guard. Verification requires all four IDs
+`['0', '1', '2', '3']`. The playbook explicitly says a file must be selected
+before F2 and that the skill clicks its name cell first.
+
+Both skills now consult their filesystem oracle before returning an
+unverified mutation-flow outcome. Confirmation returns
+`{status: 'success', verified: True, detail: 'filesystem oracle confirms; batch outcome was <original status>'}`;
+otherwise the original compact outcome is returned unchanged. This includes
+create's first-act and post-dialog target-resolution failures as well as its
+final commit outcome. Argument/listing failures, collisions, missing targets
+and ambiguity still short-circuit before the mutation flow without consulting
+the oracle. A verified batch retains the existing filesystem-verification
+result. Create's commit retry rule is unchanged: one fresh-target retry only
+with receipt proof of `not_dispatched`.
+
+Headless pack tests: **53 passed**. Coverage checks an initially unselected
+name cell, the exact click/selected predicate and unchanged remaining rename
+steps, verification of step `0`, uncertain final outcomes for both skills
+with confirming and non-confirming filesystem fixtures, default and explicit
+oracle directories, preservation of original status/detail, rename's required
+old-path absence, create's earlier mutation-flow exits, and pre-check exits
+against directories that would falsely confirm success. Existing dispatch
+retry, MCP and one-shot regressions remain covered.
+
+Full headless validation, with temporary paths in the checkout and bytecode
+disabled:
+
+```sh
+TMPDIR="$PWD/wm/tests/.tmp" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wm/tests
+```
+
+**1052 tests in 133.193 s: 1051 passed, 1 skipped**, exit 0,
+`OK (skipped=1)`. The existing sandbox-dependent ptrace/strace check remains
+skipped. Log: `wm/tests/.tmp/packs-thunar-fix5-full-suite.log`.
+
+**Raj's live skill gate re-run — NOT RUN.** No live session or display was
+opened or driven, including display `:0`. Nothing staged or committed.
+Existing unrelated checkout changes were preserved.
