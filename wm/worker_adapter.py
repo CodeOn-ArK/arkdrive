@@ -34,6 +34,22 @@ class WorkerError(AdapterError):
     pass
 
 
+def step_form_hint():
+    return dict(type='text', text=encoded({'hint':
+        "invalid step form. Tree expects need provider 'atspi' plus a role/name selector. "
+        'Valid expect kinds: window_present, window_absent, dialog_present, dialog_absent, '
+        'window_focused, pointer_at, node_present, node_absent, text_equals, text_contains, '
+        'node_state, item_present, item_absent. A mutating step needs one strong expect. '
+        'Fix the form; do not resend unchanged.'}).decode())
+
+
+def render_error(reason, name, exc):
+    content = [dict(type='text', text=encoded({'error': reason}).decode())]
+    if name == 'act' and isinstance(exc, WorkerError) and reason == 'invalid_params':
+        content.append(step_form_hint())
+    return dict(isError=True, content=content)
+
+
 def session_dir(session):
     if not re.fullmatch(r's[1-9][0-9]*', session):
         raise AdapterError('invalid_session')
@@ -219,8 +235,7 @@ TOOLS = [
                                            'intent': INTENT, 'expect': PREDICATE,
                                            'target': {'type': ['string', 'object'], 'description': 'Window handle or {from_step:"1",name:"dialog"} exported by a verified prior step.'},
                                            'require': {'type': 'object', 'description': 'Optional guards: focus, modal, ref, window. Omission guards unchanged focus/modal.'},
-                                           'timeout_ms': {'type': 'integer', 'minimum': 50, 'maximum': 5000}, 'id': {'type': 'string'},
-                                           'risk': {'type': 'string'}, 'allow_stale_pixels': {'type': 'boolean'}}, 'required': ['intent']}},
+                                           'timeout_ms': {'type': 'integer', 'minimum': 50, 'maximum': 5000}, 'id': {'type': 'string'}}, 'required': ['intent']}},
                                  deadline_ms={'type': 'integer', 'minimum': 1, 'maximum': 10000}), ['steps'])),
     dict(name='wait', description='Wait without input for a worker predicate; returns fresh state and revision.',
          inputSchema=schema(dict(expect=PREDICATE, timeout_ms={'type': 'integer', 'minimum': 1, 'maximum': 30000}), ['expect', 'timeout_ms'])),
@@ -301,6 +316,12 @@ class Adapter:
             raise AdapterError('invalid_arguments')
         if name == 'wait' and (type(arguments['timeout_ms']) is not int or not 1 <= arguments['timeout_ms'] <= 30000):
             raise AdapterError('invalid_arguments')
+        if name == 'act' and isinstance(arguments['steps'], list):
+            for step in arguments['steps']:
+                if isinstance(step, dict):
+                    for field in ('risk', 'allow_stale_pixels'):
+                        if field in step:
+                            raise AdapterError(f'{field} is not settable through this tool; resend the batch without it.')
         clear_pending = False
         if name == 'act' and self.state.get('pending'):
             result = self.resolve()
@@ -370,6 +391,10 @@ class Adapter:
         if self.images == 'inline':
             for frame in frame_refs(result):
                 content.append(dict(type='image', mimeType='image/png', data=base64.b64encode(Path(frame['path']).read_bytes()).decode()))
+        if name == 'act' and (result.get('reason') in ('invalid_expectation', 'invalid_params') or
+                              any(step.get('reason') in ('invalid_expectation', 'invalid_params')
+                                  for step in result.get('steps', []))):
+            content.append(step_form_hint())
         # Commit only after the complete result is ready to show, including images.
         if clear_pending:
             self.state.pop('pending', None)
@@ -405,7 +430,7 @@ def mcp_serve(adapter, incoming, outgoing):
                     # Never expose arbitrary exception text (paths may be sensitive).
                     exc = sys.exc_info()[1]
                     reason = exc.reason if isinstance(exc, AdapterError) else 'adapter_io_error'
-                    result = dict(isError=True, content=[{'type': 'text', 'text': encoded({'error': reason}).decode()}])
+                    result = render_error(reason, params.get('name'), exc)
             elif method == 'ping':
                 result = {}
             else:
@@ -460,7 +485,12 @@ def main():
                 print(encoded(dict(ok=True, **result)).decode())
     except (AdapterError, OSError, EOFError, ValueError, KeyError, TypeError) as exc:
         if args.mode == 'call':
-            print(encoded(dict(ok=False, error=exc.reason if isinstance(exc, AdapterError) else 'adapter_io_error')).decode())
+            reason = exc.reason if isinstance(exc, AdapterError) else 'adapter_io_error'
+            result = dict(ok=False, error=reason)
+            content = render_error(reason, args.tool, exc)['content']
+            if len(content) > 1:
+                result['content'] = content
+            print(encoded(result).decode())
         else:
             print('ark-act: ' + (exc.reason if isinstance(exc, AdapterError) else 'adapter_io_error'), file=sys.stderr)
         return 1

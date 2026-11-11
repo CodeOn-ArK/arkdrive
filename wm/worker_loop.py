@@ -27,6 +27,21 @@ success. Coordinates are native desktop pixels; use frame rect and scale to
 map image coordinates. Never repeat unknown/unobserved input; observe and
 reconcile. Authentication codes/passcodes require the human. Call done with
 success only after verifying the task, or failed/blocked with a factual summary.
+
+Valid expect kinds are window_present, window_absent, dialog_present,
+dialog_absent, window_focused, pointer_at, node_present, node_absent,
+text_equals, text_contains, node_state, item_present, item_absent.
+Tree expects (node_*, text_*, item_*) must include "provider": "atspi"
+and a selector with role and/or name/name_re, for example
+"match": {"role": "text", "name": "Name"}. Use these concrete kinds;
+do not invent a generic "state" expect. Select from freshly observed state
+and use the intended post-action value, rather than mere input acknowledgement.
+A step that changes anything (key, click, text, invoke) must carry one strong
+expect or the worker refuses it before dispatch (invalid_expectation).
+If an act returns invalid_expectation or invalid_params, fix the FORM of the
+step; do not repeat it unchanged. Re-observe if the needed selector is unclear.
+If an observe shows no windows, the application is still starting; wait
+briefly and observe again before acting.
 """
 
 
