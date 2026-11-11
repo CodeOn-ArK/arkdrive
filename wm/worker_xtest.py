@@ -57,6 +57,7 @@ class XTestTransport:
         self.x.root.xinput_select_events([(xinput.AllDevices, mask), (xinput.AllMasterDevices, xinput.MotionMask)])
 
     def devices(self, data):
+        self.device_list = data["devices"]
         for dev in data["devices"]:
             name = dev.name if hasattr(dev, "name") else dev["name"]
             if isinstance(name, bytes):

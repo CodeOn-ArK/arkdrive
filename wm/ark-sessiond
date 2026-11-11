@@ -16,6 +16,8 @@ import subprocess
 import sys
 import time
 
+from input_protocol import close_control_gate
+
 
 STATE = Path(os.path.expanduser("~/.local/state/ark-sessiond")).absolute()
 WM = Path(__file__).resolve().parent
@@ -120,7 +122,18 @@ def wait_exit(pids, seconds):
         time.sleep(0.05)
 
 
+class UnsafeTeardown(RuntimeError):
+    pass
+
+
+def require_helper_dead(record):
+    if record['profile'] == 'xorg' and alive(record.get('mkdevs_pid')):
+        raise UnsafeTeardown('teardown aborted: mkdevs helper is still alive; refusing to signal Xorg')
+
+
 def send_signal(record, pid, sig):
+    if record['profile'] == 'xorg' and pid == record.get('pid_x'):
+        require_helper_dead(record)
     if not alive(pid):
         return
     try:
@@ -176,10 +189,14 @@ def teardown(record, records):
     def attempt(operation):
         try:
             operation()
+        except UnsafeTeardown:
+            raise  # Keep the session record and Xorg/grabs intact for recovery.
         except Exception as exc:
             errors.append(str(exc))
 
     if record["profile"] == "xorg":
+        # A gate-write error aborts teardown before quit or any process signal.
+        close_control_gate(Path(record['session_dir']) / 'control')
         def quit_devices():
             try:
                 fd = os.open(Path(record["session_dir"]) / "cmd.fifo",
@@ -193,7 +210,12 @@ def teardown(record, records):
             finally:
                 os.close(fd)
         attempt(quit_devices)
-        wait_exit([record.get("mkdevs_pid")], 3)
+        helper = record.get('mkdevs_pid')
+        wait_exit([helper], 5)
+        if alive(helper):
+            attempt(lambda: send_signal(record, helper, signal.SIGKILL))
+            wait_exit([helper], 5)
+        require_helper_dead(record)
     pids = [record.get(field) for field in PID_FIELDS if record.get(field)]
     for pid in pids:
         attempt(lambda pid=pid: send_signal(record, pid, signal.SIGTERM))
@@ -204,6 +226,8 @@ def teardown(record, records):
         time.sleep(1)
         for pid in marked_pids(record):
             attempt(lambda pid=pid: send_signal(record, pid, signal.SIGKILL))
+    except UnsafeTeardown:
+        raise
     except Exception as exc:
         errors.append(str(exc))
     if record["profile"] == "xorg":
@@ -292,7 +316,8 @@ def start_xorg(record, records, timings):
     record["devices"] = json.loads(raw)
     kbd, ptr = record["devices"]["kbd"], record["devices"]["ptr"]
     time.sleep(1)
-    execute(record, ["chmod", "666", kbd, ptr], root=True)
+    execute(record, ["chmod", "600", kbd, ptr], root=True)
+    execute(record, ["chown", str(os.getuid()), kbd, ptr], root=True)
     for node in (kbd, ptr):
         properties = execute(record, ["udevadm", "info", "-q", "property", "-n", node])
         if "ID_SEAT=seat-arkdrive" not in properties.splitlines():

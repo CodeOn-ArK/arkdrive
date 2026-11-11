@@ -178,9 +178,11 @@ class Engine:
         self.queue, self.active = deque(), None
         self.actions = {}
         self.seq = 0
+        self.evdev = None
+        self.route = "xtest"
         self.fence_reason = None
         self.pending_effects = []
-        self.holds = {"xtest": {"key": set(), "button": set()}}
+        self.holds = {route: {"key": set(), "button": set()} for route in ("xtest", "evdev")}
         self.unknown_streak = 0
         self.lease_state = {}
         self.channel = {"state": "untested", "keyboard": "untested", "pointer": "untested"}
@@ -194,7 +196,7 @@ class Engine:
         except OSError:
             self.boot_id = None
         digest = hashlib.sha256()
-        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_pixels.py", "worker_tree.py", "worker_atspi.py", "openbox-rc.xml"):
+        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_evdev.py", "worker_keymap.py", "input_protocol.py", "worker_pixels.py", "worker_tree.py", "worker_atspi.py", "openbox-rc.xml"):
             digest.update(name.encode() + Path(__file__).with_name(name).read_bytes())
         self.build_id = digest.hexdigest()
         try:
@@ -238,7 +240,7 @@ class Engine:
                 try:
                     self.validate_journal()
                     self.durable("fence_clear", previous=self.fence_reason, control_epoch=current["epoch"])
-                    if not any(self.holds["xtest"].values()):
+                    if not any(v for holds in self.holds.values() for v in holds.values()):
                         self.fence_reason = None
                 except ActError:
                     pass
@@ -349,7 +351,7 @@ class Engine:
                       "focus_window": ("window",), "close_window": ("window",),
                       "invoke": ("ref", "action"), "wait": ()}[k]
             closed(intent, ("kind", "route", *fields))
-            if intent.get("route", "auto") not in ("auto", "input", "xtest", "wm", "atspi", "clipboard", "cdp"):
+            if intent.get("route", "auto") not in ("auto", "input", "xtest", "evdev", "wm", "atspi", "clipboard", "cdp"):
                 raise ActError("invalid_request")
             if k == "key":
                 intent["keys"] = chord(intent.get("keys"))
@@ -529,6 +531,17 @@ class Engine:
     def stopping_tick(self):
         """Release-only shutdown. Interrupted actions stay durable/unknown."""
         self.shutdown = True
+        if self.evdev and self.evdev.inflight:
+            # Finish reading the outstanding reply before release_all uses
+            # this stream. The owner closes the helper gate first on xorg.
+            runner = self.selftest or (self.active and self.active.get("runner"))
+            if runner:
+                try:
+                    next(runner)
+                except StopIteration:
+                    self.selftest = None
+                    self.active = None
+                return False
         if self.stop_runner is None:
             a = self.active or {"params": {"action_id": "worker_stop"}, "acks": []}
             r = a["receipt"]["steps"][0] if self.active else {
@@ -847,6 +860,8 @@ class Engine:
                     any(self.w.cache.facets.get(f, 1) > r["macro_rev"] for f in ("focus", "modal"))):
                 raise ActError("unexpected_state")
             self.arm(a, r)
+        if self.route == "evdev" and not cleanup:
+            return (yield from self.send_evdev(a, r, events))
         ack = Ack([(k, d) for k, d, *xy in events], self.t.sources, self.t.raw_seq)
         start = self.clock()
         attempt = {"route": "xtest", "started_ns": int(start * 1e9), "ended_ns": None,
@@ -930,11 +945,84 @@ class Engine:
                 self.holds["xtest"]["button"].discard(detail)
         return True
 
+    def send_evdev(self, a, r, events, diagnostic=False):
+        point = yield from self.query("pointer", deadline=self.clock() + 0.2)
+        plan = self.evdev.plan(events, point)
+        holds = self.holds["evdev"]
+        # Validate the complete macro before sending any of its frames.
+        offset = 0
+        while offset < len(plan):
+            dev = plan[offset][0]
+            end = offset
+            while end < len(plan) and end-offset < 64 and plan[end][0] == dev:
+                end += 1
+            group = plan[offset:end]
+            if not diagnostic:
+                self.gate(a)
+            elif self.shutdown or (self.w.cache.control or {}).get("state") != "agent":
+                raise ActError("preempted")
+            expected = [event for _, _, raw in group for event in raw]
+            for kind, detail in expected:
+                if kind in ("key_down", "button_down"):
+                    holds["key" if kind == "key_down" else "button"].add(detail)
+            gap = 2000 if dev == "kbd" else 0
+            result = yield from self.evdev.send_frames(dev, [frame for _, frame, _ in group], expected, gap)
+            if not diagnostic and self.evdev.last_ack is not None:
+                a.setdefault("acks", []).append((r["id"], self.evdev.last_ack))
+            r["route"] = "evdev"
+            r["attempts"].append(result)
+            r["written"] = r.get("written", 0) + result["frames_written"]
+            r["dispatch_status"] = self.aggregate(r["attempts"])
+            if result["dispatch_status"] != "not_dispatched":
+                r["rev"]["dispatched"] = r["rev"]["dispatched"] or self.w.cache.rev
+            if result["reason"]:
+                # Includes grab_lost/channel_down, even at zero frames: stop
+                # this macro and the batch without another route or replay.
+                raise ActError(result["reason"])
+            for kind, detail in expected:
+                if kind in ("key_up", "button_up"):
+                    holds["key" if kind == "key_up" else "button"].discard(detail)
+            offset = end
+            if dev == "kbd" and offset < len(plan) and plan[offset][0] == dev:
+                yield from self.pause(gap/1e6, a if not diagnostic else None)
+        return True
+
+    def release_evdev(self, a, r):
+        holds = self.holds["evdev"]
+        if not any(holds.values()):
+            return True
+        events = [("key_up", c) for c in sorted(holds["key"])] + [("button_up", c) for c in sorted(holds["button"])]
+        self.durable_cleanup(a, events)
+        ok = yield from self.evdev.release_all()
+        # The helper reply proves writes, not X consumption. Confirm release
+        # independently on this session's X connection, even after gate closure.
+        confirmed = False
+        deadline = self.clock() + 0.15
+        while ok and self.clock() < deadline:
+            try:
+                keys = yield from self.query("keymap", deadline=deadline)
+                pointer = yield from self.query("pointer", deadline=deadline)
+                mask = sum(1 << (7+b) for b in holds["button"])
+                if not set(keys) & holds["key"] and not pointer["mask"] & mask:
+                    confirmed = True
+                    break
+            except ActError:
+                break
+            yield
+        r["cleanup"] = {"released": events if confirmed else [], "unreleased": [] if confirmed else events, "confirmed": confirmed}
+        if confirmed:
+            holds["key"].clear()
+            holds["button"].clear()
+        else:
+            self.fence("F1:release_unconfirmed")
+        return confirmed
+
     def release(self, a, r):
+        evdev_ok = yield from (self.release_evdev(a, r) if self.evdev else self.noop_release())
         holds = self.holds["xtest"]
         events = [("key_up", v) for v in sorted(holds["key"], reverse=True)] + [("button_up", v) for v in sorted(holds["button"], reverse=True)]
         if not events:
-            return True
+            return evdev_ok
         # Preserve holds until a release is confirmed. QueryKeymap provides a
         # separate fallback for keyboard release; buttons require raw ack.
         held_keys = set(holds["key"])
@@ -955,6 +1043,12 @@ class Engine:
             holds["button"].update(d for k, d in events if k == "button_up")
             self.fence("F1:release_unconfirmed")
         return ok
+
+    @staticmethod
+    def noop_release():
+        if False:
+            yield
+        return True
 
     def durable_cleanup(self, a, events):
         # Release must remain possible even after F3; journal best effort only.
@@ -1043,6 +1137,16 @@ class Engine:
 
     def dispatch(self, a, s, r, handle, point):
         intent, k = s["intent"], s["intent"]["kind"]
+        physical = k in ("key", "text", "click", "scroll", "move", "drag")
+        requested = intent.get("route", "auto")
+        self.route = "evdev" if physical and self.evdev and self.evdev.health["state"] == "up" and requested != "xtest" else "xtest"
+        if self.route == "evdev":
+            self.evdev.guard(intent)
+            if not a.get("evdev_grab_checked"):
+                a["evdev_grab_checked"] = True
+                if not (yield from self.evdev.grab_check()):
+                    self.route = "xtest"
+        route = "atspi" if k == "invoke" else "wm" if k in ("focus_window", "close_window") else self.route
         # Resolve the entire macro before positioning/focusing/arming it.
         end = self.point(intent["to"], r["rev"]["base"]) if k == "drag" else None
         if end is not None:
@@ -1058,7 +1162,14 @@ class Engine:
             if (s.get("_node") and "focused" not in s["_node"].get("states", []) and not intent["replace"]):
                 insertion_keys = (self.mapped_keys(["Control_L", "Home"]), self.mapped_keys(["Right"]),
                                   self.mapped_keys(["Shift_L", "Right"]))
-        route = "atspi" if k == "invoke" else "wm" if k in ("focus_window", "close_window") else "xtest"
+        if route == "evdev":
+            all_codes = codes + mods
+            if k == "text":
+                all_codes += select_all + [c for group in text for c in group]
+                if insertion_keys:
+                    all_codes += [c for group in insertion_keys for c in group]
+            if any(self.evdev.keycodes.get(c) in (None, 99) for c in all_codes):
+                raise ActError("invalid_request", "unmapped_evdev_key")
         requested = intent.get("route", "auto")
         if requested not in ("auto", "input", route) or intent.get("via") == "paste":
             raise ActError("backend_unsupported")
@@ -1596,7 +1707,10 @@ class Engine:
                     r["channel_probe"] = probe["attempts"]
                 except ActError as exc:
                     if exc.reason in ("input_unacknowledged", "channel_down"):
-                        self.channel["state"] = "down"
+                        if r.get("route") == "evdev" and self.evdev:
+                            self.evdev.down("input_unacknowledged")
+                        else:
+                            self.channel["state"] = "down"
                         self.fence("F2:probe_failed")
         else:
             self.unknown_streak = 0
@@ -1649,7 +1763,10 @@ class Engine:
             if s["disposition"] != "unexecuted":
                 self.w.counters[s["effect"]["status"]] += 1
                 if s["effect"]["status"] == "verified" and s["kind"] in ("key", "text"):
-                    self.channel["keyboard"] = "ok"
+                    if s.get("route") == "evdev" and self.evdev:
+                        self.evdev.health["keyboard"] = "tested"
+                    else:
+                        self.channel["keyboard"] = "ok"
         r["pending_effects"] = copy.deepcopy(self.pending_effects)
         r["effect"] = copy.deepcopy((stopped or steps[-1])["effect"])
         state = self.lease_state.get(p["lease"])
@@ -1746,7 +1863,53 @@ class Engine:
             self.selftest = None
             return
         self.selftest_pending = False
-        self.selftest = self.channel_selftest()
+        self.selftest = self.channels_selftest() if self.evdev else self.channel_selftest()
+
+    def channels_selftest(self):
+        started = self.clock()
+        yield from self.evdev_selftest()
+        self.route = "xtest"
+        yield from self.channel_selftest()
+        self.w.timings["selftest_ms"] = (self.clock() - started)*1000
+        if self.channel["state"] != "ok" and self.evdev.health["state"] != "up" and not self.selftest_pending:
+            raise RuntimeError("all_input_channels_down")
+
+    def evdev_selftest(self):
+        keyboard = not any(v["mapped"] and v["type"] != "popup" for v in self.w.cache.windows.values())
+        test = None
+        old_focus = self.w.cache.focus
+        a = {"params": {"action_id": "channel_selftest"}}
+        r = {"id": "selftest", "attempts": [], "rev": {"dispatched": None}, "dispatch_status": "not_dispatched"}
+        try:
+            if not (yield from self.evdev.startup()):
+                return
+            origin = yield from self.query("pointer", deadline=self.clock() + 0.2)
+            test = self.t.test_window(keyboard)
+            yield from self.query("barrier", deadline=self.clock() + 0.2)
+            events = []
+            if keyboard:
+                shift = self.t.keycode("Shift_L")
+                if shift is None:
+                    raise ActError("channel_down")
+                events = [(kind, shift) for _ in range(50) for kind in ("key_down", "key_up")]
+            x, y = origin["x"], origin["y"]
+            delta = 1 if x+1 < self.w.screen["w"] else -1
+            events += [("motion", 0, x+delta if n%2 == 0 else x, y) for n in range(100)]
+            self.durable("channel_test", route="evdev", events=len(events), keyboard=keyboard)
+            yield from self.send_evdev(a, r, events, diagnostic=True)
+            # Core events may follow the final raw event; allow a round trip.
+            until = self.clock() + 0.15
+            while keyboard and self.t.test_presses < 50 and self.clock() < until:
+                yield
+            pointer = yield from self.query("pointer", deadline=self.clock() + 0.2)
+            if pointer["x"] != x or pointer["y"] != y or keyboard and self.t.test_presses != 50:
+                raise ActError("selftest_delivery_failed")
+            self.evdev.health.update(state="up", keyboard="tested" if keyboard else "untested", last_error=None)
+        except ActError as exc:
+            self.evdev.down(exc.reason)
+        finally:
+            yield from self.release_evdev(a, r)
+            self.t.end_test(test, old_focus)
 
     def channel_selftest(self):
         start = self.clock()

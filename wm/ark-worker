@@ -8,7 +8,6 @@ avoid ReplyRequest.reply(), which would otherwise block the owner loop.
 
 import argparse
 from contextlib import contextmanager
-import ctypes
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -38,6 +37,8 @@ WM = Path(__file__).resolve().parent
 sys.path.insert(0, str(WM))
 from worker_act import ActError, Engine, canonical, leaves, predicate_schema, recover_receipt
 from worker_xtest import XTestTransport
+from worker_evdev import EvdevTransport
+from input_protocol import control_store
 from worker_pixels import Pixels, Shadow, intersect, bbox
 from worker_tree import Provider as TreeProvider
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
@@ -187,15 +188,6 @@ def decode_control(data, generation=None):
         raise ValueError("stale_generation")
     return {"generation": gen.hex(), "epoch": epoch, "state": state,
             "flags": flags, "permit_deadline_ns": permit, "lease_hash": lease.hex()}
-
-
-def control_store(page, offset, value, bits):
-    # Aligned native integer store into the shared mapping (ArK2 is LE).
-    if sys.byteorder != "little":
-        raise RuntimeError("unsupported_control_endian")
-    scalar = (ctypes.c_uint64 if bits == 64 else ctypes.c_uint32).from_buffer(page, offset)
-    scalar.value = value
-    del scalar
 
 
 def transition_control(page, state, epoch, store=control_store):
@@ -624,6 +616,13 @@ class XState:
             self.phase = "channel_setup"
             self.w.act = Engine(self.w, XTestTransport(self.w))
         if self.phase == "channel_setup" and self.w.act.t.initialised and not self.ax.pending:
+            if self.w.record["profile"] == "xorg":
+                evdev = EvdevTransport(self.w, self.w.act.t)
+                evdev.discover(self.w.act.t.device_list)
+                self.w.act.evdev = evdev
+                mask = (xinput.RawKeyPressMask | xinput.RawKeyReleaseMask | xinput.RawButtonPressMask |
+                        xinput.RawButtonReleaseMask | xinput.RawMotionMask | xinput.HierarchyChangedMask)
+                self.root.xinput_select_events([(xinput.AllDevices, mask), (xinput.AllMasterDevices, xinput.MotionMask)])
             self.phase = "channel_test"
             self.w.act.start_selftest()
         if self.phase == "channel_test" and self.w.act.selftest is None:
@@ -992,6 +991,8 @@ class XState:
     def events(self, events):
         if getattr(self.w, "act", None):
             self.w.act.t.events(events)
+            if self.w.act.evdev:
+                self.w.act.evdev.events(events)
         damage_rects = []
         notified = set()
         for e in events:
@@ -1171,8 +1172,11 @@ class Worker:
     def channels(self):
         return {"xtest": dict(self.act.channel) if getattr(self, "act", None) else
                           {"state": "untested", "keyboard": "untested", "pointer": "untested"},
-                "evdev": {"state": "down", "grab": False, "reason":
-                          "not_implemented" if self.record["profile"] == "xorg" else "backend_unsupported"},
+                "evdev": dict(self.act.evdev.health) if getattr(self, "act", None) and self.act.evdev else
+                         {"state": "untested" if self.record["profile"] == "xorg" else "down",
+                          "grab": False, "keyboard": "untested", "last_error":
+                          None if self.record["profile"] == "xorg" else "backend_unsupported",
+                          "reason": "not_implemented" if self.record["profile"] == "xorg" else "backend_unsupported"},
                 "paste": {"state": "unavailable", "reason": "not_implemented"},
                 "atspi": self.tree.health()["atspi"] if getattr(self, "tree", None) else
                          {"state": "down", "reason": "provider_unavailable"}}
@@ -1831,6 +1835,8 @@ class Worker:
             self.selector.register(self.x.inp.fileno(), selectors.EVENT_READ, "inp")
             while True:
                 if self.stopping:
+                    if self.act and self.act.evdev:
+                        self.quiesce_evdev()
                     if self.stop_deadline is None:
                         if self.act and not self.act.stopping_tick():
                             self.ingest()
@@ -1897,6 +1903,19 @@ class Worker:
             self.cleanup(failure)
         return 1 if failure else 0
 
+    def quiesce_evdev(self):
+        # A helper may still be pacing a submitted request while the owner
+        # drains its reply. Close the shared gate before release-only shutdown.
+        # This path exists only for xorg; preserve an owner's closed state.
+        try:
+            with (self.sd / "control").open("r+b") as stream:
+                with mmap.mmap(stream.fileno(), 64) as page:
+                    current = decode_control(page[:], self.generation)
+                    if current["state"] == STATES["agent"]:
+                        control_store(page, 32, STATES["quiescing"], 32)
+        except (OSError, ValueError):
+            self.act.evdev.down("control_unavailable")
+
     def begin_stop(self):
         self.stop_deadline = time.monotonic() + 2
         if self.listener:
@@ -1944,6 +1963,8 @@ class Worker:
             self.control_file.close()
             if getattr(self, "pixels", None):
                 self.pixels.shadow.close()
+            if self.act and self.act.evdev:
+                self.act.evdev.close()
             if self.x:
                 self.x.close()
             signal.set_wakeup_fd(-1)
