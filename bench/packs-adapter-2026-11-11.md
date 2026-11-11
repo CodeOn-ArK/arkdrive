@@ -149,3 +149,36 @@ Full log: `wm/tests/.tmp/packs-adapter-fix1-full-suite.log`.
 **Live re-check — NOT RUN.** Raj reruns the one-shot observe/budget/cursor/act
 smoke and D1 live gate. No live session, provider API or display (including `:0`)
 was opened or driven. Nothing staged or committed.
+
+## Raj's verifier addendum (Nov 11, 2026)
+
+Suite re-verified by Raj on ArK2 for both the adapter change set (991 tests,
+OK) and fix round 1 (999 tests, OK). Commits: e3e9b0c (adapter fixes),
+dc001dd (fix round 1).
+
+Live checks (ArK2, dedicated xvfb sessions on display :91):
+
+1. Ready alignment — PASS. One-shot `ark-act call` processes in sequence
+   (observe, observe, act, done) against a live session with Thunar open: no
+   precondition_failed/retry cycle; the focus_window act succeeded on the
+   first attempt (receipt status success).
+2. Scope follows content — PASS via the W4 D1 harness rerun on this tree:
+   30/30 scripted Thunar renames, 3/3 steps verified, filesystem oracle each
+   run (log ~/packs-d1.log, 237 s).
+3. Cursor + tree budget — PASS. Full observe returned 104 tree lines;
+   budget {nodes: 4} returned exactly 4 lines with truncated=true and a
+   cursor; the cursor page returned the next 4 lines with zero overlap.
+   (MCP path shares the same adapter code and is covered headlessly.)
+4. Loop budget accounting — PASS. Impossible budget (CU_LOOP_TOKEN_BUDGET=50):
+   run ends token_budget_exceeded with tool_calls_made 0 and empty
+   token_usage — zero provider calls. Feasible run (llama preset): the model
+   observed once and called done(blocked) as instructed; provider reported
+   prompt_tokens 3206 against peak_estimated_prompt_tokens 3522 (estimate
+   conservative, same magnitude); completion_reserve_tokens 1024 recorded.
+
+Fix round 1 note: the first D1 attempt and the first smoke exposed two
+path-layout staleness bugs from memory step 5's instance-keyed session dirs —
+one in the W4 gate harness (run_dir, fixed in the harness, not the product)
+and the adapter defect fixed in dc001dd. Both are the same lesson: any code
+that reconstructs a session path instead of reading the registry's
+session_dir is stale since step 5.
