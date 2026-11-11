@@ -209,3 +209,16 @@ Live PSS, hardware latency, 100k-act, crash/disk-full and 24-hour gates
 remain **NOT RUN**. Production changes are confined to `wm/ark-worker`
 and `wm/worker_act.py`; test changes stay under `wm/tests/`; this is the
 only new bench note. Steps 2–5 remain out of scope.
+
+## Verifier addendum (Raj, 2026-11-11)
+
+Suite on ArK2: OK (901 tests at build). Live check with the step-0
+harness on a fresh xvfb session (--windows 10 --acts 300 --popups 2):
+
+- act_churn: actions_retained delta 0 (baseline was +300, 1:1), with
+  action_stubs +300 and journal_actions_indexed +300 - every completed
+  act compacted to a stub, exactly as designed. Journal bytes still
+  grow ~4.3 KB/act on disk (that is step 5's scope, not step 1's).
+- window/popup phases unchanged (tombstones are steps 2-3 scope).
+
+Committed 52cea81.
