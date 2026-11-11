@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from test_worker_w5 import a, loop, receipt, FakeWorker
+from worker_act import ActError, predicate_schema
 
 
 KINDS = ('window_present, window_absent, dialog_present, dialog_absent, '
@@ -23,7 +24,7 @@ class PromptCase(unittest.TestCase):
     def test_system_names_grammar_dispatch_repair_and_startup_rules(self):
         prompt = ' '.join(loop.SYSTEM.split())
         self.assertIn('Valid expect kinds are ' + KINDS + '.', prompt)
-        self.assertIn('Tree expects (node_*, text_*, item_*) must include "provider": "atspi"', prompt)
+        self.assertIn('Tree expects (node_*, text_*, item_*) can use a selector', prompt)
         self.assertIn('selector with role and/or name/name_re', prompt)
         self.assertIn('A step that changes anything (key, click, text, invoke) must carry one strong '
                       'expect or the worker refuses it before dispatch (invalid_expectation)', prompt)
@@ -31,6 +32,32 @@ class PromptCase(unittest.TestCase):
                       'step; do not repeat it unchanged', prompt)
         self.assertIn('If an observe shows no windows, the application is still starting; wait '
                       'briefly and observe again before acting', prompt)
+
+    def test_system_tree_examples_parse_and_pass_worker_predicate_validator(self):
+        prompt = ' '.join(loop.SYSTEM.split())
+        decoder = json.JSONDecoder()
+        examples = []
+        start = 0
+        while True:
+            start = prompt.find('{"kind": "text_equals"', start)
+            if start < 0:
+                break
+            example, length = decoder.raw_decode(prompt[start:])
+            examples.append(example)
+            start += length
+        self.assertEqual(len(examples), 2)
+        selector, ref = examples
+        self.assertEqual(selector['selector'], dict(provider='atspi', role='entry', name='Name'))
+        self.assertEqual(ref['ref'], 'n7')
+        self.assertNotIn('selector', ref)
+        for example in examples:
+            self.assertNotIn('provider', example)
+            predicate_schema(example)
+        # The misleading predicate-level form is rejected by the same hook.
+        invalid = dict(selector, provider=selector['selector']['provider'])
+        with self.assertRaises(ActError) as caught:
+            predicate_schema(invalid)
+        self.assertEqual(caught.exception.reason, 'invalid_params')
 
 
 class RenderingCase(unittest.TestCase):

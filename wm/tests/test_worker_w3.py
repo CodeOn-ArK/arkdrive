@@ -6,6 +6,7 @@ an independent zlib decoder and RGB oracle, not the worker's encoder/reader.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -583,6 +584,54 @@ class FrameQuotaTests(unittest.TestCase):
         self.assertFalse(Path(b['path']).exists())
         self.assertTrue(Path(c['path']).exists())
         self.assertTrue(Path(d['path']).exists())
+
+    def test_equal_mtimes_evict_in_insertion_order_with_receipt_protection(self):
+        # Reverse hash order makes the old (mtime, filename) sort evict the
+        # newest candidate first, deterministically on every filesystem.
+        payloads = sorted((bytes([n])*4 for n in range(1, 6)),
+                          key=lambda data: hashlib.sha256(data).hexdigest(), reverse=True)
+        for protected in (False, True):
+            with self.subTest(receipt_protected=protected):
+                store = Frames(self.path/str(protected), quota=12)
+                frames = []
+                for data in payloads:
+                    frames.append(store.put(data, self.meta))
+                    os.utime(frames[-1]['path'], ns=(1_000_000_000, 1_000_000_000))
+                    if protected and len(frames) == 1:
+                        store.retain(frames[0])
+                    if len(frames) > 3:
+                        expected = ([frames[0]] + frames[-2:]) if protected else frames[-3:]
+                        self.assertEqual(set(store.directory.glob('*.png')),
+                                         {Path(f['path']) for f in expected})
+                        self.assertEqual(sum(p.stat().st_size for p in store.directory.glob('*.png')), 12)
+
+    def test_restored_files_use_mtime_before_current_insertions(self):
+        a, b = self.put(1), self.put(2)
+        os.utime(a['path'], ns=(3_000_000_000, 3_000_000_000))
+        os.utime(b['path'], ns=(2_000_000_000, 2_000_000_000))
+        store = Frames(self.store.directory, quota=12)
+        store.restore(self.path, 's1')
+        c = store.put(bytes([3])*4, self.meta)
+        os.utime(c['path'], ns=(1_000_000_000, 1_000_000_000))
+        store.put(bytes([4])*4, self.meta)
+        self.assertFalse(Path(b['path']).exists())
+        self.assertTrue(Path(a['path']).exists())
+        self.assertTrue(Path(c['path']).exists())
+        store.put(bytes([5])*4, self.meta)
+        self.assertFalse(Path(a['path']).exists())
+        self.assertTrue(Path(c['path']).exists())
+
+    def test_reissuing_shared_file_preserves_first_insertion_order(self):
+        a, b, c = self.put(1), self.put(2), self.put(3)
+        again = self.store.put(bytes([1])*4, dict(self.meta, rev=2))
+        self.assertEqual(a['path'], again['path'])
+        self.assertNotEqual(a['frame'], again['frame'])
+        self.put(4)
+        self.assertFalse(Path(a['path']).exists())
+        self.assertTrue(Path(b['path']).exists())
+        self.assertTrue(Path(c['path']).exists())
+        self.assertNotIn(a['frame'], self.store.issued)
+        self.assertNotIn(again['frame'], self.store.issued)
 
     def test_protection_expires_after_fifty_receipts(self):
         a = self.put(1)

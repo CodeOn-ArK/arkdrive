@@ -169,7 +169,15 @@ class Frames:
 
     def evict(self, extra=0, protect=()):
         pinned = set(protect).union(self.pins, *self.receipts)
-        files = sorted(self.directory.glob('*.png'), key=lambda p: (p.stat().st_mtime_ns, p.name))
+        # issued preserves insertion order; shared files keep their first issue.
+        sequence = {}
+        for index, frame in enumerate(self.issued.values()):
+            sequence.setdefault(Path(frame['path']).name, index)
+        # Files surviving a restart predate current issues. Only their unknown
+        # insertion order falls back to mtime (then filename for stable ties).
+        files = sorted(self.directory.glob('*.png'),
+                       key=lambda p: (1, sequence[p.name], p.name) if p.name in sequence
+                       else (0, p.stat().st_mtime_ns, p.name))
         total = sum(p.stat().st_size for p in files)
         for path in files:
             if total + extra <= self.quota:

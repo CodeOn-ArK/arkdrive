@@ -31,9 +31,12 @@ success only after verifying the task, or failed/blocked with a factual summary.
 Valid expect kinds are window_present, window_absent, dialog_present,
 dialog_absent, window_focused, pointer_at, node_present, node_absent,
 text_equals, text_contains, node_state, item_present, item_absent.
-Tree expects (node_*, text_*, item_*) must include "provider": "atspi"
-and a selector with role and/or name/name_re, for example
-"match": {"role": "text", "name": "Name"}. Use these concrete kinds;
+Tree expects (node_*, text_*, item_*) can use a selector with role and/or name/name_re.
+Put "provider": "atspi" INSIDE the selector object, for example
+{"kind": "text_equals", "window": "<handle>", "selector": {"provider": "atspi", "role": "entry", "name": "Name"}, "value": "..."}.
+Ref-based expects need no provider, for example
+{"kind": "text_equals", "window": "<handle>", "ref": "n7", "value": "..."}.
+Use these concrete kinds;
 do not invent a generic "state" expect. Select from freshly observed state
 and use the intended post-action value, rather than mere input acknowledgement.
 A step that changes anything (key, click, text, invoke) must carry one strong
