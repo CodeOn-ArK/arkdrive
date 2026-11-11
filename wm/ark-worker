@@ -716,9 +716,17 @@ class AsyncX:
         while self.connection.pending_events():
             events.append(self.connection.next_event())
         pending, self.pending = self.pending, []
+        ready = []
         for req, callback, optional, error_callback in pending:
             if req._error is not None or req._data is not None:
-                self.budget.count -= 1
+                ready.append((req, callback, optional, error_callback))
+            else:
+                self.pending.append((req, callback, optional, error_callback))
+        # Release the whole completed batch before callbacks can issue more
+        # work. Later completed replies must not compete with that new work.
+        # Incomplete requests stay counted, including on the other connection.
+        self.budget.count -= len(ready)
+        for req, callback, optional, error_callback in ready:
             if req._error is not None:
                 if error_callback is not None:
                     error_callback(req._error)
@@ -728,8 +736,6 @@ class AsyncX:
                     raise req._error
             elif req._data is not None:
                 callback(req._data)
-            else:
-                self.pending.append((req, callback, optional, error_callback))
         return events
 
     def flush(self):
@@ -748,6 +754,7 @@ def prop_values(reply):
 
 class XBudget:
     LIMIT = 2048
+    REFRESH_REQUESTS = 20  # 12 initial requests, at most eight more ancestors.
 
     def __init__(self):
         self.limit, self.count, self.overloaded = self.LIMIT, 0, False
@@ -774,6 +781,7 @@ class XState:
         self.root = self.ev.screen().root
         self.atoms, self.versions = {}, {}
         self.clients, self.refreshing, self.again = set(), set(), set()
+        self.refresh_waiting = {}  # insertion-ordered, coalesced window IDs
         self.incarnations = {}
         self.selected_windows, self.uncovered = set(), set()
         self.focus_xid, self.input_focus = 0, 0
@@ -969,20 +977,47 @@ class XState:
         if not wid or wid == self.root.id or wid in getattr(self, "ignored", set()):
             return
         if wid in self.refreshing:
-            self.again.add(wid)
+            # A queued snapshot has not sampled anything yet.
+            if wid not in getattr(self, 'refresh_waiting', {}):
+                self.again.add(wid)
             return
         budget = getattr(self, 'budget', None)
-        if budget and (budget.overloaded or budget.count > budget.limit - 20):
-            # A metadata group needs 12 initial requests and up to 8 ancestry
-            # probes. Do not grow refresh bookkeeping for rejected groups.
+        if budget and (budget.overloaded or budget.count > budget.limit - budget.REFRESH_REQUESTS
+                       or len(self.refreshing) >= budget.limit):
+            # Bound queued IDs as well as requests. A genuine inventory/flood
+            # overflow still sheds and forces resynchronization after drain.
             budget.overloaded = True
             return
         self.refreshing.add(wid)
+        if budget:
+            self.refresh_waiting = getattr(self, 'refresh_waiting', {})
+            self.refresh_waiting[wid] = None
+            self.drain_refreshes()
+        else:
+            self.start_refresh(wid)
+
+    def drain_refreshes(self):
+        budget = self.budget
+        waiting = self.refresh_waiting
+        # Keep half the shared ceiling for foreground dependency sampling,
+        # pointer/capture work and other replies. Each active group reserves
+        # its worst-case ancestry fanout, not just its initial requests.
+        groups = max(1, budget.limit // (2 * budget.REFRESH_REQUESTS))
+        while (waiting and not budget.overloaded
+               and len(self.refreshing) - len(waiting) < groups
+               and budget.count <= budget.limit - budget.REFRESH_REQUESTS):
+            wid = next(iter(waiting))
+            del waiting[wid]
+            self.start_refresh(wid)
+
+    def start_refresh(self, wid):
         def finished():
             self.refreshing.discard(wid)
             if wid in self.again:
                 self.again.remove(wid)
                 self.refresh(wid)
+            if getattr(self, 'budget', None):
+                self.drain_refreshes()
         self.read_window(wid, finished)
 
     def read_window(self, wid, complete):
@@ -1319,6 +1354,8 @@ class XState:
                 self.w.act.evdev.events(events)
         damage_rects = []
         notified = set()
+        root_tree = screen = focus = False
+        properties = set()
         for e in events:
             # python-xlib registers a per-connection clone of DamageNotify,
             # not a subclass: isinstance against the imported class misses
@@ -1340,17 +1377,17 @@ class XState:
                         if not self.wm_ready:
                             self.check_wm()
                     elif e.atom == self.atoms["_NET_CLIENT_LIST"]:
-                        self.property(self.root, "_NET_CLIENT_LIST", self.client_list)
+                        properties.add("_NET_CLIENT_LIST")
                     elif e.atom == self.atoms["_NET_ACTIVE_WINDOW"]:
-                        self.property(self.root, "_NET_ACTIVE_WINDOW", self.active)
+                        properties.add("_NET_ACTIVE_WINDOW")
                 elif e.atom in self.atoms.values():
                     self.refresh(wid)
             elif e.type in (X.MapNotify, X.UnmapNotify, X.ConfigureNotify, X.ReparentNotify):
                 notified.add("windows")
                 self.w.cache.changed.add("stacking")
-                self.ax.ask(request.QueryTree, self.root_tree, window=self.root)
+                root_tree = True
                 if wid == self.root.id:
-                    self.ax.ask(request.GetGeometry, self.screen, drawable=self.root)
+                    screen = True
                 else:
                     self.refresh(wid)
             elif e.type == X.DestroyNotify:
@@ -1362,13 +1399,25 @@ class XState:
                 self.clients.discard(wid)
             elif e.type in (X.FocusIn, X.FocusOut):
                 notified.add("focus")
-                self.ax.ask(request.GetInputFocus, self.got_focus)
-                self.property(self.root, "_NET_ACTIVE_WINDOW", self.active)
+                focus = True
+                properties.add("_NET_ACTIVE_WINDOW")
             elif e.type == X.MotionNotify:
                 self.w.cache.set("pointer", {"x": e.root_x, "y": e.root_y})
             elif e.type == ge.GenericEventCode:
                 # Raw payloads have already been handed to the ack consumer.
                 continue
+        # A batch describes invalidations, not independent snapshots. Reading
+        # each root dependency once covers all its notifications in this turn.
+        if root_tree:
+            self.ax.ask(request.QueryTree, self.root_tree, window=self.root)
+        if screen:
+            self.ax.ask(request.GetGeometry, self.screen, drawable=self.root)
+        if focus:
+            self.ax.ask(request.GetInputFocus, self.got_focus)
+        for name in sorted(properties):
+            self.property(self.root, name, self.client_list if name == "_NET_CLIENT_LIST" else self.active)
+        if getattr(self, 'refresh_waiting', None):
+            self.drain_refreshes()
         if damage_rects and getattr(self.w, "pixels", None):
             self.w.pixels.mark(damage_rects)
         if getattr(self.w, "resync_baseline", None) is not None:
@@ -1554,7 +1603,9 @@ class Worker:
         """Step-0 gauges, sampled only by system.info; never prune or refresh.
 
         File errors are unknown (null), not zero. pending_x_requests counts
-        parent-side AsyncX requests, not server work or buffered X events.
+        admitted AsyncX requests awaiting completion collection across both
+        connections, including detached pump work, excluding collected callback
+        batches. It is not server work or buffered X events.
         Schema/units are documented in bench/memory-step0-2026-11-11.md.
         """
         act = getattr(self, 'act', None)
@@ -1583,7 +1634,8 @@ class Worker:
                 "atspi_apps": len(tree.apps) if tree else 0,
                 "atspi_child": getattr(tree, 'child_memory', None) if tree else None,
                 "journal_bytes": journal_bytes,
-                "pending_x_requests": (sum(len(channel.pending) for channel in
+                "pending_x_requests": (x.budget.count if x and getattr(x, 'budget', None) else
+                                       sum(len(channel.pending) for channel in
                                            (getattr(x, 'ax', None), getattr(x, 'inp_ax', None))
                                            if channel is not None) if x else None)}
 
@@ -2380,6 +2432,7 @@ class Worker:
             # never report partial sampling as complete coverage.
             self.x.refreshing.clear()
             self.x.again.clear()
+            getattr(self.x, 'refresh_waiting', {}).clear()
             self.resync_baseline = None
             self.watchdog = 0
             budget.overloaded = False

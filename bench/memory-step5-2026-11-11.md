@@ -277,3 +277,154 @@ are not reduced by segmentation or checkpoints. The cleanup removes the
 identified avoidable retention and adds explicit admission/fallback bounds;
 Raj's live soak and hardware gates must establish the resulting PSS plateau
 and latency against the Step-0 baseline.
+
+## Fix round 1
+
+Raj reported `queue_full` after roughly two batches of ten `fx_log` windows
+on a fresh step-5 Xvfb session, followed by healthy idle probes. This round
+uses **fake X only**: **live gates NOT RUN**, including the actual session
+soak harness. No display, including `:0`, was opened or driven. Nothing
+staged or committed; changes stay within `wm/` and this note.
+
+### Diagnosis before changing admission
+
+`wm/tests/memory_step5_fix1_trace.py` exercises production `XState.events`,
+metadata/ancestry reads, refresh completion, snapshots and `AsyncX.ask/pump`
+with deferred fake replies. Its counters independently track issuance,
+server completion, worker collection, rejected asks and peak truly
+outstanding requests. Replies are supplied at 128 per connection poll.
+The decoration count is a synthetic stress shape, **not a measurement of
+Raj's Openbox session**.
+
+The original code exhibits two separate problems:
+
+- **Real fanout (suspect b):** ten client windows with twenty child windows
+  each, each producing map/configure/reparent notifications, create 630
+  structural events. Before any reply can complete, the original code
+  admits 2,048 requests and rejects another 214 individual asks, as well as
+  refusing metadata groups. This is true outstanding work, not completed
+  reply inflation. It issues a root `QueryTree` for every structural event
+  and starts metadata groups for descendant windows too. The original
+  sizing argument counted client metadata, omitting these paths. The
+  admitted requests subsequently all complete and collect: 2,177 issued /
+  2,177 completed after callback ancestry requests, zero remaining, but the
+  overload latch remains set until normal ingest recovery.
+- **Collection lag (suspect a, with a correction):** the pump does **not**
+  impose a fixed number of reply collections per sweep; it scans every
+  tracked request after nonblocking transport polling. However, it releases
+  slots one at a time immediately before each callback. A deterministic
+  completion batch of 2,000 replies, whose first 1,000 callbacks each ask
+  for two requests, first rejects with **2,048 counted, only 97 truly
+  outstanding, and 1,951 completed but uncollected**. It rejects 952 asks
+  altogether. This workload needs at most 2,000 outstanding slots when
+  completed replies are collected before callbacks run.
+
+There is **no noncompletion leak (suspect c) in these reproductions**: all
+admitted requests drain. These traces establish both failure mechanisms in
+production paths; they do not identify the exact proportions in Raj's live
+failure or rule out other live-only defects.
+
+Pre-edit traces are in
+`wm/tests/.tmp/memory-step5-fix1-before-trace.jsonl`. The before/after
+collection experiment is in
+`wm/tests/.tmp/memory-step5-fix1-accounting-trace.jsonl`. Two regression
+assertions were also replayed with the original step-5 pump and refresh
+methods restored only in the test process: both fail (completed-batch
+fanout and decorated-ten-window admission). That replay retains the new
+root-query coalescing, demonstrating that coalescing alone is insufficient.
+See `wm/tests/.tmp/memory-step5-fix1-baseline-regressions.log`.
+
+### Fix and bounds
+
+The aggregate hard ceiling stays **2,048** and still rejects **before
+constructing/sending** an individual request. Its number was neither raised
+nor bypassed.
+
+1. Collect the entire ready reply/error batch and release its slots before
+   invoking any callback. Incomplete requests remain counted across both
+   connections. Callback order and existing optional/fatal X error handling
+   remain intact. The completion experiment now admits all 4,000 requests
+   over its two generations, with zero rejection and 2,000 new outstanding.
+2. Pace background metadata refreshes with an insertion-ordered queue of
+   **window IDs only**. At most `floor(2048 / (2 * 20)) = 51` groups are
+   active; each reserves its worst-case twenty-request footprint, at most
+   **1,020**, leaving at least **1,028** slots for foreground sampling,
+   capture, pointer and other requests. This is scheduling beneath the
+   existing ceiling, not a replacement or larger admission ceiling. The
+   per-request shared check still decides admission under mixed pressure.
+   Queue plus active IDs cannot exceed **2,048**; a larger distinct-window
+   flood sets the existing overload latch and stops growing bookkeeping.
+   Queued notifications coalesce, and their snapshots sample the latest
+   state when started. Active refreshes still retain one `again` sample.
+   Completion advances the queue fairly; queued IDs stay in `refreshing`,
+   so coverage cannot claim completion before their snapshots finish.
+3. Read root tree, geometry, focus and client/active properties once per
+   event batch when invalidated. All events still reach the input consumers
+   and revision/invalidation accounting. A 1,800-structural-event test now
+   emits one root query plus ten ancestry queries in its initial batch.
+4. Overload recovery clears queued IDs along with interrupted refreshes
+   after issued requests drain, then forces the existing watchdog resync.
+   A bounded queue cannot keep a genuine overflow permanently wedged.
+
+For the identical 630-event decorated batch, the fixed trace has **613 peak
+truly outstanding**, **3,381 issued / 3,381 completed**, **zero rejection**,
+zero pending and no overload latch after collection. More requests can
+complete successfully overall because refresh groups are no longer shed.
+See `wm/tests/.tmp/memory-step5-fix1-after-trace.jsonl`.
+
+`system.info.memory.pending_x_requests` now reports the **shared budget
+count**: admitted AsyncX requests awaiting completion collection across both
+connections, including any detached pump iteration, excluding the collected
+callback batch. Queued window IDs have not issued requests and are excluded.
+A reply that arrived since the last collection can remain counted until its
+next pump; this is a parent bookkeeping gauge, not an exact server-flight
+measurement. Unlike summing `pending` list lengths, the shared count stays
+truthful during callbacks. The schema and unit (request count) are unchanged;
+this refines the Step-0 list-length implementation documented above.
+The callback batch is itself bounded by the 2,048 requests admitted before
+collection and is released when that pump returns. Thus at most 2,048
+collected callback rows can coexist with the 2,048 newly admitted requests;
+the request ceiling is not a claim that only 2,048 Python reply objects or
+128 MiB of payload can ever be retained during callback dispatch.
+
+### Headless regression coverage
+
+`wm/tests/test_worker_w_memory_step5_fix1.py` adds nine tests covering the
+two failures, root query coalescing, queued snapshot freshness, shared
+stall admission, bounded internal backlog and resync, callback-time gauge
+accuracy, foreground action sampling during churn, and the Step-0-sized
+**200 windows / 300 acts / 40 popups** sequence. The sequence uses batches
+of ten, twenty synthetic decorations per client during window churn,
+observe RPCs submitted while metadata work is pending, real action engine
+waits with production dependency sampling, popup map/remove cycles, and
+late optional BadWindow replies after destruction. All observations settle,
+all acts succeed, no RPC returns `queue_full`, and all issued requests drain.
+Popup input/provider behavior is not simulated by this fake-X check.
+
+A stalled two-connection flood still admits exactly **2,048**, rejects the
+next ask without construction, stays bounded while stalled, then collects
+all replies when released. A 10,000-distinct-window internal refresh flood
+also sheds with bounded queued IDs and recovers through production ingest.
+**All original twenty-eight Step-5 tests remain unchanged and pass**,
+including shared detached-work accounting, rejected-refresh bookkeeping,
+RPC/act `queue_full` shapes and post-drain resynchronization.
+
+Targeted Step-5 plus fix-round run: **37 passed in 2.049 s**. Log:
+`wm/tests/.tmp/memory-step5-fix1-targeted.log`.
+
+Full headless suite: **982 tests in 128.172 s; 981 passed, 1 skipped**,
+exit 0, `OK (skipped=1)`. This is the prior 973 total plus nine new tests;
+the existing ptrace-dependent OCR strace check remains skipped. Log:
+`wm/tests/.tmp/memory-step5-fix1-full-suite.log`. The runner discovers only
+`test_worker_w*.py`, sets `PYTHONDONTWRITEBYTECODE=1`, and redirects temporary
+directories (including the W2 harness's repo-root request) into
+`wm/tests/.tmp`, as in Steps 0–5. Reproduce with
+`PYTHONDONTWRITEBYTECODE=1 python3 wm/tests/.tmp/memory-step5-fix1-run.py full`;
+run it without `full` for the 37-test targeted set. The trace helper runs
+headlessly with
+`PYTHONDONTWRITEBYTECODE=1 python3 wm/tests/memory_step5_fix1_trace.py`.
+
+The actual `fx_log`/Openbox/AT-SPI soak, live latency/PSS, popup input,
+24-hour and hardware gates remain **NOT RUN**. Raj should repeat the
+original Step-0 harness unchanged on a dedicated display 91–120 before
+calling the live regression closed.
