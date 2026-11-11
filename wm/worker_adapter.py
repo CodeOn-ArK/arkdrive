@@ -17,6 +17,8 @@ import sys
 import time
 import uuid
 
+from packs import REGISTRY
+
 MAX_FRAME = 256 * 1024
 
 
@@ -247,11 +249,7 @@ TOOLS = [
                                  cursor={'type': 'string', 'description': 'Opaque tree continuation from the previous page; retain its scope.'},
                                  region=dict(type='object', description='Rectangle {space,x,y,w,h} in a named coordinate space.'), full={'type': 'boolean'}))),
     dict(name='act', description='Execute 1–8 sequential steps, stopping on an unverified effect. Each step needs explicit strong expect, except move→pointer_at, focus_window→window_focused, close_window→window_absent, text→whole-field text_equals. Never replay uncertain input. The adapter supplies identity and the revision last shown. '
-         'Create-folder example (replace <file-manager> and <folder-list-ref> with the observed window handle and container ref): '
-         '{"steps":[{"id":"1","target":"<file-manager>","intent":{"kind":"key","keys":["Control_L","Shift_L","n"]},"expect":{"kind":"dialog_present","match":{"title_re":"[Cc]reate.*[Ff]older"},"bind":{"dialog":"dialog","entry":{"role":"text"}}}},'
-         '{"id":"2","target":{"from_step":"1","name":"entry"},"intent":{"kind":"text","text":"Reports","replace":true}},'
-         '{"id":"3","target":{"from_step":"1","name":"dialog"},"intent":{"kind":"key","keys":["Return"]},"expect":{"kind":"item_present","container":"<folder-list-ref>","name":"Reports"}}]}. '
-         'Step 1 verifies and binds the create dialog and its entry. Step 2 types into that bound entry; the worker supplies the strong whole-field text_equals expectation. Step 3 presses Return in the bound dialog and verifies the new item in the original folder listing. Bindings refer to verified earlier steps; do not invent refs for a dialog that has not appeared.',
+         'Bindings refer to verified earlier steps; do not invent refs for a dialog that has not appeared.',
          inputSchema=schema(dict(steps={'type': 'array', 'minItems': 1, 'maxItems': 8,
                                        'items': {'type': 'object', 'properties': {
                                            'intent': INTENT, 'expect': PREDICATE,
@@ -259,6 +257,8 @@ TOOLS = [
                                            'require': {'type': 'object', 'description': 'Optional guards: focus, modal, ref, window. Omission guards unchanged focus/modal.'},
                                            'timeout_ms': {'type': 'integer', 'minimum': 50, 'maximum': 5000}, 'id': {'type': 'string'}}, 'required': ['intent']}},
                                  deadline_ms={'type': 'integer', 'minimum': 1, 'maximum': 10000}), ['steps'])),
+    dict(name='use_skill', description=REGISTRY.description(),
+         inputSchema=schema(dict(name={'type': 'string'}, args={'type': 'object'}), ['name', 'args'])),
     dict(name='wait', description='Wait without input for a worker predicate; returns fresh state and revision.',
          inputSchema=schema(dict(expect=PREDICATE, timeout_ms={'type': 'integer', 'minimum': 1, 'maximum': 30000}), ['expect', 'timeout_ms'])),
     dict(name='done', description='Finish the task and release the driver lease. Report only verified success.',
@@ -275,6 +275,10 @@ class Adapter:
         self.ready = False
         self.finished = False
         self.recovery_seconds = recovery_seconds
+        self.active_pack = None
+        self._pack_windows = {}
+        self._pack_focus = None
+        self._pack_modal = []
 
     def close(self):
         self.rpc.close()
@@ -294,6 +298,10 @@ class Adapter:
                 time.sleep(.1)
         if self.state.get('generation') != meta['generation']:
             self.state.pop('rev', None)
+            self.active_pack = None
+            self._pack_windows.clear()
+            self._pack_focus = None
+            self._pack_modal = []
         self.state['generation'] = meta['generation']
         self.meta, self.ready = meta, False
 
@@ -324,6 +332,54 @@ class Adapter:
                 raise AdapterError('action_resolution_timeout')
             time.sleep(.05)
 
+    def update_pack(self, params, result):
+        """Publish only settled focus; scoped windows never stand in for focus."""
+        # Retain delivered deltas even while unsettled: the next settled
+        # result can be unchanged and omit all of those window records.
+        state = result.get('state', {})
+        if result.get('full') and params.get('scope', {}).get('kind', 'session') == 'session':
+            self._pack_windows.clear()
+        for handle in state.get('removed', []):
+            self._pack_windows.pop(handle, None)
+        for window in state.get('windows', []):
+            self._pack_windows[window['handle']] = window
+        if 'focus' in state:
+            self._pack_focus = state['focus']
+        if 'modal' in state:
+            self._pack_modal = state['modal']
+        if not result.get('settled') or result.get('resync_required'):
+            return
+        # Keep one owner through a modal sequence, per the governing plan.
+        if self._pack_modal:
+            return
+        focused = self._pack_windows.get(self._pack_focus, {})
+        self.active_pack = REGISTRY.for_class(focused.get('class', ''))
+
+    def use_skill(self, arguments):
+        name, args = arguments['name'], arguments['args']
+        if not isinstance(name, str) or not isinstance(args, dict):
+            raise AdapterError('invalid_arguments')
+        if name not in REGISTRY.skills:
+            raise AdapterError('unknown_skill: ' + name + '; loaded skills: ' + ', '.join(REGISTRY.skills))
+        pack, skill = REGISTRY.skills[name]
+        # A one-shot adapter has no cached focus. Every invocation rechecks it.
+        observation = self.call('observe', {'full': True, 'scope': {'kind': 'session'},
+                                            'channels': ['state']})
+        state = json.loads(observation['content'][0]['text'])
+        if self.active_pack is not pack:
+            active = self.active_pack.NAME if self.active_pack else 'none'
+            raise AdapterError('inactive_skill_pack: ' + pack.NAME + '; active pack: ' + active)
+        if not state.get('settled') or state.get('resync_required'):
+            raise AdapterError('observe_required')
+        # A previous interrupted invocation must be recovered, never mistaken for
+        # this invocation's mutation (nor followed by another mutation).
+        if self.state.get('pending'):
+            recovered = json.loads(self.call('act', {'steps': []})['content'][0]['text'])
+            result = dict(status=recovered['status'], detail='previous_action_resolved; skill not run')
+        else:
+            result = skill['run'](self, args)
+        return dict(content=[dict(type='text', text=encoded(result).decode())], isError=False)
+
     def call(self, name, arguments):
         check_kill()
         if self.finished:
@@ -344,6 +400,8 @@ class Adapter:
                     for field in ('risk', 'allow_stale_pixels'):
                         if field in step:
                             raise AdapterError(f'{field} is not settable through this tool; resend the batch without it.')
+        if name == 'use_skill':
+            return self.use_skill(arguments)
         clear_pending = False
         if name == 'act' and self.state.get('pending'):
             result = self.resolve()
@@ -357,6 +415,7 @@ class Adapter:
                 params['since_rev'] = None if arguments.get('full') else since
                 result = self.rpc.call('window.observe', self.leased(params))
                 self.ready |= session_ready(params, result)
+                self.update_pack(params, result)
             elif name == 'act':
                 if since is None:
                     raise AdapterError('observe_required')
@@ -367,6 +426,7 @@ class Adapter:
                     handshake = {'since_rev': None, 'channels': ['state']}
                     result = self.rpc.call('window.observe', self.leased(handshake))
                     self.ready = session_ready(handshake, result)
+                    self.update_pack(handshake, result)
                     if not self.ready:
                         raise AdapterError('observe_required')
                 pending = dict(action_id='a-' + uuid.uuid4().hex, generation=self.meta['generation'])
@@ -413,6 +473,9 @@ class Adapter:
                 # Return the original receipt/advice even if reconciliation fails.
         rendered = render_observe(result) if name == 'observe' else result
         content = [{'type': 'text', 'text': encoded(rendered).decode()}]
+        if name == 'observe' and self.active_pack is not None:
+            content.append(dict(type='text', text='[pack: ' + self.active_pack.NAME + ']\n' +
+                                self.active_pack.PLAYBOOK + '\n[/pack]'))
         if self.images == 'inline':
             for frame in frame_refs(result):
                 content.append(dict(type='image', mimeType='image/png', data=base64.b64encode(Path(frame['path']).read_bytes()).decode()))
