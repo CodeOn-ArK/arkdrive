@@ -20,6 +20,8 @@ from worker_act import ActError
 
 TILE = 64
 QUOTA = 200 * 1024 * 1024
+FRAME_LIMIT = 4096
+IDENTITY_LIMIT = 4096
 
 
 def intersect(a, b):
@@ -127,12 +129,33 @@ class Shadow:
 
 
 class Frames:
-    def __init__(self, directory, quota=QUOTA):
+    def __init__(self, directory, quota=QUOTA, file_limit=FRAME_LIMIT, identity_limit=IDENTITY_LIMIT):
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.quota, self.issued = quota, {}
+        self.file_limit, self.identity_limit = file_limit, identity_limit
+        # Interrupted writes are never evidence. Cleanup precedes restoration
+        # and quota enforcement, which must first load durable receipt pins.
+        for path in self.directory.glob('*.tmp'):
+            if path.is_file():
+                path.unlink()
+        # A restart has no issuance history: preserve the established
+        # (mtime, filename) fallback, before all new issues. Thereafter a file's
+        # sequence lives independently of the bounded transform cache.
+        files = sorted((p for p in self.directory.glob('*.png') if p.is_file()),
+                       key=lambda p: (p.stat().st_mtime_ns, p.name))
+        self.file_sequence = {p.name: i for i, p in enumerate(files)}
+        self.next_sequence = len(files)
         self.pins = set()
+        self.observations = {}
         self.receipts = deque(maxlen=50)
+
+    def pin_observation(self, lease, frames):
+        for frame in frames:
+            self.observations.setdefault(lease, deque(maxlen=2)).append(Path(frame['path']).name)
+
+    def release_lease(self, lease):
+        self.observations.pop(lease, None)
 
     @staticmethod
     def references(value):
@@ -167,32 +190,38 @@ class Frames:
             self.receipts.append(self.references(row['receipt']))
         self.evict()
 
-    def evict(self, extra=0, protect=()):
+    def evict(self, extra=0, protect=(), extra_files=0):
         pinned = set(protect).union(self.pins, *self.receipts)
-        # issued preserves insertion order; shared files keep their first issue.
-        sequence = {}
-        for index, frame in enumerate(self.issued.values()):
-            sequence.setdefault(Path(frame['path']).name, index)
+        pinned.update(name for frames in self.observations.values() for name in frames)
+        # Shared files keep their first issue even after every corresponding
+        # identity has left RAM. Looking up/reissuing a transform never reorders.
+        sequence = self.file_sequence
         # Files surviving a restart predate current issues. Only their unknown
         # insertion order falls back to mtime (then filename for stable ties).
-        files = sorted(self.directory.glob('*.png'),
+        files = sorted((p for p in self.directory.glob('*.png') if p.is_file()),
                        key=lambda p: (1, sequence[p.name], p.name) if p.name in sequence
                        else (0, p.stat().st_mtime_ns, p.name))
         total = sum(p.stat().st_size for p in files)
+        count = len(files)
         for path in files:
-            if total + extra <= self.quota:
+            if total + extra <= self.quota and count + extra_files <= self.file_limit:
                 break
             if path.name not in pinned:
                 total -= path.stat().st_size
+                count -= 1
                 path.unlink()
+                sequence.pop(path.name, None)
+        surviving = {p.name for p in files if p.exists()}
+        self.file_sequence = {k: v for k, v in sequence.items() if k in surviving}
         self.issued = {k: v for k, v in self.issued.items() if Path(v['path']).exists()}
-        if total + extra > self.quota:
+        if total + extra > self.quota or count + extra_files > self.file_limit:
             raise ActError('provider_degraded', 'frame_quota')
 
     def put(self, png, metadata):
         digest = hashlib.sha256(png).hexdigest()
         path = self.directory / (digest + '.png')
-        self.evict(0 if path.exists() else len(png), [path.name])
+        exists = path.exists()
+        self.evict(0 if exists else len(png), [path.name], extra_files=0 if exists else 1)
         if not path.exists():
             temp = path.with_suffix('.tmp')
             try:
@@ -202,11 +231,16 @@ class Frames:
                 temp.replace(path)
             finally:
                 temp.unlink(missing_ok=True)
+        if path.name not in self.file_sequence:
+            self.file_sequence[path.name] = self.next_sequence
+            self.next_sequence += 1
         # Identical PNGs at different desktop offsets share a file, never a
         # coordinate transform. Frame identity includes its issuance metadata.
         identity = hashlib.sha256(json.dumps([digest, metadata], sort_keys=True).encode()).hexdigest()
         value = dict(metadata, frame='f:' + identity, path=str(path))
         self.issued[value['frame']] = value
+        while len(self.issued) > self.identity_limit:
+            del self.issued[next(iter(self.issued))]
         return {k: value[k] for k in ('frame', 'path', 'rev', 'rect', 'scale', 'space')}
 
 

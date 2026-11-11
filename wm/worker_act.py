@@ -279,7 +279,7 @@ class Engine:
                 except ActError:
                     pass
             # New authority always needs a new attach and full observation.
-            self.w.lease = self.w.lease_peer = self.w.lease_until = None
+            self.w.release_lease()
             if current["state"] == "agent" and self.selftest_pending and self.selftest is None and not self.fence_reason:
                 self.start_selftest()
 

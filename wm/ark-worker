@@ -1718,7 +1718,12 @@ class Worker:
 
     def expire_lease(self):
         if self.lease_peer is None and self.lease_until is not None and time.monotonic() >= self.lease_until:
-            self.lease = self.lease_until = None
+            self.release_lease()
+
+    def release_lease(self):
+        if getattr(self, 'pixels', None):
+            self.pixels.frames.release_lease(self.lease)
+        self.lease = self.lease_peer = self.lease_until = None
 
     def message(self, peer, payload):
         ident = None
@@ -1811,7 +1816,7 @@ class Worker:
                     self.act.lease_state[self.lease]["done"] = True
                 else:
                     self.journal.append("done", status=params["status"], summary=params["summary"])
-                self.lease = self.lease_peer = self.lease_until = None
+                self.release_lease()
                 result = {}
             else:
                 raise RPCError("method_not_found", code=-32601)
@@ -2081,6 +2086,10 @@ class Worker:
     def observed(self, peer, params, result):
         if getattr(self, "act", None):
             self.act.observed(peer, params, result)
+        token = getattr(self, 'lease', None)
+        if (getattr(self, 'pixels', None) and token and peer is self.lease_peer
+                and params.get('lease', token) == token):
+            self.pixels.frames.pin_observation(token, result.get('frames', []))
 
     def predicate(self, expect):
         if getattr(self, "act", None):
