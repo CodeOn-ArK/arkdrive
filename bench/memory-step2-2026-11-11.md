@@ -230,3 +230,14 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 wm/tests/memory_step0.py \
 
 Live GTK/libatspi behavior, PSS/latency, long soak and hardware gates remain
 **NOT RUN**. Changes are confined to `wm/` and this new bench note.
+
+## Verifier addendum (Raj, 2026-11-11)
+
+Suite on ArK2: OK (921 tests at build). Live check with the step-0
+harness on a fresh xvfb session (--windows 200 --acts 5 --popups 2):
+window_churn atspi_apps delta is 0 (the step-0 baseline was +200,
+1:1 with churn) - parent and child app records now return to
+baseline when apps exit. removed_windows still grows +200; that is
+step 3's scope (the tombstone floor), not a step-2 regression.
+
+Committed 71e2af7.
