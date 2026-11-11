@@ -802,6 +802,11 @@ class Provider:
 
     def predicate_window(self, p):
         window = p.get('window')
+        within = p.get('within')
+        if window is None and within == 'modal':
+            window = next(iter(self.w.cache.modal), None)
+        if window is None and any(w['handle'] == within for w in self.w.cache.windows.values()):
+            window = within
         identity = p.get('ref', p.get('container', p.get('within')))
         if window is None and isinstance(identity, str):
             window = next((h for h, snap in self.cache.windows.items() if identity in snap['nodes']), None)
@@ -810,6 +815,10 @@ class Provider:
     def evaluate(self, p):
         window = self.predicate_window(p)
         subject = p.get('ref', p.get('selector'))
+        if subject is None and p['kind'] in ('node_present', 'node_absent'):
+            match = p.get('match', {k: p[k] for k in ('name', 'role') if k in p})
+            if match:
+                subject = dict(provider='atspi', **match)
         if p['kind'] == 'node_absent' and isinstance(subject, str):
             owner = self.cache.ref_windows.get(subject)
             if self.cache.unmapped(subject) or (owner is not None and not any(
@@ -819,6 +828,8 @@ class Provider:
                 return True
         item_query = subject is None and p['kind'].startswith('item_')
         container = p.get('container', p.get('within'))
+        if 'container' not in p and container in (window, 'modal'):
+            container = None
         if item_query:
             try:
                 root = self.resolve(window, container)

@@ -149,7 +149,7 @@ def render_receipt(receipt):
     result['reason'] = short(result['reason'])
     result['rev'] = receipt.get('rev', {}).get('final')
     result['steps'] = [dict(id=s['id'], effect={k: short(s['effect'][k]) for k in
-                         ('status', 'predicate_class', 'expect_source') if k in s['effect']},
+                         ('status', 'predicate_class', 'expect_source', 'assurance', 'fallback_from') if k in s['effect']},
                          route=short(s.get('route')), reason=short(s.get('reason')))
                        for s in receipt.get('steps', [])[:8]]
     frames = frame_refs(receipt)
@@ -207,6 +207,7 @@ AT = dict(type='object', description='Exactly one of {ref:"n12"}, {point:{space,
 PREDICATE = dict(type='object', description='Strong worker predicate. State match uses title/title_re/class/type; tree match uses role/name/name_re. text_equals uses ref or match plus value. item_present/absent uses container and name. Composite all/any has of:[2–4 non-composite predicates]. reaction is not proof and is rejected.',
                 properties=dict(kind={'type': 'string'}, match={'type': 'object'}, window={'type': ['string', 'object']},
                                 ref={'type': 'string'}, value={}, within={'type': 'string'}, state={'type': 'string'},
+                                text={'type': 'string'}, re={'type': 'string'}, region={'type': 'object'},
                                 container={}, name={'type': 'string'}, point=POINT, bind={'type': 'object'},
                                 of={'type': 'array', 'items': {'type': 'object'}}), required=['kind'])
 INTENT = dict(type='object', description='One intent. key sends one chord as keysyms, e.g. ["Control_L","Shift_L","n"] or ["F2"], never "Ctrl+n". text uses text/replace/via. click/move/scroll use at. invoke uses ref/action. focus_window/close_window use window.',

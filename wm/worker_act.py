@@ -25,6 +25,12 @@ class TreePending(ActError):
         super().__init__("provider_degraded")
 
 
+class OCRPending(ActError):
+    """A read-only OCR flight may be awaited inside the caller's deadline."""
+    def __init__(self):
+        super().__init__('provider_degraded')
+
+
 MODIFIERS = {"ctrl": "Control_L", "control": "Control_L", "shift": "Shift_L",
              "alt": "Alt_L", "super": "Super_L"}
 MODS = {"Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Super_L", "Super_R"}
@@ -117,6 +123,16 @@ def predicate_schema(p, nested=False):
         if "selector" in p:
             from worker_tree import selector_schema
             selector_schema(p["selector"])
+        if k in ('ocr_text', 'ocr_text_present', 'ocr_text_absent'):
+            if 'text' in p and (not isinstance(p['text'], str) or not p['text']):
+                raise ActError('invalid_expectation')
+            if 're' in p:
+                if 'text' in p or not isinstance(p['re'], str) or not p['re'] or len(p['re']) > 512:
+                    raise ActError('invalid_expectation')
+                try:
+                    re.compile(p['re'])
+                except re.error:
+                    raise ActError('invalid_expectation')
         if k == "node_state" and (p.get("state") not in
                 ("selected", "checked", "expanded", "focused", "enabled", "editable", "disabled") or
                 "value" in p and type(p["value"]) is not bool):
@@ -432,7 +448,8 @@ class Engine:
     def effect(status, p, evidence=None):
         k = p.get("kind") if p else None
         return {"status": status, "predicate": p, "evidence": evidence or [],
-                "assurance": "none" if status != "verified" else "position" if k == "pointer_at" else "application_state"}
+                "assurance": "none" if status != "verified" else "position" if k == "pointer_at" else
+                "visual_state" if any(e.get('kind') == 'ocr' for e in evidence or []) else "application_state"}
 
     def submit(self, peer, ident, params):
         p, h = self.normalise(params)
@@ -595,6 +612,8 @@ class Engine:
         if "point" in raw:
             closed(raw, ("point",))
             raw = raw["point"]
+        if 'text' in raw:
+            return self.text_point(raw, base)
         if contains_ref(raw) or "text" in raw:
             raise ActError("provider_degraded")
         closed(raw, ("space", "x", "y", "at_rev"), ("x", "y"))
@@ -617,6 +636,44 @@ class Engine:
             raise ActError("invalid_request")
         return {"x": x, "y": y}
 
+    def text_point(self, raw, base=None):
+        closed(raw, ('text', 'nth', 'within'), ('text',))
+        text = string(raw['text'])
+        if 'nth' in raw:
+            integer(raw['nth'], 0, 2**31-1)
+        handle = raw.get('within', self.w.cache.focus)
+        win = self.window(handle)
+        if win is None:
+            raise ActError('target_not_found')
+        tree, ocr = getattr(self.w, 'tree', None), getattr(self.w, 'ocr', None)
+        matches = []
+        if tree and tree.healthy(handle):
+            snap = tree.snapshot(handle, completed=True)
+            matches = [dict(text=n['name'], box=n['bounds'], ref=n['ref'])
+                       for n in snap['nodes'].values() if n.get('name') == text and
+                       n.get('showing', True) and n.get('visible', True)]
+        if not matches and ocr:
+            lines = ocr.read(handle)
+            if lines is None:
+                if ocr.state != 'down':
+                    raise OCRPending()
+                raise ActError('provider_degraded')
+            matches = [line for line in lines if text in line['text']]
+        nth = raw.get('nth', 0)
+        if not matches or ('nth' not in raw and len(matches) > 1) or nth >= len(matches):
+            raise ActError('target_not_found', dict(candidates=matches[:5]))
+        x, y, width, height = matches[nth]['box']
+        if tree and matches[nth].get('ref') and 'disabled' in tree.cache.windows[handle]['nodes'][matches[nth]['ref']].get('states', []):
+            raise ActError('precondition_failed')
+        g = win['geometry']
+        right, bottom = min(x+width, g['x']+g['w']), min(y+height, g['y']+g['h'])
+        x, y = max(x, g['x']), max(y, g['y'])
+        if right <= x or bottom <= y:
+            raise ActError('target_not_found')
+        if base is not None and self.w.cache.facets.get('tree['+handle+']', 1) > base and tree and matches[nth].get('ref'):
+            raise ActError('stale_rev', 'tree_changed')
+        return self.point(dict(x=x+(right-x)//2, y=y+(bottom-y)//2), base)
+
     def resolve(self, s, base=None):
         target, intent = s.get("target"), s["intent"]
         tree = getattr(self.w, "tree", None)
@@ -631,6 +688,12 @@ class Engine:
             raise ActError("target_not_found")
         at = intent.get("from") if intent["kind"] == "drag" else intent.get("at")
         at = at or ((target or {}).get("point") if isinstance(target, dict) else None)
+        if isinstance(at, dict) and 'text' in at and 'within' not in at and handle:
+            at = dict(at, within=handle)
+        if isinstance(at, dict) and 'text' in at and at.get('within'):
+            if handle and handle != at['within']:
+                raise ActError('invalid_request')
+            handle = at['within']
         point = self.point(at, base) if at is not None else None
         if semantic:
             if not isinstance(target, dict):
@@ -689,6 +752,10 @@ class Engine:
             for value in (s.get("target"), s["intent"].get("at"), s["intent"].get("from")):
                 if isinstance(value, dict):
                     raw = value.get("point", value)
+                    if 'text' in raw:
+                        fresh = self.point(dict(raw, within=raw.get('within', handle)), base)
+                        if fresh != point:
+                            raise ActError('stale_rev', 'text_target_changed')
                     if "at_rev" in raw:
                         integer(raw["at_rev"], 1, cache.rev)
                         if handle is not None and cache.facets.get("geometry[" + handle + "]", 1) > raw["at_rev"]:
@@ -757,7 +824,35 @@ class Engine:
                  (v.get("is_modal") or (v.get("transient_for") and v["type"] == "dialog"))}
         return windows, focus["handle"] if focus else None, modal
 
+    def effective_predicate(self, p):
+        """Only name presence/absence has an OCR equivalent. Never infer refs."""
+        if p['kind'] in ('all', 'any'):
+            return dict(p, of=[self.effective_predicate(v) for v in p['of']])
+        tree, ocr = getattr(self.w, 'tree', None), getattr(self.w, 'ocr', None)
+        if not tree or not ocr or p['kind'] not in ('node_present', 'node_absent') or 'ref' in p:
+            return p
+        window = p.get('window') or (p.get('within') if p.get('within') != 'modal' else
+                                    next(iter(self.w.cache.modal), None)) or tree.predicate_window(p)
+        if tree.readiness(window) != 'degraded':
+            return p
+        match = p.get('selector', p.get('match', {'name': p['name']} if 'name' in p else {}))
+        if (not isinstance(match, dict) or set(match)-{'provider', 'name'} or not isinstance(match.get('name'), str) or not match['name'] or
+                p.get('role') or p.get('container') or
+                p.get('within') and p['within'] != 'modal' and not any(
+                    w['mapped'] and w['handle'] == p['within'] for w in self.w.cache.windows.values())):
+            return p
+        return dict(kind='ocr_text_absent' if p['kind'] == 'node_absent' else 'ocr_text_present',
+                    text=match['name'], window=window)
+
+    def evaluated_effect(self, status, p, sampled=False):
+        effective = self.effective_predicate(p) if p else p
+        effect = self.effect(status, effective, self.evidence(effective, sampled) if status == 'verified' and effective else [])
+        if effective != p:
+            effect['fallback_from'] = 'tree'
+        return effect
+
     def evaluate(self, p, sampled=False):
+        p = self.effective_predicate(p)
         k = p["kind"]
         if k in ("all", "any"):
             results = [self.evaluate(v, sampled) for v in p["of"]]
@@ -765,6 +860,8 @@ class Engine:
                 return False if False in results else None if None in results else True
             return True if True in results else None if None in results else False
         tree = getattr(self.w, "tree", None)
+        if k in ('ocr_text', 'ocr_text_present', 'ocr_text_absent') and getattr(self.w, 'ocr', None):
+            return self.w.ocr.evaluate(p)
         if tree and k in ("node_present", "node_absent", "text_equals", "text_contains", "node_state", "item_present", "item_absent", "scroll_value"):
             return tree.evaluate(p)
         if tree and k == "focus_is" and "ref" in p:
@@ -1462,6 +1559,9 @@ class Engine:
         return focus_ok and all(names(h, True) for h in new_modal - old_modal) and all(names(h, False) for h in removed)
 
     def evidence(self, p, sampled=False):
+        p = self.effective_predicate(p)
+        if predicate_class(p) == 'ocr' and getattr(self.w, 'ocr', None):
+            return self.w.ocr.evidence(p)
         if predicate_class(p) == "composite":
             return [e for leaf in leaves(p) if self.evaluate(leaf, sampled) is True
                     for e in self.evidence(leaf, sampled)]
@@ -1474,14 +1574,21 @@ class Engine:
                  "comparison": comparison}]
 
     def tree_expectation(self, p):
-        return any(predicate_class(leaf) == "tree" or
+        p = self.effective_predicate(p)
+        return any((predicate_class(leaf) == 'tree' or
+                    predicate_class(leaf) == 'ocr' and getattr(self.w, 'ocr', None) is not None) or
                    (leaf["kind"] == "focus_is" and "ref" in leaf) or
                    (leaf["kind"].startswith("dialog_") and leaf.get("role")) for leaf in leaves(p))
 
     def tree_undecided(self, p):
+        p = self.effective_predicate(p)
+        ocr = getattr(self.w, 'ocr', None)
+        ocr_wait = any(predicate_class(leaf) == 'ocr' for leaf in leaves(p))
+        if ocr_wait and (ocr is None or ocr.state == 'down'):
+            return False
         tree = getattr(self.w, "tree", None)
         if tree is None:
-            return False
+            return ocr_wait and ocr.flight is not None
         windows = []
         for leaf in leaves(p):
             if predicate_class(leaf) == "tree" or (leaf["kind"] == "focus_is" and "ref" in leaf):
@@ -1491,7 +1598,7 @@ class Engine:
                                if win["mapped"] and self.matches(win, leaf.get("match", {})) and
                                (not leaf.get("window") or win["handle"] == leaf["window"]) and
                                (win.get("is_modal") or win.get("transient_for") or win["type"] == "dialog"))
-        return bool(windows) and all(tree.can_wait(h) for h in windows)
+        return (bool(windows) or ocr_wait) and all(tree.can_wait(h) for h in windows) and (not ocr_wait or ocr.flight is not None)
 
     def verify(self, a, r, p, until):
         final = False
@@ -1625,6 +1732,10 @@ class Engine:
                 if not self.w.tree.can_wait(exc.window):
                     raise ActError("provider_degraded") from exc
                 waiting = True
+            except OCRPending:
+                if not getattr(self.w, 'ocr', None) or self.w.ocr.state == 'down':
+                    raise ActError('provider_degraded')
+                waiting = True
             yield
 
     def run(self, a):
@@ -1700,7 +1811,7 @@ class Engine:
                                 expect.get("value") == s["intent"]["text"]):
                             r.update(disposition="satisfied_without_dispatch", reason="precondition_already_satisfied")
                             r["rev"]["verified"] = self.w.cache.rev
-                            r["effect"] = self.effect("verified", expect, self.evidence(expect))
+                            r["effect"] = self.evaluated_effect('verified', expect)
                         else:
                             raise ActError("invalid_expectation", "precondition_already_satisfied")
                     else:
@@ -1720,9 +1831,13 @@ class Engine:
                             yield from self.dispatch(a, s, r, handle, point)
                             outcome, reason = yield from self.verify(a, r, expect, min(a["deadline"], self.clock() + s["timeout_ms"] / 1000))
                         r["disposition"] = "executed" if r["attempts"] or k == "wait" else "failed"
-                        r["effect"] = self.effect(outcome, expect, self.evidence(expect, a.get("verification_sampled", False)) if outcome == "verified" else [])
+                        r["effect"] = self.evaluated_effect(outcome, expect, a.get('verification_sampled', False))
                         r["reason"] = reason
                         r["timing_ms"]["verify"] = (self.clock() - verify_started) * 1000
+                    effective = self.effective_predicate(expect)
+                    if effective != expect:
+                        r['effect'].update(predicate=effective, fallback_from='tree')
+                    r['predicate_class'] = predicate_class(effective)
                     r["effect"].update(predicate_class=r["predicate_class"], expect_source=r["expect_source"])
                     r["focus"]["after"], r["modal"]["after"] = self.w.cache.focus, list(self.w.cache.modal)
                     if a["preempted"]:
@@ -1750,10 +1865,10 @@ class Engine:
                             outcome, _ = yield from self.verify(a, r, r["expect"], until)
                         else:
                             outcome = "unknown"
-                        r["effect"] = self.effect(outcome, r["expect"])
+                        r["effect"] = self.evaluated_effect(outcome, r["expect"])
                         r["disposition"] = "executed"
                     else:
-                        r["effect"] = self.effect("not_observed", r["expect"])
+                        r["effect"] = self.evaluated_effect('not_observed', r['expect'])
                     stop_reason = exc.reason
                     break
                 finally:
@@ -1844,6 +1959,8 @@ class Engine:
                                          "rev": self.w.cache.rev})
         for s in steps:
             s.pop("windows_before", None)
+            if s['effect'].get('fallback_from') == 'tree':
+                s['predicate_class'] = predicate_class(s['effect']['predicate'])
             s["effect"].update(predicate_class=s["predicate_class"], expect_source=s["expect_source"])
             if s["disposition"] != "unexecuted":
                 self.w.counters[s["effect"]["status"]] += 1

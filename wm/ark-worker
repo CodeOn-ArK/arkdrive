@@ -35,12 +35,13 @@ import Xlib
 
 WM = Path(__file__).resolve().parent
 sys.path.insert(0, str(WM))
-from worker_act import ActError, Engine, canonical, leaves, predicate_schema, recover_receipt
+from worker_act import ActError, OCRPending, Engine, canonical, leaves, predicate_schema, recover_receipt
 from worker_xtest import XTestTransport
 from worker_evdev import EvdevTransport
 from input_protocol import control_store
 from worker_pixels import Pixels, Shadow, intersect, bbox
 from worker_tree import Provider as TreeProvider
+from worker_ocr import Provider as OCRProvider
 # Discovery of sessiond STATE uses the account database, never inherited HOME.
 STATE = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/ark-sessiond"
 PAGE = struct.Struct("<4sI16sQIIQ16s")
@@ -1118,6 +1119,7 @@ class Worker:
         self.act = None
         self.pixels = None
         self.tree = None
+        self.ocr = None
         self.resync_baseline = None
         self.setup_action_profile()
         self.journal = Journal(state / "acts" / (generation + ".jsonl"), self.sid, generation)
@@ -1171,6 +1173,9 @@ class Worker:
         else:
             for name in ("atspi", "tree"):
                 result[name].update(state="down", reason="provider_unavailable")
+        if getattr(self, 'ocr', None):
+            result['ocr'] = self.ocr.health()
+            result['fallback_available'] = ['state', 'ocr', 'pixels', 'keyboard']
         return result
 
     def settle_pixels(self):
@@ -1258,7 +1263,8 @@ class Worker:
                          "reason": None if getattr(self, "tree", None) and self.tree.ready and all(
                           self.tree.status(w["handle"]) in ("usable", "empty")
                           for w in self.cache.windows.values() if w["mapped"]) else "provider_degraded"},
-                "ocr": {"complete": False, "reason": "not_implemented"},
+                "ocr": self.ocr.coverage() if getattr(self, 'ocr', None) else
+                       {"complete": False, "reason": "not_implemented"},
                 "pixels": {"complete": bool(getattr(self, "pixels", None) and not self.pixels.failure
                                                and not self.pixels.pending and not self.pixels.dirty),
                            "reason": self.pixels.failure if getattr(self, "pixels", None) else "not_implemented"}}
@@ -1656,7 +1662,7 @@ class Worker:
             raise RPCError("invalid_params")
         return time.monotonic() + ms / 1000
 
-    def observation(self, params):
+    def observation(self, params, wait_ocr=False):
         if not self.settle_pixels():
             raise ActError("provider_degraded", "capture_pending")
         channels = params.get("channels", ["auto"])
@@ -1691,10 +1697,6 @@ class Worker:
                             delta["windows"].append(dict(window=win["handle"], tiles=changed,
                                 bbox=bbox(intersect(pixels.rects[t], region) for t in changed)))
                     result["pixels_changed"] = delta
-            # Explicit pixels requests yield at most one frame, even if cached.
-            if "pixels" in channels and not result["unchanged"]:
-                result["frames"] = [pixels.frame(rect, wins, params.get("scale"))]
-                result["channels_used"].append("pixels")
         cursor = params.get("cursor")
         if tree_requested and tree_window and (cursor is not None or any(
                 w["handle"] == tree_window and w["mapped"] for w in self.cache.windows.values())):
@@ -1722,13 +1724,38 @@ class Worker:
                         if any(w["handle"] == tree_window and w["mapped"] for w in self.cache.windows.values()):
                             result["providers"]["atspi"]["apps"][tree.app(tree.window(tree_window))].update(
                                 state="degraded", reason=exc.detail)
-                        if pixels and channels == ["auto"]:
+                        if pixels and channels == ["auto"] and not getattr(self, 'ocr', None):
                             result["frames"] = [pixels.frame(rect, wins, params.get("scale"))]
                             result["channels_used"].append("pixels")
-            elif pixels and channels == ["auto"] and not result["unchanged"]:
+            elif pixels and channels == ["auto"] and not result["unchanged"] and not getattr(self, 'ocr', None):
                 result["frames"] = [pixels.frame(rect, wins, params.get("scale"))]
                 result["channels_used"].append("pixels")
-        if any(c == "ocr" or c == "tree" and tree is None or c == "pixels" and pixels is None for c in channels):
+        ocr = getattr(self, 'ocr', None)
+        blind = False
+        if ocr and pixels and not result['unchanged']:
+            handle = tree_window or (tree.target(scope) if tree else None)
+            if not handle:
+                handle = next((win['handle'] for win in wins if win['mapped'] and win['handle'] == self.cache.focus),
+                              next((win['handle'] for win in wins if win['mapped']), None))
+            tree_usable = bool(tree and handle and tree.status(handle) == 'usable' and
+                               result.get('tree', {}).get('status') != 'degraded')
+            if handle and ('ocr' in channels or any(c in ('auto', 'tree') for c in channels) and not tree_usable):
+                lines = ocr.read(handle, rect)
+                if lines is None and wait_ocr and ocr.state != 'down':
+                    raise OCRPending()
+                if lines is not None:
+                    result['ocr'] = dict(window=handle, lines=lines)
+                    result['channels_used'].append('ocr')
+                    result['coverage']['ocr'] = ocr.coverage()
+                else:
+                    result['providers']['ocr'].update(state='degraded' if ocr.state != 'down' else 'down',
+                                                      reason=ocr.reason or 'observation_deadline')
+                blind = not tree_usable and (lines is None or len(lines) < 3)
+        if pixels and not result['unchanged'] and ('pixels' in channels or blind):
+            result['frames'] = [pixels.frame(rect, wins, params.get('scale'))]
+            if 'pixels' not in result['channels_used']:
+                result['channels_used'].append('pixels')
+        if any(c == 'ocr' and ocr is None or c == "tree" and tree is None or c == "pixels" and pixels is None for c in channels):
             result.update(unchanged=None, resync_required=True)
         return result
 
@@ -1757,7 +1784,11 @@ class Worker:
         elif not self.covered() or not self.settle_pixels():
             peer.waits.append({"kind": "observe", "id": ident, "params": params, "deadline": deadline})
         else:
-            result = self.observation(params)
+            try:
+                result = self.observation(params, wait_ocr=True)
+            except OCRPending:
+                peer.waits.append(dict(kind='observe', id=ident, params=params, deadline=deadline))
+                return
             self.observed(peer, params, result)
             self.respond(peer, ident, result)
 
@@ -1822,7 +1853,8 @@ class Worker:
         if not isinstance(expect, dict):
             raise RPCError("invalid_params")
         satisfied = self.predicate(expect)
-        if (satisfied is True or (satisfied is None and self.covered())) and self.settle_pixels():
+        undecided = bool(getattr(self, 'act', None) and self.act.tree_undecided(expect))
+        if (satisfied is True or (satisfied is None and self.covered() and not undecided)) and self.settle_pixels():
             self.respond(peer, ident, self.wait_result(params, satisfied))
         elif len(peer.waits) >= 8:
             raise RPCError("queue_full")
@@ -1832,10 +1864,12 @@ class Worker:
     def wait_result(self, params, satisfied, timeout=False):
         if not self.settle_pixels():
             raise ActError("provider_degraded", "capture_pending")
-        return {"satisfied": satisfied, "rev": self.cache.rev,
-                "evidence": [{"kind": "state", "rev": self.cache.rev}] if satisfied else [],
+        result = {"satisfied": satisfied, "rev": self.cache.rev,
+                "evidence": (self.act.evidence(params.get('expect', params.get('predicate'))) if getattr(self, 'act', None) and
+                             params.get('expect', params.get('predicate')) else [{"kind": "state", "rev": self.cache.rev}]) if satisfied else [],
                 "state_delta": self.cache.observe({"kind": "session"}, params.get("since_rev"), self.covered()),
                 "reason": "provider_degraded" if satisfied is None else "timeout" if timeout else None}
+        return result
 
     def pending(self):
         for peer in list(self.peers):
@@ -1857,10 +1891,15 @@ class Worker:
                         if (not expired and item["params"].get("since_rev") is None and
                                 getattr(self, "tree", None) and self.tree.busy(item["params"])):
                             continue
-                        result = self.observation(item["params"])
+                        try:
+                            result = self.observation(item["params"], wait_ocr=not expired)
+                        except OCRPending:
+                            continue
                     else:
                         satisfied = self.predicate(item["params"].get("expect", item["params"].get("predicate")))
-                        if not expired and satisfied is not True and not (satisfied is None and self.covered()):
+                        undecided = bool(getattr(self, 'act', None) and self.act.tree_undecided(
+                            item['params'].get('expect', item['params'].get('predicate'))))
+                        if not expired and satisfied is not True and not (satisfied is None and self.covered() and not undecided):
                             continue
                         result = self.wait_result(item["params"], satisfied, expired)
                 except (RPCError, ActError) as exc:
@@ -1882,11 +1921,14 @@ class Worker:
         self.cache.commit(bool(events))
         if getattr(self, "tree", None):
             self.tree.tick()
+        if getattr(self, 'ocr', None):
+            self.ocr.tick()
 
     def run(self):
         failure = None
         try:
             self.tree = TreeProvider(self)
+            self.ocr = OCRProvider(self)
             self.x = XState(self)
             self.selector.register(self.x.ev.fileno(), selectors.EVENT_READ, "ev")
             self.selector.register(self.x.inp.fileno(), selectors.EVENT_READ, "inp")
@@ -2001,6 +2043,8 @@ class Worker:
         # already be broken on this path. Never report failed-start early.
         if getattr(self, "tree", None):
             self.tree.close()
+        if getattr(self, 'ocr', None):
+            self.ocr.close()
         if self.openbox:
             if self.openbox.poll() is None:
                 self.openbox.terminate()
