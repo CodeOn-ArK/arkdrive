@@ -51,7 +51,7 @@ def add_result(history, name, value, image=False):
 
 
 def estimate(history, tools):
-    return (len(a.encoded(history).decode()) + len(a.encoded(tools).decode())) / 3
+    return loop.estimated_prompt_tokens(history, tools)
 
 
 class ObserveRenderingCase(unittest.TestCase):
@@ -153,7 +153,7 @@ class HistoryCase(unittest.TestCase):
             add_result(history, name, {'rev': len(history), 'payload': 'x' * 1000}, image=True)
         return history
 
-    def test_tiny_budget_stubs_old_act_wait_and_protects_last_two_and_observes(self):
+    def test_tiny_budget_stubs_observes_too_and_protects_last_two_act_wait(self):
         history = self.budget_history()
         before = copy.deepcopy(history)
         loop.compact_history(history, a.TOOLS, 1)
@@ -162,9 +162,11 @@ class HistoryCase(unittest.TestCase):
         for index, ((result, name), (original, _)) in enumerate(zip(results, originals)):
             if index < len(results) - 2 and name in ('act', 'wait'):
                 self.assertEqual(result['content'], [dict(type='text', text='{"superseded":true}')])
+            elif name == 'observe':
+                self.assertEqual(shown(result), dict(rev=shown(original)['rev'], superseded=True))
             else:
                 self.assertEqual(result, original)
-        # No eligible content remains; an unattainable budget still sends as-is.
+        # No eligible content remains; run_loop must reject this request.
         after = a.encoded(history)
         loop.compact_history(history, a.TOOLS, 1)
         self.assertEqual(a.encoded(history), after)
@@ -211,11 +213,12 @@ class HistoryCase(unittest.TestCase):
 
     def test_frames_removed_before_delivery_are_not_counted_as_viewed(self):
         for names, budget, expected in [(('observe', 'observe'), 0, 1),
-                                        (('act', 'wait', 'act', 'wait'), 1, 2)]:
+                                        (('act', 'wait', 'act', 'wait'), 12000, 2)]:
             with self.subTest(names=names):
                 client = Mock()
                 client.start.return_value = a.TOOLS
-                client.tool.return_value = dict(content=[dict(type='text', text='{"rev":11}'),
+                client.tool.return_value = dict(content=[dict(type='text', text=json.dumps(
+                    dict(rev=11, payload='x'*10000 if budget else ''))),
                     dict(type='image', mimeType='image/png', data='eA==')])
                 provider = Mock()
                 provider.config = dict(provider='llama', images=True, token_budget=budget)
@@ -241,6 +244,8 @@ class HistoryCase(unittest.TestCase):
             else:
                 self.assertEqual(params['since_rev'], adapter.state['rev'])
                 result = observation(rev)
+                if method == 'window.observe':
+                    result['padding'] = 'x'*30000
             revisions.append(rev)
             return result
         adapter.rpc.call.side_effect = rpc
@@ -248,7 +253,7 @@ class HistoryCase(unittest.TestCase):
         client.start.return_value = a.TOOLS
         client.tool.side_effect = adapter.call
         provider = Mock()
-        provider.config = dict(provider='llama', images=False, token_budget=1)
+        provider.config = dict(provider='llama', images=False, token_budget=12000)
         names = iter(('observe', 'act', 'observe', 'wait', 'act', 'act', 'done'))
         def complete(tools, history):
             snapshots.append(copy.deepcopy(history))
@@ -261,13 +266,13 @@ class HistoryCase(unittest.TestCase):
         provider.complete.side_effect = complete
         with patch.object(loop, 'check_kill'), patch.object(a, 'check_kill'):
             summary = loop.run_loop(client, provider, 'Task')
-        self.assertEqual(summary['done'], dict(status='success', summary='Verified'))
+        self.assertEqual(summary['done'], dict(status='success', summary='Verified'), summary)
         self.assertEqual(len(set(actions)), 3)
         results = list(loop.tool_results(snapshots[-1]))
         self.assertEqual(shown(results[0][0]), {'rev': 11, 'superseded': True})
-        self.assertEqual(shown(results[1][0]), {'superseded': True})
-        self.assertEqual(shown(results[2][0])['rev'], 13)
-        self.assertEqual(shown(results[3][0]), {'superseded': True})
+        self.assertEqual(shown(results[1][0])['rev'], 12)
+        self.assertEqual(shown(results[2][0]), {'rev': 13, 'superseded': True})
+        self.assertEqual(shown(results[3][0])['rev'], 14)
         self.assertEqual([shown(message)['rev'] for message, _ in results[-2:]], [15, 16])
 
 

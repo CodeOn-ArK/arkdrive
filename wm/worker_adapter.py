@@ -190,6 +190,13 @@ def render_observe(observation):
     return result
 
 
+def session_ready(params, result):
+    """Match the worker's session observed-state admission gate."""
+    return bool(params.get('scope', {}).get('kind', 'session') == 'session'
+                and result.get('full') and result.get('settled')
+                and not result.get('resync_required'))
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         # Do not echo argv: a mistaken credential argument must not be logged.
@@ -224,6 +231,11 @@ TOOLS = [
     dict(name='observe', description='Read fresh session state/tree/pixels. Observe before acting; coordinates are desktop pixels. full resets the delta baseline. Tree pages/deltas retain worker budgets and cursor metadata. The adapter keeps your view current and reconciles automatically after uncertain acts; you do not need full:true for correctness.',
          inputSchema=schema(dict(scope=dict(type='object', properties=dict(kind={'type': 'string', 'enum': ['session', 'window', 'family']}, window={'type': 'string'})),
                                  channels={'type': 'array', 'items': {'type': 'string', 'enum': ['auto', 'state', 'tree', 'ocr', 'pixels']}},
+                                 budget=schema(dict(nodes={'type': 'integer', 'minimum': 0,
+                                                          'description': 'Tree page node limit (worker cap 200).'},
+                                                    bytes={'type': 'integer', 'minimum': 0,
+                                                           'description': 'Tree page JSON byte limit (worker cap 16384).'})),
+                                 cursor={'type': 'string', 'description': 'Opaque tree continuation from the previous page; retain its scope.'},
                                  region=dict(type='object', description='Rectangle {space,x,y,w,h} in a named coordinate space.'), full={'type': 'boolean'}))),
     dict(name='act', description='Execute 1–8 sequential steps, stopping on an unverified effect. Each step needs explicit strong expect, except move→pointer_at, focus_window→window_focused, close_window→window_absent, text→whole-field text_equals. Never replay uncertain input. The adapter supplies identity and the revision last shown. '
          'Create-folder example (replace <file-manager> and <folder-list-ref> with the observed window handle and container ref): '
@@ -335,7 +347,7 @@ class Adapter:
                 params = {k: v for k, v in arguments.items() if k != 'full'}
                 params['since_rev'] = None if arguments.get('full') else since
                 result = self.rpc.call('window.observe', self.leased(params))
-                self.ready |= bool(result.get('full') and result.get('settled') and not result.get('resync_required'))
+                self.ready |= session_ready(params, result)
             elif name == 'act':
                 if since is None:
                     raise AdapterError('observe_required')
@@ -343,8 +355,11 @@ class Adapter:
                     # New CUT/reconnected lease needs the worker's fresh-observation
                     # handshake. This private read never advances the model baseline;
                     # a newer handshake rev makes the worker reject the old base_rev.
-                    self.rpc.call('window.observe', self.leased({'since_rev': None, 'channels': ['state']}))
-                    self.ready = True
+                    handshake = {'since_rev': None, 'channels': ['state']}
+                    result = self.rpc.call('window.observe', self.leased(handshake))
+                    self.ready = session_ready(handshake, result)
+                    if not self.ready:
+                        raise AdapterError('observe_required')
                 pending = dict(action_id='a-' + uuid.uuid4().hex, generation=self.meta['generation'])
                 params = self.leased(dict(arguments, action_id=pending['action_id'], base_rev=since,
                                           control_epoch=self.meta['control_epoch']))

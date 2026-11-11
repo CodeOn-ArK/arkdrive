@@ -80,8 +80,12 @@ def provider_config(env=None):
         effort = 'medium'
     if provider in ('llama', 'anthropic'):
         effort = 'none'
+    # A bounded context must leave room for the requested completion. Keep
+    # the existing 4096 output cap when context budgeting is disabled.
+    completion_tokens = 1024 if token_budget else 4096
     return dict(provider=provider, server=server, model=model, key=key,
                 token_budget=token_budget, http_timeout=http_timeout,
+                completion_tokens=completion_tokens,
                 effort=effort, effort_fallback=effort_fallback,
                 images=provider in ('llama', 'openai', 'openrouter', 'anthropic'))
 
@@ -109,35 +113,57 @@ def supersede_observes(history):
     """After appending an observe, retain only its predecessors' revisions."""
     observes = [message for message, name in tool_results(history) if name == 'observe']
     for message in observes[:-1]:
-        rev = None
-        for block in message['content']:
-            if block['type'] != 'text':
-                continue
-            try:
-                value = json.loads(block['text'])
-            except ValueError:
-                continue
-            if isinstance(value, dict) and 'rev' in value:
-                rev = value['rev']
-                break
-        message['content'] = [dict(type='text', text=encoded(dict(rev=rev, superseded=True)).decode())]
+        stub_observe(message)
 
 
-def compact_history(history, tools, budget):
-    """Stub oldest act/wait content within the budget, protecting the last two.
+def stub_observe(message):
+    rev = None
+    for block in message['content']:
+        if block['type'] != 'text':
+            continue
+        try:
+            value = json.loads(block['text'])
+        except ValueError:
+            continue
+        if isinstance(value, dict) and 'rev' in value:
+            rev = value['rev']
+            break
+    message['content'] = [dict(type='text', text=encoded(dict(rev=rev, superseded=True)).decode())]
+
+
+def estimated_prompt_tokens(history, tools):
+    """Character-based estimate; not provider tokenizer/usage data."""
+    return math.ceil((len(encoded(history).decode()) + len(encoded(tools).decode())) / 3)
+
+
+def completion_reserve(config):
+    budget = config.get('token_budget', 7000 if config.get('provider') == 'llama' else 0)
+    return config.get('completion_tokens', 1024 if budget else 4096)
+
+
+def compact_history(history, tools, budget, reserve=0):
+    """Stub old act/wait content, then observes including the latest if needed.
 
     Adapter revision/identity/recovery state lives in ark-act, not history text.
     Calls and result envelopes stay intact so provider tool pairing is preserved.
+    Return the remaining prompt estimate; the caller must reject requests that
+    still cannot fit after reserving completion capacity.
     """
     if not budget:
-        return
-    tools_chars = len(encoded(tools).decode())
+        return estimated_prompt_tokens(history, tools)
     stub = [dict(type='text', text=encoded(dict(superseded=True)).decode())]
-    for message, name in list(tool_results(history))[:-2]:
-        if (len(encoded(history).decode()) + tools_chars) / 3 <= budget:
+    results = list(tool_results(history))
+    for message, name in results[:-2]:
+        if estimated_prompt_tokens(history, tools) + reserve <= budget:
             break
         if name in ('act', 'wait') and message['content'] != stub:
             message['content'] = list(stub)
+    for message, name in results:
+        if estimated_prompt_tokens(history, tools) + reserve <= budget:
+            break
+        if name == 'observe':
+            stub_observe(message)
+    return estimated_prompt_tokens(history, tools)
 
 
 def image_block(block, anthropic=False):
@@ -192,13 +218,14 @@ def request_body(config, tools, history):
                         expanded.append(dict(role='user', content=pending))
                         pending = []
         messages = expanded
-    body = dict(model=config['model'], messages=messages, max_tokens=4096, temperature=.1, top_p=1)
+    completion_tokens = completion_reserve(config)
+    body = dict(model=config['model'], messages=messages, max_tokens=completion_tokens, temperature=.1, top_p=1)
     if anthropic:
         body.update(system='\n'.join(system), tools=[dict(name=t['name'], description=t['description'], input_schema=t['inputSchema']) for t in tools])
     else:
         body.update(tools=[dict(type='function', function=dict(name=t['name'], description=t['description'], parameters=t['inputSchema'])) for t in tools], tool_choice='auto')
         if config['provider'] == 'llama':
-            body.update(n_predict=4096, cache_prompt=True, top_k=40, repeat_penalty=1.0)
+            body.update(n_predict=completion_tokens, cache_prompt=True, top_k=40, repeat_penalty=1.0)
         elif config['effort'] != 'none':
             body['reasoning_effort'] = config['effort']
     return body
@@ -335,6 +362,7 @@ class MCPClient:
 def run_loop(client, provider, task, max_turns=40):
     cap = min(max_turns, 40)
     summary = dict(turns_used=0, tool_calls_made=0, frames_viewed=0, token_usage={}, max_turns=cap,
+                   peak_estimated_prompt_tokens=0, completion_reserve_tokens=completion_reserve(provider.config),
                    done=None, reason=None, **effort_summary(provider.config))
     history = [dict(role='system', content=SYSTEM), dict(role='user', content=task)]
     pending_results = []
@@ -345,8 +373,13 @@ def run_loop(client, provider, task, max_turns=40):
         for turn in range(cap):
             check_kill()
             summary['turns_used'] = turn + 1
-            compact_history(history, tools, provider.config.get('token_budget',
-                            7000 if provider.config.get('provider') == 'llama' else 0))
+            budget = provider.config.get('token_budget',
+                         7000 if provider.config.get('provider') == 'llama' else 0)
+            estimate = compact_history(history, tools, budget, summary['completion_reserve_tokens'])
+            if budget and estimate + summary['completion_reserve_tokens'] > budget:
+                summary['reason'] = 'token_budget_exceeded'
+                break
+            summary['peak_estimated_prompt_tokens'] = max(summary['peak_estimated_prompt_tokens'], estimate)
             pending_frames = sum(b['type'] == 'image' for message in pending_results
                                  for b in message['content']) if provider.config['images'] else 0
             assistant, usage = provider.complete(tools, history)
@@ -409,6 +442,7 @@ def main():
         args = parser.parse_args()
     except AdapterError:
         print(encoded(dict(turns_used=0, tool_calls_made=0, frames_viewed=0, token_usage={}, done=None,
+                           peak_estimated_prompt_tokens=0, completion_reserve_tokens=0,
                            reason='invalid_arguments', effort='none')).decode())
         return 1
     client = None
@@ -422,6 +456,7 @@ def main():
         summary = run_loop(client, Provider(config), args.task, args.max_turns)
     except (AdapterError, OSError) as exc:
         summary = dict(turns_used=0, tool_calls_made=0, frames_viewed=0, token_usage={}, done=None,
+                       peak_estimated_prompt_tokens=0, completion_reserve_tokens=completion_reserve(config),
                        reason=exc.reason if isinstance(exc, AdapterError) else 'loop_start_failed',
                        **effort_summary(config))
     finally:

@@ -648,6 +648,14 @@ class Provider:
     def target(self, scope):
         if scope.get('kind', 'session') == 'session':
             return self.w.cache.focus
+        if scope.get('kind') == 'family':
+            # Re-resolve on every read: dialogs can map, close or take focus
+            # while an observe waits. Explicit window scopes retain their
+            # named target, including deliberate reads of unfocused windows.
+            focused = next((w for w in self.w.cache.selected(scope)
+                            if w['mapped'] and w['handle'] == self.w.cache.focus), None)
+            if focused:
+                return focused['handle']
         return scope.get('window', scope.get('handle'))
 
     def ensure(self, window, health=False):
