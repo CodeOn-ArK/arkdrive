@@ -391,3 +391,33 @@ skipped. Log: `wm/tests/.tmp/packs-thunar-fix6-full-suite.log`.
 **Raj's live skill gate re-run — NOT RUN.** No live session or display was
 opened or driven, including display `:0`. Nothing staged or committed.
 Existing unrelated checkout changes were preserved.
+
+## Raj verifier addendum — live skill gate, fix rounds 5 and 6 (Nov 11, 2026)
+
+Gate: ~/packs_skill_gate.py on ArK2 (slate -> xvfb session -> worker ->
+Thunar on a home seeded with alpha.txt + beta.txt; one-shot skill calls).
+
+Gate run 5 (after fix round 5, commit 8310814): pack note present;
+create_folder success/verified with the folder on disk (the batch
+outcome was unknown and the filesystem-oracle path from fix round 5
+decided it, exactly as designed); second create = collision;
+rename_notfound returned the real candidates; bogus skill errored
+correctly. rename FAILED with a raw invalid_params adapter error:
+fix round 5 had put the selection click inside the rename batch,
+making the timeout sum 11,000 ms, over the worker's 10,000 ms hard
+cap, so the batch was rejected before dispatch. Diagnosed from the
+cap rule plus the D1 batch arithmetic (the proven batch sums to
+9,000 ms).
+
+Gate run 6 (after fix round 6, commit a525a65; suite 1,056 OK
+verified by Raj on ArK2): FULL PASS. create success/verified, on
+disk; collision on repeat; rename success/verified with the on-disk
+swap confirmed (alpha.txt gone, alpha-renamed.txt present);
+rename_notfound candidates reflect the post-rename listing
+[packprobe, alpha-renamed.txt, beta.txt]; bogus skill error correct;
+pack note present.
+
+The Thunar pack is functionally complete: both skills verified live
+end to end, including the collision, not-found, ambiguity, and
+oracle-on-uncertainty paths. Remaining packs work: the measurement
+pilot (trimmed generalist vs pack) from COUNCIL-AGENTS-RECONCILED.md.
