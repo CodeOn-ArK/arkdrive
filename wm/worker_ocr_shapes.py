@@ -20,40 +20,63 @@ def templates():
     from PIL import Image
     lookup = defaultdict(lambda: defaultdict(list))
     spaces = {}
-    for face in ('Sans', 'Serif', 'Monospace'):
-        for size in range(10, 49):
-            font = (face, size)
-            for char in string.ascii_letters + string.digits + string.punctuation:
-                surface = cairo.ImageSurface(cairo.FORMAT_RGB24, size*3, size*3)
+    chars = string.ascii_letters + string.digits + string.punctuation
+    # Keep render configurations separate: one line must agree on the entire
+    # font (including hinting), rather than mixing per-glyph render variants.
+    for rendering in ('original', 'live-full'):
+        options = cairo.FontOptions()
+        if rendering != 'original':
+            options.set_antialias(cairo.ANTIALIAS_SUBPIXEL)
+            options.set_subpixel_order(cairo.SUBPIXEL_ORDER_RGB)
+            options.set_hint_style(cairo.HINT_STYLE_FULL)
+            options.set_hint_metrics(cairo.HINT_METRICS_ON)
+        for face in ('Sans', 'Serif', 'Monospace'):
+            for size in range(10, 49):
+                font = (face, size, rendering)
+                cell = size*2
+                origin, baseline = size//2, size*3//2
+                # One strip per font avoids thousands of surface allocations
+                # and RGB conversions on the first region's budget.
+                surface = cairo.ImageSurface(cairo.FORMAT_RGB24, cell*len(chars), cell)
                 ctx = cairo.Context(surface)
+                ctx.set_font_options(options)
                 ctx.set_source_rgb(1, 1, 1)
                 ctx.paint()
                 ctx.set_source_rgb(0, 0, 0)
                 ctx.select_font_face(face)
                 ctx.set_font_size(size)
-                ctx.move_to(size, size*2)
-                ctx.show_text(char)
+                for index, char in enumerate(chars):
+                    ctx.move_to(index*cell+origin, baseline)
+                    ctx.show_text(char)
                 surface.flush()
-                image = Image.frombytes('RGB', (size*3, size*3), bytes(surface.get_data()),
+                image = Image.frombytes('RGB', (surface.get_width(), cell), bytes(surface.get_data()),
                                         'raw', 'BGRX', surface.get_stride()).convert('L')
-                bounds = ink(image)
-                if bounds:
-                    glyph = image.crop(bounds).point(lambda p: 0 if p < 128 else 255)
-                    key = (glyph.size, glyph.tobytes())
-                    lookup[key][font].append((char, bounds[0]-size,
-                                              ctx.text_extents(char).x_advance,
-                                              bounds[1]-size*2))
+                image = image.point(lambda p: 255 if p < 128 else 0)
+                for index, char in enumerate(chars):
+                    crop = image.crop((index*cell, 0, (index+1)*cell, cell))
+                    bounds = crop.getbbox()
+                    if bounds:
+                        glyph = crop.crop(bounds)
+                        key = (glyph.size, glyph.tobytes())
+                        lookup[key][font].append((char, bounds[0]-origin,
+                                                  ctx.text_extents(char).x_advance,
+                                                  bounds[1]-baseline))
                 spaces[font] = ctx.text_extents(' ').x_advance
     return lookup, spaces
 
 
-def recognize(image, recognized):
+def recognize(image, recognized, diagnostics=None):
     """Return exact-font lines only; the gate uses recognized content shape."""
+    def record(state, reason=None, **detail):
+        if diagnostics is not None:
+            diagnostics.update(state=state, reason=reason, **detail)
     if not any(re.search(r'\b\w{1,4}\b|\d', line['text']) for line in recognized):
+        record('abstained', 'content_gate')
         return None
     image = image.point(lambda p: 0 if p < 128 else 255)
     bounds = ink(image)
     if bounds is None:
+        record('abstained', 'no_ink')
         return None
     lookup, spaces = templates()
     # Horizontal projection finds physical lines independently of PSM splits.
@@ -89,7 +112,7 @@ def recognize(image, recognized):
             crop = band.crop((left, 0, right+1, band.height))
             gb = ink(crop)
             crop = crop.crop(gb)
-            matches = lookup.get((crop.size, crop.tobytes()), {})
+            matches = lookup.get((crop.size, crop.point(lambda p: 255-p).tobytes()), {})
             candidates = set(matches) if candidates is None else candidates.intersection(matches)
             glyphs.append((left, right, top+gb[1], matches))
         decoded = set()
@@ -117,8 +140,13 @@ def recognize(image, recognized):
             else:
                 decoded.add(text)
         if len(decoded) != 1:
+            record('abstained', 'raster_miss' if not candidates else 'metrics_or_ambiguity',
+                   band=[top, bottom], glyphs=len(glyphs),
+                   unmatched=sum(not g[3] for g in glyphs),
+                   candidate_fonts=len(candidates or ()), decodings=sorted(decoded))
             return None
         text = decoded.pop()
         if any(c.isalnum() for c in text):
             result.append(dict(text=text, box=[bb[0], top, bb[2]-bb[0], bottom-top+1], conf=100.0))
+    record('engaged', lines=len(result))
     return result

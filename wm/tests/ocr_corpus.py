@@ -35,16 +35,32 @@ FACES = ('Sans', 'Serif', 'Monospace')
 SIZES = (14, 18, 24, 32)
 FIXTURE = (('ArkDrive canvas', 24, 52), ('Alpha 123', 24, 112),
            ('Bravo 456', 260, 172), ('Target: W0', 24, 232))
+RENDER_MODES = ('original', 'live-full', 'live-medium', 'live-slight')
 
 
-def render(commands, face='Sans', size=24, width=None, height=None):
+def font_options(mode):
+    options = cairo.FontOptions()
+    if mode != 'original':
+        options.set_antialias(cairo.ANTIALIAS_GRAY if mode == 'full-gray' else cairo.ANTIALIAS_SUBPIXEL)
+        options.set_subpixel_order(cairo.SUBPIXEL_ORDER_RGB)
+        options.set_hint_style({'live-full': cairo.HINT_STYLE_FULL,
+                                'live-medium': cairo.HINT_STYLE_MEDIUM,
+                                'live-slight': cairo.HINT_STYLE_SLIGHT,
+                                'full-gray': cairo.HINT_STYLE_FULL}[mode])
+        options.set_hint_metrics(cairo.HINT_METRICS_ON)
+    return options
+
+
+def render(commands, face='Sans', size=24, width=None, height=None, rendering='original'):
     probe = cairo.Context(cairo.ImageSurface(cairo.FORMAT_RGB24, 1, 1))
+    probe.set_font_options(font_options(rendering))
     probe.select_font_face(face)
     probe.set_font_size(size)
     width = width or int(max(x+probe.text_extents(t).x_advance for t, x, y in commands)+16)
     height = height or size+24
     surface = cairo.ImageSurface(cairo.FORMAT_RGB24, width, height)
     ctx = cairo.Context(surface)
+    ctx.set_font_options(font_options(rendering))
     ctx.set_source_rgb(1, 1, 1)
     ctx.paint()
     ctx.set_source_rgb(0, 0, 0)
@@ -61,19 +77,21 @@ def render(commands, face='Sans', size=24, width=None, height=None):
     return rgb, dict(x=0, y=0, w=width, h=height)
 
 
-def samples():
-    return [(f'{face}/{size}/{text}', text, *render(((text, 12, size+8),), face, size))
+def samples(rendering='original'):
+    return [(f'{face}/{size}/{text}', text,
+             *render(((text, 12, size+8),), face, size, rendering=rendering))
             for face in FACES for size in SIZES for text in TEXTS]
 
 
-def measure(backend, corpus, line_mode=None):
+def measure(backend, corpus, line_mode=None, rendering='original'):
     results, times = [], []
     for key, expected, rgb, rect in corpus:
         start = time.perf_counter()
         actual = '\n'.join(l['text'] for l in backend.read(rgb, rect, mode=line_mode))
         times.append((time.perf_counter()-start)*1000)
-        results.append(dict(key=key, expected=expected, actual=actual, exact=actual == expected))
-    rgb, rect = render(FIXTURE, width=560, height=280)
+        results.append(dict(key=key, expected=expected, actual=actual, exact=actual == expected,
+                            glyphs=getattr(backend, 'last_shapes', None)))
+    rgb, rect = render(FIXTURE, width=560, height=280, rendering=rendering)
     start = time.perf_counter()
     fixture = [l['text'] for l in backend.read(rgb, rect)]
     return dict(exact=sum(r['exact'] for r in results), total=len(results),
@@ -81,7 +99,66 @@ def measure(backend, corpus, line_mode=None):
                 median_ms=statistics.median(times), max_ms=max(times),
                 fixture_ms=(time.perf_counter()-start)*1000,
                 fixture=fixture, fixture_exact=fixture == [t for t, x, y in FIXTURE],
+                fixture_glyphs=getattr(backend, 'last_shapes', None),
                 results=results)
+
+
+def live_style_report(output, before=None):
+    """Full cross product in each mode; retain exact outputs and regressions."""
+    prior = json.loads(before.read_text()) if before else None
+    report = dict(cairo=cairo.cairo_version_string(), modes={})
+    old, adopted = Backend(shapes=False), Backend()
+    try:
+        for mode in RENDER_MODES:
+            corpus = samples(mode)
+            baseline = measure(old, corpus, rendering=mode)
+            current = measure(adopted, corpus, rendering=mode)
+            current['baseline_exact'] = baseline['exact']
+            current['regressions_base'] = [r['key'] for p, r in zip(baseline['results'], current['results'])
+                                            if p['exact'] and not r['exact']]
+            if prior:
+                assert [r['key'] for r in prior[mode]['results']] == [r['key'] for r in current['results']]
+                current['regressions_round1'] = [r['key'] for p, r in zip(prior[mode]['results'], current['results'])
+                                                 if p['exact'] and not r['exact']]
+            report['modes'][mode] = current
+            print(mode, current['exact'], '/', current['total'],
+                  'fixture', current['fixture'], 'median_ms', round(current['median_ms'], 2),
+                  'regressions', current.get('regressions_round1'), flush=True)
+            output.write_text(json.dumps(report, indent=2)+'\n')
+    finally:
+        old.close()
+        adopted.close()
+
+
+def raster_diagnosis():
+    """Ablate the hinted atlas and compare source glyphs at threshold 128."""
+    from PIL import Image
+    from unittest.mock import patch
+    from worker_ocr_shapes import templates, recognize
+    lookup, spaces = templates()
+    original = {key: {f: v for f, v in fonts.items() if f[2] == 'original'}
+                for key, fonts in lookup.items()}
+    original = {k: v for k, v in original.items() if v}
+    report = {}
+    for mode in RENDER_MODES + ('full-gray',):
+        rgb, rect = render(FIXTURE, width=560, height=280, rendering=mode)
+        image = Image.frombytes('RGB', (rect['w'], rect['h']), rgb).convert('L')
+        before, after = {}, {}
+        # Deliberately unrelated initial content opens the shape gate without
+        # supplying expected text or any candidate characters to the decoder.
+        with patch('worker_ocr_shapes.templates', return_value=(original, spaces)):
+            recognize(image, [dict(text='a1')], before)
+        recognize(image, [dict(text='a1')], after)
+        differences = []
+        for char in sorted(set(''.join(t for t, x, y in FIXTURE)) - {' '}):
+            rgb, rect = render(((char, 24, 48),), width=96, height=96, rendering=mode)
+            mask = Image.frombytes('RGB', (96, 96), rgb).convert('L').point(lambda p: 255 if p < 128 else 0)
+            glyph = mask.crop(mask.getbbox())
+            matching = original.get((glyph.size, glyph.tobytes()), {})
+            differences.append(dict(char=char, size=glyph.size,
+                                    original_exact=any(f[:2] == ('Sans', 24) for f in matching)))
+        report[mode] = dict(round1=before, round2=after, rasters=differences)
+    return report
 
 
 def main():
@@ -89,9 +166,18 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--best', type=Path, default=Path(__file__).parent/'fixtures/tessdata_best')
     parser.add_argument('--shapes-only', action='store_true')
+    parser.add_argument('--live-style', action='store_true', help='compare all four rendering modes')
+    parser.add_argument('--diagnose-rasters', action='store_true', help='record exact raster/atlas mismatch diagnostics')
+    parser.add_argument('--before', type=Path, help='round-1 live-style outputs for regression scoring')
     parser.add_argument('--allow-missing-best', action='store_true',
                         help='exploratory local sweep; comparison remains incomplete')
     args = parser.parse_args()
+    if args.diagnose_rasters:
+        args.output.write_text(json.dumps(raster_diagnosis(), indent=2)+'\n')
+        return 0
+    if args.live_style:
+        live_style_report(args.output, args.before)
+        return 0
     corpus = samples()
     report = json.loads(args.output.read_text()) if args.shapes_only else dict(
         cairo=cairo.cairo_version_string(), sources=len(TEXTS), samples=len(corpus), candidates={})

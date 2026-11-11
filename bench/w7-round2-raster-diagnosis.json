@@ -1,0 +1,1220 @@
+{
+  "original": {
+    "round1": {
+      "state": "engaged",
+      "reason": null,
+      "lines": 4
+    },
+    "round2": {
+      "state": "engaged",
+      "reason": null,
+      "lines": 4
+    },
+    "rasters": [
+      {
+        "char": "0",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "1",
+        "size": [
+          7,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "2",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "3",
+        "size": [
+          11,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "4",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "5",
+        "size": [
+          10,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "6",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": ":",
+        "size": [
+          3,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "A",
+        "size": [
+          15,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "B",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "D",
+        "size": [
+          14,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "T",
+        "size": [
+          13,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "W",
+        "size": [
+          22,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "a",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "c",
+        "size": [
+          10,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "e",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "g",
+        "size": [
+          12,
+          19
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "h",
+        "size": [
+          11,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "i",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "k",
+        "size": [
+          10,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "l",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "n",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "o",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "p",
+        "size": [
+          11,
+          19
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "r",
+        "size": [
+          7,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "s",
+        "size": [
+          9,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "t",
+        "size": [
+          7,
+          16
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "v",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      }
+    ]
+  },
+  "live-full": {
+    "round1": {
+      "state": "abstained",
+      "reason": "raster_miss",
+      "band": [
+        34,
+        51
+      ],
+      "glyphs": 14,
+      "unmatched": 3,
+      "candidate_fonts": 0,
+      "decodings": []
+    },
+    "round2": {
+      "state": "engaged",
+      "reason": null,
+      "lines": 4
+    },
+    "rasters": [
+      {
+        "char": "0",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "1",
+        "size": [
+          7,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "2",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "3",
+        "size": [
+          11,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "4",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "5",
+        "size": [
+          10,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "6",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": ":",
+        "size": [
+          3,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "A",
+        "size": [
+          15,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "B",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "D",
+        "size": [
+          14,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "T",
+        "size": [
+          13,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "W",
+        "size": [
+          22,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "a",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "c",
+        "size": [
+          10,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "e",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "g",
+        "size": [
+          12,
+          19
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "h",
+        "size": [
+          11,
+          18
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "i",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "k",
+        "size": [
+          10,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "l",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "n",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "o",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "p",
+        "size": [
+          11,
+          19
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "r",
+        "size": [
+          7,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "s",
+        "size": [
+          9,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "t",
+        "size": [
+          7,
+          16
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "v",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      }
+    ]
+  },
+  "live-medium": {
+    "round1": {
+      "state": "abstained",
+      "reason": "raster_miss",
+      "band": [
+        34,
+        51
+      ],
+      "glyphs": 14,
+      "unmatched": 3,
+      "candidate_fonts": 0,
+      "decodings": []
+    },
+    "round2": {
+      "state": "engaged",
+      "reason": null,
+      "lines": 4
+    },
+    "rasters": [
+      {
+        "char": "0",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "1",
+        "size": [
+          7,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "2",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "3",
+        "size": [
+          11,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "4",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "5",
+        "size": [
+          10,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "6",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": ":",
+        "size": [
+          3,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "A",
+        "size": [
+          15,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "B",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "D",
+        "size": [
+          14,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "T",
+        "size": [
+          13,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "W",
+        "size": [
+          22,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "a",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "c",
+        "size": [
+          10,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "e",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "g",
+        "size": [
+          12,
+          19
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "h",
+        "size": [
+          11,
+          18
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "i",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "k",
+        "size": [
+          10,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "l",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "n",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "o",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "p",
+        "size": [
+          11,
+          19
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "r",
+        "size": [
+          7,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "s",
+        "size": [
+          9,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "t",
+        "size": [
+          7,
+          16
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "v",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      }
+    ]
+  },
+  "live-slight": {
+    "round1": {
+      "state": "engaged",
+      "reason": null,
+      "lines": 4
+    },
+    "round2": {
+      "state": "engaged",
+      "reason": null,
+      "lines": 4
+    },
+    "rasters": [
+      {
+        "char": "0",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "1",
+        "size": [
+          7,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "2",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "3",
+        "size": [
+          11,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "4",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "5",
+        "size": [
+          10,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "6",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": ":",
+        "size": [
+          3,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "A",
+        "size": [
+          15,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "B",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "D",
+        "size": [
+          14,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "T",
+        "size": [
+          13,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "W",
+        "size": [
+          22,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "a",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "c",
+        "size": [
+          10,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "e",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "g",
+        "size": [
+          12,
+          19
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "h",
+        "size": [
+          11,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "i",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "k",
+        "size": [
+          10,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "l",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "n",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "o",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "p",
+        "size": [
+          11,
+          19
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "r",
+        "size": [
+          7,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "s",
+        "size": [
+          9,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "t",
+        "size": [
+          7,
+          16
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "v",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      }
+    ]
+  },
+  "full-gray": {
+    "round1": {
+      "state": "abstained",
+      "reason": "raster_miss",
+      "band": [
+        34,
+        51
+      ],
+      "glyphs": 14,
+      "unmatched": 10,
+      "candidate_fonts": 0,
+      "decodings": []
+    },
+    "round2": {
+      "state": "abstained",
+      "reason": "raster_miss",
+      "band": [
+        34,
+        51
+      ],
+      "glyphs": 14,
+      "unmatched": 9,
+      "candidate_fonts": 0,
+      "decodings": []
+    },
+    "rasters": [
+      {
+        "char": "0",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "1",
+        "size": [
+          7,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "2",
+        "size": [
+          11,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "3",
+        "size": [
+          11,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "4",
+        "size": [
+          13,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "5",
+        "size": [
+          10,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "6",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": ":",
+        "size": [
+          3,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "A",
+        "size": [
+          15,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "B",
+        "size": [
+          12,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "D",
+        "size": [
+          14,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "T",
+        "size": [
+          13,
+          17
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "W",
+        "size": [
+          22,
+          17
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "a",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "c",
+        "size": [
+          10,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "e",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "g",
+        "size": [
+          12,
+          19
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "h",
+        "size": [
+          11,
+          18
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "i",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "k",
+        "size": [
+          10,
+          18
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "l",
+        "size": [
+          2,
+          18
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "n",
+        "size": [
+          11,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "o",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "p",
+        "size": [
+          11,
+          19
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "r",
+        "size": [
+          7,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "s",
+        "size": [
+          9,
+          13
+        ],
+        "original_exact": false
+      },
+      {
+        "char": "t",
+        "size": [
+          7,
+          16
+        ],
+        "original_exact": true
+      },
+      {
+        "char": "v",
+        "size": [
+          12,
+          13
+        ],
+        "original_exact": false
+      }
+    ]
+  }
+}

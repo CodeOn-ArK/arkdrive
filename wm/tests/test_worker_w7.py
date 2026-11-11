@@ -168,6 +168,83 @@ class CacheAndIncremental(OCRHarness):
 
 
 class PredicatesAndObservations(OCRHarness):
+    def test_window_health_degradation_overrides_usable_publication(self):
+        # Contract defence for a split publication/health view. The real
+        # provider sequence below currently reports degraded in BOTH views;
+        # this test does not claim that it reproduces Raj's live failure.
+        self.degrade_tree()
+        providers = self.w.providers()
+        with patch.object(self.w, 'providers', return_value=providers), \
+                patch.object(self.p, 'status', return_value='usable'), \
+                patch.object(self.p, 'readiness', return_value='healthy'):
+            params = dict(scope=dict(kind='window', window=self.handle),
+                          channels=['auto'], since_rev=self.w.cache.rev)
+            with self.assertRaises(OCRPending):
+                self.w.observation(params, wait_ocr=True)
+            self.answer_ocr([line()])
+            result = self.w.observation(params, wait_ocr=True)
+            self.assertFalse(result['unchanged'])
+            self.assertEqual(result['ocr']['lines'], [line()])
+            self.w.observed(self.peer, params, result)
+            with patch.object(self.o, 'read', side_effect=AssertionError('already served')):
+                self.assertTrue(self.w.observation(params)['unchanged'])
+
+    def test_never_published_hang_after_session_health_polling(self):
+        # Rebuild the first window as a mapped but never-published app. The
+        # second app is healthy and focused throughout the session polls.
+        self.p.cache.prune(self.handle)
+        self.p.probes.pop(self.handle)
+        self.p.layouts.pop(self.handle)
+        self.later()
+        healthy = self.w.cache.handle(11)
+        self.w.x.window_pids[11] = 202
+        self.w.cache.set('focus', healthy)
+        self.w.cache.commit()
+        self.p.tick()
+        hung_task = next(t for t in self.p.pending.values() if t['window'] == self.handle)
+        healthy_task = next(t for t in self.p.pending.values() if t['window'] == healthy)
+        self.answer(self.raw, task=healthy_task)
+        self.assertNotIn(self.handle, self.p.cache.windows)
+        self.assertEqual(self.p.status(self.handle), 'pending')
+        self.assertEqual(self.p.readiness(self.handle), 'healthy')
+        for _ in range(3):
+            params = dict(channels=['auto'], since_rev=self.w.cache.rev)
+            result = self.w.observation(params)
+            self.w.observed(self.peer, params, result)
+            self.assertNotIn('ocr', result)
+        # worker_atspi translates a failed binding call into this error. Its
+        # measured round trip exceeds 1 s, outside the 2 s map grace period.
+        self.now += 3.1
+        self.answer(error='application_unreachable', task=hung_task,
+                    max_call_ms=1100, breach=True)
+        for _ in range(3):
+            params = dict(channels=['auto'], since_rev=self.w.cache.rev)
+            result = self.w.observation(params)
+            self.w.observed(self.peer, params, result)
+            app = result['providers']['atspi']['apps']['101']
+            self.assertEqual(app['state'], 'degraded')
+            self.assertEqual(app['window_status'][self.handle]['state'], 'degraded')
+            self.assertEqual(app['reason'], 'application_unreachable')
+            self.assertNotIn('ocr', result)
+        self.assertNotIn(self.handle, self.p.probes)
+        self.assertEqual(self.p.status(self.handle), 'degraded')
+        self.assertEqual(self.p.readiness(self.handle), 'degraded')
+        params = dict(scope=dict(kind='window', window=self.handle),
+                      channels=['auto'], since_rev=self.w.cache.rev)
+        with self.assertRaises(OCRPending):
+            self.w.observation(params, wait_ocr=True)
+        lines = [line('Add to list'), line('Clicks: 0', y=170), line('Alpha', y=210)]
+        self.answer_ocr(lines)
+        result = self.w.observation(params, wait_ocr=True)
+        self.assertEqual(result['tree']['status'], 'degraded')
+        self.assertEqual(result['ocr']['lines'], lines)
+        self.w.observed(self.peer, params, result)
+        with patch.object(self.o, 'read', side_effect=AssertionError('unchanged OCR')):
+            self.assertTrue(self.w.observation(params)['unchanged'])
+            healthy_params = dict(scope=dict(kind='window', window=healthy),
+                                  channels=['auto'], since_rev=self.w.cache.rev)
+            self.assertTrue(self.w.observation(healthy_params)['unchanged'])
+
     def test_presence_absence_regex_and_exact_legacy_kind(self):
         self.warm([line('Alpha 123')])
         for p, expected in [(dict(kind='ocr_text_present', text='Alpha'), True),
