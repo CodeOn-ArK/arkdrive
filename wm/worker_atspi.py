@@ -54,6 +54,8 @@ class Backend:
         self.a = atspi
         self.objects, self.bus_apps, self.versions = {}, {}, {}
         self.window_versions, self.event_windows, self.window_keys = {}, {}, {}
+        self.window_apps, self.app_windows = {}, {}
+        self.window_buses, self.bus_windows = {}, {}
         self.lock = threading.Lock()
         self.local = threading.local()
         self.activity = {}
@@ -168,10 +170,10 @@ class Backend:
         if self.global_due is None:
             self.global_due = time.monotonic() + EVENT_DEBOUNCE
 
-    def flush_events(self, results):
+    def flush_events(self, results, force=False):
         # Called by the existing IPC pump, on the binding owner. Keep a fixed
         # first-event deadline: a continuous flood cannot postpone delivery.
-        if self.global_due is not None and time.monotonic() >= self.global_due:
+        if self.global_due is not None and (force or time.monotonic() >= self.global_due):
             results.put(dict(event='changed', global_invalidation=True))
             self.global_due = None
 
@@ -190,6 +192,46 @@ class Backend:
     def remember_window(self, window, key):
         self.event_windows.setdefault(key, set()).add(window)
         self.window_keys.setdefault(window, set()).add(key)
+
+    def forget_window(self, task):
+        """Owner-only job: retire a window after all earlier jobs have returned.
+
+        The dispatcher queues this even when the app has a flight. No binding
+        calls or nested event dispatch occur here, so a partial/failed walk's
+        memberships are retired just like a successfully published walk's.
+        """
+        window = task['window']
+        self.objects.pop(window, None)
+        self.window_versions.pop(window, None)
+        for key in self.window_keys.pop(window, ()):
+            windows = self.event_windows[key]
+            windows.discard(window)
+            if not windows:
+                del self.event_windows[key]
+        for bus in self.window_buses.pop(window, ()):
+            windows = self.bus_windows[bus]
+            windows.discard(window)
+            if not windows:
+                del self.bus_windows[bus]
+                self.bus_apps.pop(bus, None)
+        app = self.window_apps.pop(window, task['app'])
+        windows = self.app_windows.get(app)
+        if windows is not None:
+            windows.discard(window)
+            if not windows:
+                del self.app_windows[app]
+        if app not in self.app_windows:
+            self.versions.pop(app, None)
+        return dict(forgotten=True)
+
+    def memory_counters(self):
+        return dict(windows=len(self.objects), objects=sum(len(v[0]) for v in self.objects.values()),
+                    bus_apps=len(self.bus_apps), versions=len(self.versions),
+                    window_versions=len(self.window_versions), event_keys=len(self.event_windows),
+                    event_memberships=sum(map(len, self.event_windows.values())),
+                    window_keys=len(self.window_keys), window_apps=len(self.window_apps),
+                    app_windows=len(self.app_windows), window_buses=len(self.window_buses),
+                    bus_windows=len(self.bus_windows))
 
     def freshness(self, window, app):
         # Only fallback events advance the app epoch; known sibling events
@@ -248,6 +290,10 @@ class Backend:
 
     def _snapshot(self, task):
         window, app_id = task['window'], task['app']
+        if window in self.window_apps and self.window_apps[window] != app_id:
+            self.forget_window(task)
+        self.window_apps[window] = app_id
+        self.app_windows.setdefault(app_id, set()).add(window)
         version = self.freshness(window, app_id)
         deadline = time.monotonic() + 2
         def check():
@@ -274,6 +320,8 @@ class Backend:
         bus = str(self.read(self.read(frame, 'app'), 'bus_name'))
         with self.lock:
             self.bus_apps[bus] = task['app']
+            self.window_buses.setdefault(window, set()).add(bus)
+            self.bus_windows.setdefault(bus, set()).add(window)
         objects, seen = {}, set()
         count = 0
         deadline = time.monotonic() + 2
@@ -488,6 +536,11 @@ def main(fd):
                 traceback.print_exc()
             result = dict(id=task['id'], error=reason)
         result.update(app=task['app'], **backend.timing())
+        # A coalesced invalidation may have arrived reentrantly during the
+        # job, with a deadline still in the future. Deliver it BEFORE the
+        # result, including forget acknowledgements, irrespective of debounce.
+        backend.flush_events(results, force=True)
+        result['memory'] = backend.memory_counters()
         results.put(result)
         backend.local.job = None
 
@@ -497,12 +550,18 @@ def main(fd):
                 if task['op'] == 'ping':
                     wire.send(dict(event='pong'))
                     continue
-                if task['app'] in flights:
+                if task['op'] != 'forget_window' and any(
+                        f['app'] == task['app'] for f in flights.values()):
                     # The parent permits one flight per app; this is our
                     # transport/bookkeeping fault, not app unreachability.
-                    wire.send(dict(id=task['id'], error='worker_fault'))
+                    backend.flush_events(results, force=True)
+                    results.put(dict(id=task['id'], app=task['app'], error='worker_fault',
+                                     memory=backend.memory_counters()))
                     continue
-                flights[task['app']] = dict(id=task['id'], started=time.monotonic(), reported=0)
+                # Forget is sequenced on the same owner queue, including when
+                # a preceding walk/job for this app is queued or in progress.
+                flights[task['id']] = dict(id=task['id'], app=task['app'],
+                                          started=time.monotonic(), reported=0)
                 jobs.append(task)
             # This GLib source is the only job dispatcher. Run one complete
             # job per turn so queued events and IPC get a turn between jobs.
@@ -518,7 +577,7 @@ def main(fd):
                 except queue.Empty:
                     break
                 if 'id' in result:
-                    flights.pop(result['app'], None)
+                    flights.pop(result['id'], None)
                     with backend.activity_lock:
                         backend.activity.pop(result['id'], None)
                 wire.send(result)

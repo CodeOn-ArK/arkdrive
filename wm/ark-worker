@@ -1407,6 +1407,7 @@ class Worker:
                 "frame_identities": len(frames.issued) if frames else 0,
                 "frame_files": frame_files,
                 "atspi_apps": len(tree.apps) if tree else 0,
+                "atspi_child": getattr(tree, 'child_memory', None) if tree else None,
                 "journal_bytes": journal_bytes,
                 "pending_x_requests": (sum(len(channel.pending) for channel in
                                            (getattr(x, 'ax', None), getattr(x, 'inp_ax', None))
@@ -2159,6 +2160,8 @@ class Worker:
         self.x.events(events)
         self.poll_control()
         self.cache.commit(bool(events))
+        if getattr(self, 'act', None):
+            self.act.prune_windows()
         if getattr(self, "tree", None):
             self.tree.tick()
         if getattr(self, 'ocr', None):

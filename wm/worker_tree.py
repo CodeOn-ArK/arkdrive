@@ -167,12 +167,14 @@ class TreeCache:
         old = self.windows.get(window, {})
         previous = old.get('nodes', {})
         by_key = {n['key']: n for n in previous.values()}
-        nodes, lines, enumeration = {}, [], []
+        nodes, lines = {}, []
+        enumeration = None if raw.get('rendered_only') else []
         def enumerate_raw(n, parent=None):
             enumeration.append(dict(key=n['key'], parent=parent, name=n.get('name', ''), role=n['role']))
             for child in n.get('children', []):
                 enumerate_raw(child, n['key'])
-        enumerate_raw(raw)
+        if enumeration is not None:
+            enumerate_raw(raw)
         def visit(n, depth, parent=None):
             key = n['key']
             prior = by_key.get(key)
@@ -193,14 +195,17 @@ class TreeCache:
             visit(root, 0)
         changed = nodes != previous or lines != old.get('lines')
         if not changed:
-            old['enumeration'] = enumeration
+            if enumeration is None:
+                old.pop('enumeration', None)
+            else:
+                old['enumeration'] = enumeration
             return False
         # One previous revision permits exact deltas; older readers get full.
-        self.windows[window] = dict(nodes=nodes, lines=lines, enumeration=enumeration, rev=rev,
-                                    previous=old, epoch=self.epoch)
-        # Avoid an unbounded linked history.
-        if old:
-            old.pop('previous', None)
+        predecessor = dict(refs=list(previous), lines=old['lines'], rev=old['rev']) if old else None
+        self.windows[window] = dict(nodes=nodes, lines=lines, rev=rev,
+                                    previous=predecessor, epoch=self.epoch)
+        if enumeration is not None:
+            self.windows[window]['enumeration'] = enumeration
         return True
 
     def page(self, window, since=None, cursor=None, budget=None, dirty=False):
@@ -226,7 +231,7 @@ class TreeCache:
             raise ActError('provider_degraded', 'tree_page_budget')
         old = snap.get('previous')
         if cursor is None and since is not None and old and old['rev'] == since < snap['rev']:
-            before = {v['ref']: s for v, s in zip(old['nodes'].values(), old['lines'])}
+            before = dict(zip(old['refs'], old['lines']))
             current = {v['ref']: s for v, s in zip(snap['nodes'].values(), snap['lines'])}
             delta = dict(added=[s for r, s in current.items() if r not in before],
                          changed=[s for r, s in current.items() if r in before and s != before[r]],
@@ -265,7 +270,10 @@ class TreeCache:
         for s in lines:
             ref = s.lstrip().split(' ', 1)[0]
             n = snap['nodes'][ref]
-            self.identities[ref] = (n['key'], n['role'], n.get('name', ''))
+            # Frozen cursors survive unmap, but their refs no longer do. A
+            # continuation must not resurrect identities pruned on close.
+            if ref in self.ref_windows:
+                self.identities[ref] = (n['key'], n['role'], n.get('name', ''))
 
     def find(self, window, subject, missing=False):
         nodes = self.windows.get(window, {}).get('nodes', {})
@@ -340,6 +348,8 @@ class Provider:
         self.window_serials = {}
         self.first_map, self.dirty_due, self.retry, self.consumers = {}, {}, {}, {}
         self.raw, self.inventories = {}, {}
+        self.window_apps, self.forgetting = {}, {}
+        self.child_memory = None
         self.wire = self.child = None
         self.seq, self.ready, self.restart_at, self.restart_attempt = 0, False, 0, 0
         self.call_progress = False
@@ -404,6 +414,9 @@ class Provider:
         self.retry.clear()
         self.raw.clear()
         self.inventories.clear()
+        self.window_apps.clear()
+        self.forgetting.clear()
+        self.child_memory = None
         self.dirty.clear()
         for task in self.pending.values():
             task['done'], task['error'] = True, 'provider_degraded'
@@ -528,7 +541,8 @@ class Provider:
         if not self.ready or now < self.next_probe(window):
             return None
         app = self.app(self.window(window))
-        current = next((t for t in self.pending.values() if t['app'] == app), None)
+        current = next((t for t in self.pending.values()
+                        if t['app'] == app and t['op'] != 'forget_window'), None)
         return current if current is not None else self.request(
             'probe' if window in self.cache.windows and window not in self.dirty else 'snapshot', window)
 
@@ -538,7 +552,8 @@ class Provider:
         The job remains supervised if its owner is blocked. A late reply cannot
         revalidate the stale snapshot; normal scheduled snapshot recovery can.
         """
-        if task is None or task.get('observe_failed'):
+        if task is None or task.get('observe_failed') or task.get('window_retired') or not any(
+                w['handle'] == task['window'] and w['mapped'] for w in self.w.cache.windows.values()):
             return True
         now = self.clock()
         limit = min(task['started'] + 1, deadline if deadline is not None else float('inf'))
@@ -568,6 +583,7 @@ class Provider:
         breaker = self.apps.setdefault(app, Breaker())
         now = self.clock()
         self.first_map.setdefault(window, now)
+        self.window_apps[window] = app
         if not self.ready or (breaker.state == 'degraded' and now < breaker.due):
             return None
         if any(v['app'] == app for v in self.pending.values()):
@@ -583,6 +599,50 @@ class Provider:
         self.wire.send(dict(id=self.seq, op=op, app=app, window=window, pid=pid, title=win.get('title', ''),
                             rect=win['geometry'], window_events=True, **fields))
         return task
+
+    def prune_closed(self):
+        live = {w['handle'] for w in self.w.cache.windows.values() if w['mapped']}
+        for task in self.pending.values():
+            if task['op'] != 'forget_window' and task['window'] not in live:
+                # Unmap/remap can reuse a handle. Its old flight must stay
+                # retired even if the window maps again before the reply.
+                task['window_retired'] = True
+        act = getattr(self.w, 'act', None)
+        if act:
+            act.prune_windows(live)
+        for h in set(self.window_apps) - live:
+            self.forgetting[h] = self.window_apps.pop(h)
+        tracked = (set(self.cache.windows) | set(self.probes) | set(self.layouts) |
+                   set(self.modals) | set(self.unavailable) | set(self.first_map) |
+                   set(self.window_serials) | set(self.raw) | set(self.consumers) |
+                   set(self.dirty) | set(self.dirty_due) | set(self.retry) |
+                   {k[0] for k in self.inventories})
+        for h in tracked - live:
+            self.cache.prune(h)
+            for mapping in (self.probes, self.layouts, self.modals, self.first_map,
+                            self.dirty_due, self.retry, self.raw, self.window_serials, self.consumers):
+                mapping.pop(h, None)
+            self.unavailable.discard(h)
+            self.dirty.discard(h)
+            self.inventories = {k: v for k, v in self.inventories.items() if k[0] != h}
+        # Retain app health/epochs until all flights (including forget) drain.
+        # No process-liveness inference is needed: an app with no live windows
+        # has no cached state to supervise, even if its process stays alive.
+        apps = ({self.app(w) for w in self.w.cache.windows.values() if w['mapped']} |
+                {t['app'] for t in self.pending.values()} | set(self.forgetting.values()))
+        for mapping in (self.apps, self.serials, self.samples):
+            for app in set(mapping) - apps:
+                mapping.pop(app, None)
+
+    def send_forgets(self):
+        if not self.ready:
+            return
+        for h, app in list(self.forgetting.items()):
+            self.seq += 1
+            self.pending[self.seq] = dict(id=self.seq, app=app, window=h, op='forget_window',
+                started=self.clock(), done=False, error=None, breached=False, measured_calls=True)
+            self.wire.send(dict(id=self.seq, op='forget_window', app=app, window=h))
+            del self.forgetting[h]
 
     def target(self, scope):
         if scope.get('kind', 'session') == 'session':
@@ -620,6 +680,7 @@ class Provider:
 
     def tick(self):
         now = self.clock()
+        self.prune_closed()
         self.retired = [p for p in getattr(self, 'retired', []) if p.poll() is None]
         if self.wire is None:
             if now >= self.restart_at:
@@ -645,7 +706,7 @@ class Provider:
                                 (self.app(w) == row['app'] and
                                  (not row.get('window') or w['handle'] == row['window'])))]
                     if row.get('global_invalidation') or not row.get('window'):
-                        apps = {self.app(w) for w in windows} if row.get('global_invalidation') else {row['app']}
+                        apps = {self.app(w) for w in windows}
                         for app in apps:
                             self.serials[app] = self.serials.get(app, 0) + 1
                     else:
@@ -672,6 +733,8 @@ class Provider:
                                     snap['nodes'][r]['key'] += ':removed:' + str(
                                         self.freshness(h))
                 elif 'id' in row:
+                    if 'memory' in row:
+                        self.child_memory = row['memory']
                     task = self.pending.pop(row['id'], None)
                     if task is None:
                         continue
@@ -680,6 +743,15 @@ class Provider:
                         # work returns. Give that IPC turn its normal budget.
                         self.ping = now
                     task.update(done=True, completed=now, result=row.get('result'), error=row.get('error'))
+                    if task['op'] == 'forget_window':
+                        if task['error']:
+                            self.forgetting[task['window']] = task['app']
+                        continue
+                    # Keep the completed task available to its act waiter, but
+                    # never publish a closed window's late result or health.
+                    if task.get('window_retired') or not any(w['handle'] == task['window'] and w['mapped']
+                               for w in self.w.cache.windows.values()):
+                        continue
                     if task.get('observe_expired'):
                         continue
                     result = task['result'] or {}
@@ -754,7 +826,9 @@ class Provider:
                     legacy = progress is None and not task['measured_calls']
                     app_elapsed = elapsed if legacy else max(
                         (progress or {}).get('active_call_ms', 0), (progress or {}).get('max_call_ms', 0))/1000
-                    if not task['breached'] and (legacy or (progress or {}).get('breach')):
+                    live = any(w['handle'] == task['window'] and w['mapped']
+                               for w in self.w.cache.windows.values())
+                    if live and task['op'] != 'forget_window' and not task['breached'] and (legacy or (progress or {}).get('breach')):
                         task['breached'] = True
                         if now - self.first_map.get(task['window'], now) >= MAP_GRACE:
                             self.apps[task['app']].fail(now, app_elapsed)
@@ -771,18 +845,8 @@ class Provider:
                 raise EOFError('provider_heartbeat_timeout')
             if self.ready and now - self.started > 30:
                 self.restart_attempt = 0
-            live = {w['handle'] for w in self.w.cache.windows.values() if w['mapped']}
-            tracked = (set(self.cache.windows) | set(self.probes) | set(self.layouts) |
-                       set(self.modals) | set(self.unavailable) | set(self.first_map) | set(self.window_serials))
-            for h in tracked - live:
-                self.cache.prune(h)
-                for mapping in (self.probes, self.layouts, self.modals, self.first_map,
-                                self.dirty_due, self.retry, self.raw, self.window_serials):
-                    mapping.pop(h, None)
-                self.unavailable.discard(h)
-                self.dirty.discard(h)
-                self.consumers.pop(h, None)
-                self.inventories = {k: v for k, v in self.inventories.items() if k[0] != h}
+            self.send_forgets()
+            self.prune_closed()
             for win in list(self.w.cache.windows.values()):
                 if not win['mapped']:
                     continue

@@ -288,6 +288,15 @@ class Engine:
                                    "observed": None, "acts": budget.get("acts"), "used": 0,
                                    "misses": 0, "suspended": False, "peer": peer}
 
+    def prune_windows(self, live=None):
+        if live is None:
+            live = {w['handle'] for w in self.w.cache.windows.values() if w['mapped']}
+        for state in self.lease_state.values():
+            for field in ('trees', 'tree_pages', 'ocr_trees'):
+                entries = state.get(field, {})
+                for handle in set(entries) - live:
+                    entries.pop(handle, None)
+
     def observed(self, peer, params, result):
         token = self.w.lease
         state = self.lease_state.get(token)
@@ -328,6 +337,9 @@ class Engine:
                 and params.get("scope", {}).get("kind", "session") == "session"):
             state["observed"] = result["rev"]
             self.reconcile(observed_rev=result["rev"])
+        # Frozen cursor pages can still be delivered after unmap. Preserve
+        # their wire behavior without reintroducing closed-window baselines.
+        self.prune_windows()
 
     def reconciliation_reason(self):
         if self.pending_effects:
@@ -603,6 +615,7 @@ class Engine:
             self.action_stubs.popitem(last=False)
 
     def tick(self):
+        self.prune_windows()
         if self.evdev:
             self.evdev.tick()
         if self.selftest:

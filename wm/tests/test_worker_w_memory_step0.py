@@ -111,7 +111,7 @@ class MemoryCounters(Harness):
         self.assertEqual(result, before)
         self.assertEqual(memory, dict(schema=1, actions_retained=0, action_stubs=0,
             journal_actions_indexed=0, lease_records=1,
-            removed_windows=0, frame_identities=0, frame_files=0, atspi_apps=0,
+            removed_windows=0, frame_identities=0, frame_files=0, atspi_apps=0, atspi_child=None,
             journal_bytes=0, pending_x_requests=None))
 
 

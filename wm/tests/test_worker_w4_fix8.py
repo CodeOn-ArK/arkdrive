@@ -88,7 +88,11 @@ class WindowFreshness(h.ProviderHarness):
                     name='Rename', role='push_button')
 
     def inventory(self):
-        return dict(items=copy.deepcopy(self.p.cache.windows[self.dialog]['enumeration']))
+        # The fake enumerate reply comes from the complete fixture. Production
+        # rendered-only snapshots deliberately retain no semantic inventory.
+        cache = h.TreeCache()
+        cache.update(self.dialog, self.dialog_raw)
+        return dict(items=copy.deepcopy(cache.windows[self.dialog]['enumeration']))
 
     def test_sibling_event_during_inventory_flight_preserves_dialog_inventory(self):
         query = self.inventory_query()
