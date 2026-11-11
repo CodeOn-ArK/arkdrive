@@ -7,8 +7,11 @@ session running `wm/fixtures/fx_canvas` on ArK2, supplied 2026-11-11 as
 
 It reads `ArkDrive canvas`, `Alpha 123`, `Bravo 456`, `Target: W0`.
 A pointer is present above/over the Bravo region. The standing headless test
-uses physical line crops from the unmodified file, excluding that pointer for
-Bravo and preserving the entire W0 line (crop x=8..240, y=200..248).
+asserts all four strings on the **whole window, pointer included**, as well as
+the original diagnostic line crops (excluding the pointer for Bravo and
+preserving the entire W0 line, crop x=8..240, y=200..248). Per-band refinement
+retains Tesseract's Bravo line when its contaminated band abstains, while
+independently refining the clean Alpha and W0 bands.
 No source pixel is repainted or normalized. Rendering-mode corpus cases are
 synthetic and are reported separately. No second real capture was generated;
 the supplied capture plus eight complete synthetic modes provide the measured

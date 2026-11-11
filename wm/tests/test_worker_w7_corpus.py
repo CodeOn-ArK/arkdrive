@@ -35,7 +35,7 @@ class Corpus(unittest.TestCase):
         self.assertEqual(actual, rgb)
         self.assertEqual(spaces, rgb_spaces)
 
-    def test_real_xvfb_capture_exact_with_unmodified_whole_w0_line(self):
+    def test_real_xvfb_capture_exact_including_whole_window_with_pointer(self):
         import hashlib
         from PIL import Image
         from ocr_corpus import REAL_CAPTURE, REAL_SHA256, REAL_LINES
@@ -65,10 +65,58 @@ class Corpus(unittest.TestCase):
                     self.assertEqual([l['text'] for l in actual], [expected])
                     states.append(backend.last_shapes['state'])
             self.assertEqual(states, ['abstained', 'engaged', 'engaged', 'engaged'])
+            actual = backend.read(source.tobytes(), dict(x=31, y=27, w=560, h=280))
+            self.assertEqual([l['text'] for l in actual], [t for t, _ in REAL_LINES])
+            self.assertEqual(actual[-1]['conf'], 100)
+            self.assertEqual(actual[-1]['box'], [55, 242, 121, 23])
+            bands = backend.last_shapes['bands']
+            self.assertEqual([b['state'] for b in bands],
+                             ['abstained', 'engaged', 'abstained', 'engaged'])
+            self.assertEqual(bands[2]['reason'], 'raster_miss')
         finally:
             backend.close()
 
+    def test_corrupted_band_keeps_tesseract_without_vetoing_clean_bands(self):
+        from PIL import Image
+        from worker_ocr_shapes import recognize
+        # Source spellings are deliberately different from initial recognition.
+        rgb, rect = render((('W0', 12, 40), ('B7', 12, 90), ('A0', 12, 140)),
+                           'Sans', 24, width=200, height=160)
+        image = Image.frombytes('RGB', (rect['w'], rect['h']), rgb).convert('L')
+        # Attach an unsupported raster to the middle band's first glyph.
+        for y in range(74, 86):
+            for x in range(9, 16):
+                image.putpixel((x, y), 0)
+        fallback = [dict(text=t, box=[12, y, 40, 26], conf=c)
+                    for t, y, c in [('WO', 16, 91), ('corrupted B7', 66, 82), ('AO', 116, 93)]]
+        diag = {}
+        actual = recognize(image, fallback, diag)
+        actual.sort(key=lambda l: l['box'][1])
+        self.assertEqual([l['text'] for l in actual], ['W0', 'corrupted B7', 'A0'])
+        self.assertEqual(actual[1], fallback[1])
+        self.assertEqual([l['conf'] for l in actual], [100, 82, 100])
+        self.assertEqual([b['state'] for b in diag['bands']], ['engaged', 'abstained', 'engaged'])
+
+    def test_content_gate_is_per_band_and_spanning_tesseract_lines_are_retained(self):
+        from PIL import Image
+        from worker_ocr_shapes import recognize
+        rgb, rect = render((('W0', 12, 40), ('A0', 12, 90)),
+                           'Sans', 24, width=200, height=110)
+        image = Image.frombytes('RGB', (rect['w'], rect['h']), rgb).convert('L')
+        fallback = [dict(text='lengthy', box=[12, 16, 40, 26], conf=91),
+                    dict(text='AO', box=[12, 66, 40, 26], conf=92)]
+        diag = {}
+        actual = recognize(image, fallback, diag)
+        self.assertIn(fallback[0], actual)
+        self.assertEqual(diag['bands'][0]['reason'], 'content_gate')
+        self.assertEqual(diag['bands'][1]['state'], 'engaged')
+        spanning = [dict(text='WO AO', box=[12, 16, 40, 76], conf=80)]
+        self.assertIsNone(recognize(image, spanning, diag))
+        self.assertTrue(all(b['reason'] == 'line_spans_bands' for b in diag['bands']))
+
     def test_default_meets_corpus_and_fixture_adoption_bar(self):
+        import json
+        from pathlib import Path
         from unittest.mock import patch
         from worker_ocr_shapes import templates
         self.assertGreaterEqual(len(TEXTS), 40)
@@ -83,6 +131,8 @@ class Corpus(unittest.TestCase):
                          for key, fonts in lookup.items()}
         round2_lookup = {k: v for k, v in round2_lookup.items() if v}
         old, round1, round2, adopted = Backend(shapes=False), Backend(), Backend(), Backend()
+        saved = json.loads((Path(__file__).resolve().parents[2] /
+                            'bench/w7-round3-after.json').read_text())['modes']
         try:
             for mode in RENDER_MODES:
                 with self.subTest(rendering=mode):
@@ -94,10 +144,12 @@ class Corpus(unittest.TestCase):
                     with patch('worker_ocr_shapes.templates', return_value=(round2_lookup, spaces)):
                         prior2 = measure(round2, corpus, rendering=mode)
                     current = measure(adopted, corpus, rendering=mode)
+                    self.assertEqual([r['key'] for r in saved[mode]['results']],
+                                     [r['key'] for r in current['results']])
                     self.assertTrue(current['fixture_exact'], current['fixture'])
                     self.assertEqual(current['fixture_glyphs']['state'], 'engaged')
                     self.assertGreaterEqual(current['rate'], .98)
-                    for reference in (baseline, prior, prior2):
+                    for reference in (baseline, prior, prior2, saved[mode]):
                         self.assertFalse([r for p, r in zip(reference['results'], current['results'])
                                           if p['exact'] and not r['exact']])
                     self.assertFalse([r for r in current['results']

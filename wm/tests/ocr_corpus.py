@@ -194,11 +194,16 @@ def real_capture_report():
             results.append(dict(expected=expected, region=box, actual=actual, baseline=baseline,
                                 exact=[l['text'] for l in actual] == [expected],
                                 glyphs=backend.last_shapes.copy()))
+        rect = dict(x=0, y=0, w=image.width, h=image.height)
+        baseline = raw.read(image.tobytes(), rect)
+        actual = backend.read(image.tobytes(), rect)
+        whole = dict(actual=actual, baseline=baseline, glyphs=backend.last_shapes.copy(),
+                     exact=[l['text'] for l in actual] == [t for t, _ in REAL_LINES])
     finally:
         backend.close()
         raw.close()
     return dict(source=str(REAL_CAPTURE), sha256=hashlib.sha256(REAL_CAPTURE.read_bytes()).hexdigest(),
-                dimensions=image.size, glyphs=glyphs, results=results,
+                dimensions=image.size, glyphs=glyphs, results=results, whole_window=whole,
                 gray_full_binary_diff_pixels=sum(p != 0 for p in diff.tobytes()),
                 exact=sum(r['exact'] for r in results),
                 false_glyph_accepts=sum(r['glyphs']['state'] == 'engaged' and not r['exact'] for r in results))

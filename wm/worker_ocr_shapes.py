@@ -114,8 +114,12 @@ def build_templates(renderings, alpha_gray=True):
     return lookup, spaces
 
 
-def recognize(image, recognized, diagnostics=None):
-    """Return exact-font lines only; the gate uses recognized content shape."""
+def recognize(image, recognized, diagnostics=None, fallback=None):
+    """Refine independent physical bands, retaining abstaining Tesseract lines.
+
+    recognized includes low-confidence words for the content gate; fallback is
+    the normal confidence-filtered output. Neither supplies glyph candidates.
+    """
     def record(state, reason=None, **detail):
         if diagnostics is not None:
             diagnostics.update(state=state, reason=reason, **detail)
@@ -137,15 +141,39 @@ def recognize(image, recognized, diagnostics=None):
             runs.append([y, y])
         else:
             runs[-1][1] = y
-    # Join detached dots/accents using the source glyph height, not a label.
+    def touches(line, top, bottom):
+        box = line.get('box')
+        return box is None or box[1] <= bottom and box[1]+box[3] > top
+
+    # Join detached dots/accents using source height. For gaps larger than
+    # half the smaller run, require shared Tesseract line geometry: a tall
+    # neighboring block must not absorb a separate line just by being tall.
     merged = []
     for top, bottom in runs:
-        if merged and top-merged[-1][1] <= max(3, (bottom-top+1)//2):
+        if (merged and top-merged[-1][1] <= max(3, (bottom-top+1)//2) and (
+                top-merged[-1][1] <= max(3, min(bottom-top+1, merged[-1][1]-merged[-1][0]+1)//2) or
+                any(touches(l, *merged[-1]) and touches(l, top, bottom) for l in recognized))):
             merged[-1][1] = bottom
         else:
             merged.append([top, bottom])
-    result = []
-    for top, bottom in merged:
+    def overlaps(line, top, bottom):
+        # Unboxed inputs are supported for single-band decoder diagnostics.
+        return len(merged) == 1 if 'box' not in line else touches(line, top, bottom)
+
+    fallback = recognized if fallback is None else fallback
+    result, replaced, reports = [], set(), []
+    for index, (top, bottom) in enumerate(merged):
+        report = dict(band=[top, bottom], state='abstained', reason='content_gate')
+        reports.append(report)
+        content = [l for l in recognized if overlaps(l, top, bottom)]
+        if not any(re.search(r'\b\w{1,4}\b|\d', l['text']) for l in content):
+            continue
+        # Never remove a Tesseract line which also covers another band.
+        affected = [i for i, l in enumerate(fallback) if overlaps(l, top, bottom)]
+        if any(overlaps(fallback[i], t, b) for i in affected
+               for j, (t, b) in enumerate(merged) if j != index):
+            report['reason'] = 'line_spans_bands'
+            continue
         band = image.crop((0, top, image.width, bottom+1))
         bb = ink(band)
         columns = [x for x in range(bb[0], bb[2]) if ink(band.crop((x, 0, x+1, band.height)))]
@@ -189,13 +217,18 @@ def recognize(image, recognized, diagnostics=None):
             else:
                 decoded.add(text)
         if len(decoded) != 1:
-            record('abstained', 'raster_miss' if not candidates else 'metrics_or_ambiguity',
-                   band=[top, bottom], glyphs=len(glyphs),
-                   unmatched=sum(not g[3] for g in glyphs),
-                   candidate_fonts=len(candidates or ()), decodings=sorted(decoded))
-            return None
+            report.update(reason='raster_miss' if not candidates else 'metrics_or_ambiguity',
+                          glyphs=len(glyphs), unmatched=sum(not g[3] for g in glyphs),
+                          candidate_fonts=len(candidates or ()), decodings=sorted(decoded))
+            continue
         text = decoded.pop()
         if any(c.isalnum() for c in text):
             result.append(dict(text=text, box=[bb[0], top, bb[2]-bb[0], bottom-top+1], conf=100.0))
-    record('engaged', lines=len(result))
-    return result
+            replaced.update(affected)
+            report.update(state='engaged', reason=None, text=text)
+    if not result:
+        detail = next((r for r in reports if r['reason'] != 'content_gate'), reports[0])
+        record('abstained', **{k: v for k, v in detail.items() if k != 'state'}, bands=reports)
+        return None
+    record('engaged', lines=len(result), bands=reports)
+    return result + [line for i, line in enumerate(fallback) if i not in replaced]

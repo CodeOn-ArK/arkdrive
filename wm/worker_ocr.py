@@ -26,7 +26,7 @@ from worker_tree import Wire, packet, MAX_IPC
 
 OCR_KINDS = {'ocr_text', 'ocr_text_present', 'ocr_text_absent'}
 IMAGE_LIMIT = 64 * 1024 * 1024
-PARAMETERS = ('eng', 'grey', 2, 60, 'sparse/line48', 'glyph-v3')
+PARAMETERS = ('eng', 'grey', 2, 60, 'sparse/line48', 'glyph-v4')
 
 
 class PipePair:
@@ -162,7 +162,7 @@ class Backend:
                 from worker_ocr_shapes import recognize
                 self.last_shapes = {}
                 refined = recognize(source, self.lines(tsv, dict(x=0, y=0), scale, min_conf=0),
-                                    self.last_shapes)
+                                    self.last_shapes, fallback=self.lines(tsv, dict(x=0, y=0), scale))
                 if refined is not None:
                     for line in refined:
                         line['box'][0] += rect['x']

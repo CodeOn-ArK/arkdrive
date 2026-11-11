@@ -1822,17 +1822,28 @@ class Worker:
         self.cache.selected(params.get("scope", {"kind": "session"}))
         if len(peer.waits) >= 8:
             raise RPCError("queue_full")
+        probe = None
+        tree = getattr(self, 'tree', None)
+        probe_deadline = tree.clock() + max(0, deadline-time.monotonic()) if tree else None
+        scope = params.get('scope', {})
+        if (tree and scope.get('kind', 'session') == 'window' and any(
+                w['handle'] == tree.target(scope) and w['mapped'] for w in self.cache.windows.values())):
+            probe = tree.observe_probe(tree.target(scope))
         full = since is None or since < 1 or since > self.cache.rev
         if full:
             pending = {"kind": "observe", "id": ident, "params": params,
-                       "deadline": deadline, "pointer_pending": True}
+                       "deadline": deadline, "pointer_pending": True,
+                       "liveness_probe": probe, "liveness_deadline": probe_deadline}
             peer.waits.append(pending)
             def pointer(data):
                 self.cache.set("pointer", {"x": data["root_x"], "y": data["root_y"]})
                 pending["pointer_pending"] = False
             self.x.ax.ask(request.QueryPointer, pointer, window=self.x.root)
-        elif not self.covered() or not self.settle_pixels():
-            peer.waits.append({"kind": "observe", "id": ident, "params": params, "deadline": deadline})
+        elif (not self.covered() or not self.settle_pixels() or
+              tree and not tree.observe_probe_ready(probe, probe_deadline)):
+            peer.waits.append({"kind": "observe", "id": ident, "params": params,
+                               "deadline": deadline, "liveness_probe": probe,
+                               "liveness_deadline": probe_deadline})
         else:
             try:
                 result = self.observation(params, wait_ocr=True)
@@ -1936,6 +1947,9 @@ class Worker:
                         continue
                     self.require_lease(peer, item["params"])
                     if item["kind"] == "observe":
+                        if (getattr(self, 'tree', None) and not self.tree.observe_probe_ready(
+                                item.get('liveness_probe'), item.get('liveness_deadline'))):
+                            continue
                         if not expired and (not self.covered() or item.get("pointer_pending")):
                             continue
                         if (not expired and item["params"].get("since_rev") is None and

@@ -167,6 +167,170 @@ class CacheAndIncremental(OCRHarness):
         self.assertEqual(self.o.requests, 2)
 
 
+class WindowObserveLiveness(OCRHarness):
+    def setUp(self):
+        super().setUp()
+        self.peer.waits = []
+        self.w.peers = [self.peer]
+        self.clock_patch = patch('time.monotonic', side_effect=lambda: self.now)
+        self.clock_patch.start()
+        self.addCleanup(self.clock_patch.stop)
+
+    def observe_window(self, ident=77, **extra):
+        params = dict(lease='lease', scope=dict(kind='window', window=self.handle),
+                      channels=['auto'], since_rev=self.w.cache.rev)
+        params.update(extra)
+        self.w.observe(self.peer, ident, params)
+        return params
+
+    def healthy_neighbor(self):
+        self.later()
+        healthy = self.w.cache.handle(11)
+        self.w.x.window_pids[11] = 202
+        self.w.cache.set('focus', healthy)
+        self.w.cache.commit()
+        self.p.tick()
+        self.answer(self.raw, task=next(t for t in self.p.pending.values() if t['window'] == healthy))
+        return healthy
+
+    def test_published_then_hung_app_falls_back_in_same_targeted_observe(self):
+        self.healthy_neighbor()
+        self.now += 3.1
+        # Session polls serve the focused neighbor and add no inline probe.
+        for ident in range(5):
+            self.w.observe(self.peer, ident, dict(lease='lease', since_rev=self.w.cache.rev))
+        self.assertFalse(self.p.pending)
+        self.assertEqual(self.p.status(self.handle), 'usable')
+        self.assertEqual(self.p.apps['101'].breaches, 0)
+        self.assertIn(self.handle, self.p.cache.windows)
+        params = self.observe_window()
+        self.assertFalse(any(i == 77 for i, _ in self.replies))
+        probe = self.peer.waits[0]['liveness_probe']
+        self.assertEqual((probe['op'], probe['window']), ('probe', self.handle))
+        # Actual IPC completion, not an injected health/publication split.
+        self.now += .251
+        self.answer(error='application_unreachable', task=probe, max_call_ms=251, breach=True)
+        self.w.pending()
+        self.assertEqual(self.p.apps['101'].state, 'degraded')
+        self.assertEqual(self.p.apps['101'].breaches, 1)
+        self.assertEqual(self.o.requests, 1)
+        self.assertFalse(any(i == 77 for i, _ in self.replies))
+        lines = [line('Add to list'), line('Clicks: 0', y=170), line('Item 1', y=210)]
+        self.answer_ocr(lines)
+        self.w.pending()
+        result = next(r for i, r in self.replies if i == 77)
+        self.assertIn('ocr', result['channels_used'])
+        self.assertEqual(result['ocr']['lines'], lines)
+        self.assertEqual(result['providers']['atspi']['apps']['101']['state'], 'degraded')
+        self.assertNotIn('pixels', result['channels_used'])
+        count = self.p.seq
+        self.observe_window(78)
+        self.assertEqual(self.p.seq, count)  # breaker backoff, no second probe
+        self.assertTrue(self.replies[-1][1]['unchanged'])
+        self.assertEqual(self.o.requests, 1)
+
+    def test_healthy_window_probes_only_when_existing_schedule_is_due(self):
+        self.now += 3.1
+        with patch.object(self.o, 'read', side_effect=AssertionError('healthy OCR')):
+            for ident in range(5):
+                self.observe_window(ident)
+            probes = [r for r in self.wire.sent if r.get('op') == 'probe']
+            self.assertEqual(len(probes), 1)
+            self.assertEqual(len(self.peer.waits), 5)
+            task = next(iter(self.p.pending.values()))
+            self.now += .01
+            self.answer(dict(name='Fixture'), task=task, max_call_ms=1, breach=False)
+            completed = self.now
+            self.w.pending()
+            self.assertFalse(self.peer.waits)
+            self.assertEqual(self.p.samples['101'], completed)
+            for offset in (0, .25, .999):
+                self.now = completed+offset
+                self.observe_window(10)
+                self.assertFalse(self.peer.waits)
+            self.assertEqual(len([r for r in self.wire.sent if r.get('op') == 'probe']), 1)
+            self.now = completed+1
+            self.observe_window(11)
+            self.assertEqual(len([r for r in self.wire.sent if r.get('op') == 'probe']), 2)
+            self.assertEqual(self.p.apps['101'].state, 'healthy')
+
+    def test_full_window_observe_probes_before_selecting_channels(self):
+        self.now += 3.1
+        self.w.x.root = 1
+        self.w.x.ax = NS(ask=lambda request, callback, **kw: callback(dict(root_x=0, root_y=0)))
+        self.observe_window(since_rev=None)
+        self.assertFalse(self.peer.waits[0]['pointer_pending'])
+        probe = self.peer.waits[0]['liveness_probe']
+        self.now += .251
+        self.answer(error='application_unreachable', task=probe, max_call_ms=251, breach=True)
+        self.w.pending()
+        self.assertEqual(self.o.requests, 1)
+        self.answer_ocr([line('one'), line('two', y=170), line('three', y=210)])
+        self.w.pending()
+        self.assertIn('ocr', self.replies[-1][1]['channels_used'])
+        self.assertFalse(self.peer.waits)
+
+    def test_starting_window_is_not_inline_probed_inside_map_grace(self):
+        self.p.cache.prune(self.handle)
+        self.p.probes.pop(self.handle)
+        mapped = self.p.first_map[self.handle]
+        count = self.p.seq
+        for age in (0, 1, 1.999):
+            self.now = mapped+age
+            self.observe_window()
+            self.assertFalse(self.peer.waits)
+            self.assertEqual(self.p.seq, count)
+            self.assertEqual(self.p.apps['101'].state, 'healthy')
+        self.now = mapped+2
+        self.observe_window()
+        self.assertEqual(self.p.seq, count+1)
+        self.assertEqual(next(iter(self.p.pending.values()))['op'], 'snapshot')
+
+    def test_inline_timeout_is_bounded_by_observe_deadline_and_ignores_late_reply(self):
+        self.now += 3.1
+        self.observe_window(deadline_ms=50)
+        task = self.peer.waits[0]['liveness_probe']
+        self.now += .049
+        self.w.pending()
+        self.assertFalse(self.replies)
+        self.assertEqual(self.p.apps['101'].state, 'healthy')
+        self.now += .0011
+        self.w.pending()
+        self.assertFalse(self.peer.waits)
+        self.assertEqual(self.p.apps['101'].state, 'degraded')
+        result = self.replies[-1][1]
+        self.assertFalse(result['unchanged'])
+        self.assertIn('pixels', result['channels_used'])
+        self.assertEqual(self.o.requests, 1)  # OCR tried within the same observe
+        self.answer(dict(name='late'), task=task, max_call_ms=1, breach=False)
+        self.assertEqual(self.p.apps['101'].state, 'degraded')
+        self.assertIn(self.handle, self.p.unavailable)
+
+    def test_inline_probe_has_one_second_ceiling_with_time_for_same_observe_ocr(self):
+        self.now += 3.1
+        self.observe_window()
+        self.now += 1
+        self.w.pending()
+        self.assertEqual(self.p.apps['101'].state, 'degraded')
+        self.assertEqual(self.o.requests, 1)
+        self.assertFalse(self.replies)
+        self.answer_ocr([line('one'), line('two', y=170), line('three', y=210)])
+        self.w.pending()
+        self.assertIn('ocr', self.replies[-1][1]['channels_used'])
+
+    def test_reply_completed_after_observe_deadline_does_not_serve_stale_tree(self):
+        self.now += 3.1
+        self.observe_window(deadline_ms=50)
+        task = self.peer.waits[0]['liveness_probe']
+        self.now += .06
+        self.answer(dict(name='late'), task=task, max_call_ms=1, breach=False)
+        self.w.pending()
+        self.assertEqual(self.p.apps['101'].state, 'degraded')
+        self.assertEqual(self.o.requests, 1)
+        self.assertFalse(self.replies[-1][1]['unchanged'])
+        self.assertIn('pixels', self.replies[-1][1]['channels_used'])
+
+
 class PredicatesAndObservations(OCRHarness):
     def pending_live_shape(self, app_state, snapshot=False):
         # Establish another app before registering the target as never-published.
@@ -213,6 +377,9 @@ class PredicatesAndObservations(OCRHarness):
             params = dict(scope=dict(kind='window', window=self.handle),
                           channels=['auto'], since_rev=self.w.cache.rev)
             # Exercise the RPC fast path itself, not just the decision helper.
+            # These injected publication/health views isolate channel ordering;
+            # discovery of stale liveness is covered by WindowObserveLiveness.
+            self.p.samples[self.p.app(self.p.window(self.handle))] = self.now
             self.peer.waits = []
             self.w.observe(self.peer, 77, params)
             self.assertTrue(any(p['id'] == 77 for p in self.peer.waits))

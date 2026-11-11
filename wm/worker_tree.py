@@ -437,7 +437,7 @@ class Provider:
             b = self.apps.get(app, Breaker())
             pid = getattr(self.w.x, 'window_pids', {}).get(win['xid']) if getattr(self.w, 'x', None) else None
             state = 'down' if not self.ready else self.readiness(win['handle'])
-            due = max(b.due, self.retry.get(win['handle'], (0, 0))[0], self.dirty_due.get(win['handle'], 0))
+            due = self.next_probe(win['handle'])
             detail = dict(pid=pid, state=state, reason='provider_restarting' if not self.ready else
                           b.reason or ('application_unreachable' if state == 'degraded' else None),
                           breaches=b.breaches, next_probe_ms=max(0, int((due-self.clock())*1000)))
@@ -508,6 +508,59 @@ class Provider:
         """Target-window counter plus the explicit app/global fallback epoch."""
         return (self.serials.get(app if app is not None else self.app(self.window(window)), 0),
                 self.window_serials.get(window, 0))
+
+    def next_probe(self, window):
+        """One schedule for liveness freshness, retries and app backoff."""
+        app = self.app(self.window(window))
+        return max(self.apps.get(app, Breaker()).due,
+                   self.retry.get(window, (0, 0))[0], self.dirty_due.get(window, 0),
+                   self.samples.get(app, float('-inf')) + 1)
+
+    def observe_probe(self, window):
+        """Start/join one due app call for a window OBSERVE, outside map grace.
+
+        Acts retain their existing readiness rules. Completed calls in samples
+        are app-wide liveness evidence; cached snapshot reads are not evidence.
+        """
+        now = self.clock()
+        if now - self.first_map.setdefault(window, now) < MAP_GRACE:
+            return None
+        if not self.ready or now < self.next_probe(window):
+            return None
+        app = self.app(self.window(window))
+        current = next((t for t in self.pending.values() if t['app'] == app), None)
+        return current if current is not None else self.request(
+            'probe' if window in self.cache.windows and window not in self.dirty else 'snapshot', window)
+
+    def observe_probe_ready(self, task, deadline=None):
+        """Bound the inline wait by the observe deadline and 1 s call ceiling.
+
+        The job remains supervised if its owner is blocked. A late reply cannot
+        revalidate the stale snapshot; normal scheduled snapshot recovery can.
+        """
+        if task is None or task.get('observe_failed'):
+            return True
+        now = self.clock()
+        limit = min(task['started'] + 1, deadline if deadline is not None else float('inf'))
+        timeout = task.get('completed', now) >= limit
+        failed = (task['breached'] or task['error'] in ('timeout', 'application_unreachable') or
+                  (task.get('result') or {}).get('alive') is False)
+        if not timeout and not failed:
+            return task['done']
+        b = self.apps[task['app']]
+        # Completed errors/breaches were already counted by tick(). Only an
+        # inline timeout (or an explicit negative liveness reply) is new here.
+        if not task['breached'] and (timeout or (task.get('result') or {}).get('alive') is False):
+            b.fail(now, now-task['started'])
+        if b.state != 'degraded':
+            b.degrade(now, 'application_unreachable')
+        if timeout:
+            task['breached'] = task['observe_expired'] = True
+        task['observe_failed'] = True
+        self.unavailable.add(task['window'])
+        self.dirty.add(task['window'])
+        self.dirty_due[task['window']] = max(now + 1, b.due)
+        return True
 
     def request(self, op, window, **fields):
         win = self.window(window)
@@ -626,7 +679,9 @@ class Provider:
                         # The GLib owner can service its queued ping only after
                         # work returns. Give that IPC turn its normal budget.
                         self.ping = now
-                    task.update(done=True, result=row.get('result'), error=row.get('error'))
+                    task.update(done=True, completed=now, result=row.get('result'), error=row.get('error'))
+                    if task.get('observe_expired'):
+                        continue
                     result = task['result'] or {}
                     if task['op'] == 'snapshot' and result:
                         self.raw[task['window']] = copy.deepcopy(result)
