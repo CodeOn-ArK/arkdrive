@@ -28,7 +28,7 @@ def compile_keycodes(display, keyboard):
     """Compile this session slave's XKB key names; never X keycode minus 8.
 
     The temporary XCB connection explicitly names the verified session display.
-    All FFI queries happen at startup, before input admission.
+    Queries run during settled establishment or a settled cache refresh.
     """
     xcb = C.CDLL('libxcb.so.1')
     xkb = C.CDLL('libxkbcommon.so.0')
@@ -92,9 +92,16 @@ class EvdevTransport:
         # may still be attaching our slaves while this transport is created.
         self.established = False
         self.revision = 0
+        self.dirty = False
+        self.recompiles = 0
+        self.map_epoch = 0
+        self.frame_epoch = 0
+        self.recompile_runner = None
         self.settle_until = self.clock() + 0.05
         self.provided_keycodes = keycodes
         self.inflight = False
+        self.refresh_inflight = False
+        self.stopping = False
         self.last_ack = None
 
     @property
@@ -167,6 +174,14 @@ class EvdevTransport:
                     raise ChannelError('helper_timeout', submitted)
                 try:
                     if sent < len(data):
+                        if 'frames' in req:
+                            # No final packet bytes from a dirty/stale plan.
+                            # Cancel before submission and free the stream for
+                            # the refresh's grab probe (never deadlock it).
+                            if self.dirty or self.frame_epoch != self.map_epoch:
+                                if sent:
+                                    self.close()
+                                raise ActError('provider_degraded')
                         count = sock.send(data[sent:])
                         if not count:
                             raise ChannelError('helper_disconnected', submitted)
@@ -189,25 +204,32 @@ class EvdevTransport:
                 except (BlockingIOError, InterruptedError):
                     pass
                 yield
+        except ActError:
+            raise
         except Exception as exc:
             raise self.failure(exc, submitted) from exc
 
-    def request(self, **fields):
+    def request(self, *, _map_epoch=None, _refresh=False, **fields):
         # Bootstrap grab checks, per-batch probes and releases share the event
         # stream. A busy probe must not down()/close() another request's socket.
         while self.inflight:
             yield
         self.inflight = True
+        self.refresh_inflight = _refresh
+        self.frame_epoch = self.map_epoch if _map_epoch is None else _map_epoch
         try:
             if self.health['state'] == 'down' and fields.get('op') != 'release_all':
                 raise ChannelError(self.health['last_error'] or 'channel_down')
             return (yield from self._request(**fields))
+        except ActError:
+            raise
         except Exception as exc:
             failure = self.failure(exc)
             self.down(failure.reason)
             raise failure from exc
         finally:
             self.inflight = False
+            self.refresh_inflight = False
 
     def _request(self, **fields):
         self.seq += 1
@@ -215,12 +237,18 @@ class EvdevTransport:
         # A reconnect uses the identical sequence and payload. The helper
         # caches replies across connections, so lost acknowledgements cannot
         # cause a second write. Only one reconnect in this generation.
-        submitted = False
+        submitted, last_fault = False, None
         while True:
             try:
                 return (yield from self.exchange(req))
+            except ActError:
+                # A cancelled retry cannot erase an earlier full submission.
+                if submitted:
+                    raise ChannelError(last_fault.reason, True) from last_fault
+                raise
             except Exception as fault:
                 exc = self.failure(fault)
+                last_fault = exc
                 submitted |= exc.submitted
                 self.close()
                 if self.reconnects or self.health['state'] == 'down':
@@ -228,8 +256,8 @@ class EvdevTransport:
                     raise ChannelError(exc.reason, submitted) from exc
                 self.reconnects += 1
 
-    def discover(self, devices):
-        self.sources.clear()
+    def discover(self, devices, *, commit=True):
+        sources = {}
         for dev in devices:
             def get(k):
                 return getattr(dev, k) if hasattr(dev, k) else dev[k]
@@ -239,8 +267,11 @@ class EvdevTransport:
             # Xorg uses the config Identifiers, not uinput product names.
             from Xlib.ext import xinput
             if get('enabled') and (name, get('use')) in (('kbd', xinput.SlaveKeyboard), ('ptr', xinput.SlavePointer)):
-                self.sources['keyboard' if name == 'kbd' else 'pointer'] = get('deviceid')
-        self.initialised = True
+                sources['keyboard' if name == 'kbd' else 'pointer'] = get('deviceid')
+        if commit:
+            self.sources = sources
+            self.initialised = True
+        return sources
 
     def devices(self, callback):
         from Xlib.ext import xinput
@@ -249,7 +280,7 @@ class EvdevTransport:
                         opcode=self.w.x.ev.display.get_extension_major('XInputExtension'),
                         deviceid=xinput.AllDevices)
 
-    def snapshot(self):
+    def snapshot(self, *, commit=True):
         devices = []
         try:
             self.devices(lambda value: devices.append(value))
@@ -262,7 +293,7 @@ class EvdevTransport:
             yield
         if devices[0] is None:
             raise ChannelError('assigned_slaves_unavailable')
-        self.discover(devices[0])
+        return self.discover(devices[0], commit=commit)
 
     def barrier(self):
         done = []
@@ -276,9 +307,9 @@ class EvdevTransport:
         # the revision is compared and the channel is established.
         yield
 
-    def grab_check(self, *, retire=True):
+    def grab_check(self, *, retire=True, refresh=False):
         try:
-            reply = yield from self.request(op='grab_check')
+            reply = yield from self.request(op='grab_check', _refresh=refresh)
             busy = reply.get('kbd') == reply.get('ptr') == 'busy' and reply.get('ok') is True
             self.health['grab'] = busy
             if not busy and retire:
@@ -288,11 +319,34 @@ class EvdevTransport:
             self.down(exc.reason)
             return False
 
+    def tick(self):
+        if self.recompile_runner is not None:
+            try:
+                next(self.recompile_runner)
+            except StopIteration:
+                self.recompile_runner = None
+
+    def stop_refresh(self):
+        # Drain an owned grab reply before release_all; cancel a refresh that
+        # is only waiting on another request. No new probes during shutdown.
+        self.stopping = True
+        if self.refresh_inflight:
+            self.tick()
+        if not self.refresh_inflight and self.recompile_runner is not None:
+            self.recompile_runner.close()
+            self.recompile_runner = None
+        return self.refresh_inflight
+
     def startup(self):
+        if self.established:
+            while self.dirty and self.health['state'] != 'down':
+                yield
+            return self.health['state'] != 'down'
+        return (yield from self.settle())
+
+    def settle(self, *, recompile=False):
         deadline = self.clock() + 2
         while self.health['state'] != 'down':
-            if self.established:
-                return True
             if self.clock() >= deadline:
                 self.down('session_settlement_timeout')
                 return False
@@ -301,15 +355,17 @@ class EvdevTransport:
                 continue
             revision, failure = self.revision, None
             try:
-                yield from self.snapshot()
+                sources = yield from self.snapshot(commit=not recompile)
                 if self.revision != revision:
                     continue
-                if set(self.sources) != {'keyboard', 'pointer'}:
+                if recompile and sources != self.sources:
+                    failure = 'assigned_device_changed'
+                elif set(sources) != {'keyboard', 'pointer'}:
                     failure = 'assigned_slaves_unavailable'
                 else:
                     try:
-                        self.keycodes = (self.provided_keycodes if self.provided_keycodes is not None else
-                                        compile_keycodes(':' + str(self.w.record['display']), self.sources['keyboard']))
+                        keycodes = dict(self.provided_keycodes if self.provided_keycodes is not None else
+                                        compile_keycodes(':' + str(self.w.record['display']), sources['keyboard']))
                     except (OSError, ValueError, AttributeError):
                         failure = 'session_keymap_unavailable'
                 # A round trip on the event connection orders notifications
@@ -322,7 +378,9 @@ class EvdevTransport:
             if failure:
                 self.down(failure)
                 return False
-            busy = yield from self.grab_check(retire=False)
+            busy = yield from self.grab_check(retire=False, refresh=recompile)
+            if self.stopping:
+                return False
             try:
                 yield from self.barrier()
             except ChannelError as exc:
@@ -335,28 +393,46 @@ class EvdevTransport:
             if not busy:
                 self.down('no_exclusive_grab')
                 return False
+            if recompile:
+                self.recompiles += 1
+                if keycodes != self.keycodes:
+                    self.map_epoch += 1
+                    self.health['keyboard'] = 'untested'
+            self.keycodes = keycodes
+            self.dirty = False
             self.established = True
             return True
         return False
 
     def events(self, events):
-        # XTEST owns the sole raw-event stream and test surface. Only an
-        # established mapping can be invalidated for the generation.
         from Xlib import X
         from Xlib.ext import xinput
         for event in events:
-            reason = None
-            if event.type == X.MappingNotify:
-                reason = 'session_keymap_changed'
-            if (getattr(event, 'evtype', None) == xinput.HierarchyChanged and
-                    getattr(event, 'extension', None) == self.w.x.ev.display.get_extension_major('XInputExtension')):
-                reason = 'assigned_device_changed'
-            if reason:
+            mapping = (event.type == X.MappingNotify and
+                       getattr(event, 'request', X.MappingKeyboard) in (X.MappingKeyboard, X.MappingModifier))
+            hierarchy = (getattr(event, 'evtype', None) == xinput.HierarchyChanged and
+                         getattr(event, 'extension', None) == self.w.x.ev.display.get_extension_major('XInputExtension'))
+            if hierarchy and self.established:
+                # XI2's top-level flags aggregate ALL devices. Only per-device
+                # evidence can retire our assigned pair; unrelated hotplug is
+                # neither a map invalidation nor a reason to rediscover.
+                data = getattr(event, 'data', event)
+                info = data.get('info', []) if isinstance(data, dict) else getattr(data, 'info', [])
+                changed = xinput.SlaveRemoved | xinput.SlaveDetached | xinput.DeviceDisabled
+                for dev in info:
+                    def get(key, default=None):
+                        return dev.get(key, default) if isinstance(dev, dict) else getattr(dev, key, default)
+                    if (get('deviceid') in self.sources.values() and
+                            (get('flags', 0) & changed or (get('enabled') is not None and not get('enabled')))):
+                        self.down('assigned_device_changed')
+                continue
+            if (mapping or hierarchy) and self.health['state'] != 'down' and not self.stopping:
+                self.revision += 1
+                self.settle_until = self.clock() + 0.05
                 if self.established:
-                    self.down(reason)
-                else:
-                    self.revision += 1
-                    self.settle_until = self.clock() + 0.05
+                    self.dirty = True
+                    if self.recompile_runner is None:
+                        self.recompile_runner = self.settle(recompile=True)
 
     @staticmethod
     def guard(intent):
@@ -398,7 +474,7 @@ class EvdevTransport:
         except ChannelError:
             return False
 
-    def send_frames(self, dev, frames, expected, gap_us):
+    def send_frames(self, dev, frames, expected, gap_us, *, map_epoch=None):
         ack = self.last_ack = Ack(expected, self.sources, self.raw_seq)
         result = {'route': 'evdev', 'written': 0, 'frames_written': 0, 'expected': len(frames),
                   'written_prefix': {'frames': 0}, 'dispatch_status': 'not_dispatched',
@@ -409,7 +485,7 @@ class EvdevTransport:
             if self.health['state'] == 'down':
                 result['reason'] = 'channel_down'
                 return result
-            reply = yield from self.request(generation=self.w.generation, dev=dev, frames=frames, gap_us=gap_us)
+            reply = yield from self.request(_map_epoch=map_epoch, generation=self.w.generation, dev=dev, frames=frames, gap_us=gap_us)
             written = reply.get('frames_written')
             if (type(written) is not int or not 0 <= written <= len(frames) or
                     type(reply.get('ok')) is not bool or reply.get('error') not in (None, 'rejected', 'gate_closed', 'io_error', 'grab_lost') or
@@ -451,6 +527,8 @@ class EvdevTransport:
             result.update(dispatch_status='accepted' if ack.complete else 'unknown',
                           accepted=True if ack.complete else None,
                           reason=None if ack.complete else 'input_unacknowledged')
+        except ActError as exc:
+            result['reason'] = exc.reason
         except ChannelError as exc:
             result.update(dispatch_status='unknown' if exc.submitted else 'not_dispatched',
                           accepted=None if exc.submitted else False,

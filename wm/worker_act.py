@@ -513,6 +513,8 @@ class Engine:
         return {"status": "final", "receipt": a["receipt"], "reconciliation": a.get("reconciliations", [])} if a["final"] else self.pending(a)
 
     def tick(self):
+        if self.evdev:
+            self.evdev.tick()
         if self.selftest:
             try:
                 next(self.selftest)
@@ -531,6 +533,8 @@ class Engine:
     def stopping_tick(self):
         """Release-only shutdown. Interrupted actions stay durable/unknown."""
         self.shutdown = True
+        if self.evdev and self.evdev.stop_refresh():
+            return False
         if self.evdev and self.evdev.inflight:
             # Finish reading the outstanding reply before release_all uses
             # this stream. The owner closes the helper gate first on xorg.
@@ -945,13 +949,33 @@ class Engine:
                 self.holds["xtest"]["button"].discard(detail)
         return True
 
+    def wait_evdev(self, a, diagnostic=False):
+        while self.evdev.dirty and self.evdev.health['state'] != 'down':
+            if diagnostic:
+                if self.shutdown or (self.w.cache.control or {}).get('state') != 'agent':
+                    raise ActError('preempted')
+            else:
+                self.gate(a)
+            yield
+        if self.evdev.health['state'] == 'down':
+            raise ActError('channel_down')
+
     def send_evdev(self, a, r, events, diagnostic=False):
         point = yield from self.query("pointer", deadline=self.clock() + 0.2)
+        yield from self.wait_evdev(a, diagnostic)
+        epoch = self.evdev.map_epoch
+        if r.get('evdev_intent_epoch', epoch) != epoch:
+            raise ActError('provider_degraded')
         plan = self.evdev.plan(events, point)
         holds = self.holds["evdev"]
         # Validate the complete macro before sending any of its frames.
         offset = 0
         while offset < len(plan):
+            yield from self.wait_evdev(a, diagnostic)
+            if epoch != self.evdev.map_epoch:
+                # A prefix may already have run. Cleanup, never replay/replan
+                # a macro across a changed table.
+                raise ActError('provider_degraded')
             dev = plan[offset][0]
             end = offset
             while end < len(plan) and end-offset < 64 and plan[end][0] == dev:
@@ -966,7 +990,9 @@ class Engine:
                 if kind in ("key_down", "button_down"):
                     holds["key" if kind == "key_down" else "button"].add(detail)
             gap = 2000 if dev == "kbd" else 0
-            result = yield from self.evdev.send_frames(dev, [frame for _, frame, _ in group], expected, gap)
+            result = yield from self.evdev.send_frames(dev, [frame for _, frame, _ in group], expected, gap, map_epoch=epoch)
+            if dev == 'kbd':
+                r['evdev_map_epoch'] = epoch
             if not diagnostic and self.evdev.last_ack is not None:
                 a.setdefault("acks", []).append((r["id"], self.evdev.last_ack))
             r["route"] = "evdev"
@@ -1142,6 +1168,8 @@ class Engine:
         self.route = "evdev" if physical and self.evdev and self.evdev.health["state"] == "up" and requested != "xtest" else "xtest"
         if self.route == "evdev":
             self.evdev.guard(intent)
+            yield from self.wait_evdev(a)
+            r['evdev_intent_epoch'] = self.evdev.map_epoch
             if not a.get("evdev_grab_checked"):
                 a["evdev_grab_checked"] = True
                 if not (yield from self.evdev.grab_check()):
@@ -1764,9 +1792,13 @@ class Engine:
                 self.w.counters[s["effect"]["status"]] += 1
                 if s["effect"]["status"] == "verified" and s["kind"] in ("key", "text"):
                     if s.get("route") == "evdev" and self.evdev:
-                        self.evdev.health["keyboard"] = "tested"
+                        if (not self.evdev.dirty and self.evdev.health['state'] != 'down' and
+                                s.get('evdev_map_epoch') == self.evdev.map_epoch):
+                            self.evdev.health["keyboard"] = "tested"
                     else:
                         self.channel["keyboard"] = "ok"
+            s.pop('evdev_map_epoch', None)
+            s.pop('evdev_intent_epoch', None)
         r["pending_effects"] = copy.deepcopy(self.pending_effects)
         r["effect"] = copy.deepcopy((stopped or steps[-1])["effect"])
         state = self.lease_state.get(p["lease"])
@@ -1875,6 +1907,14 @@ class Engine:
             raise RuntimeError("all_input_channels_down")
 
     def evdev_selftest(self):
+        deadline = self.clock() + 5
+        while not (yield from self.evdev_selftest_attempt()):
+            if self.clock() >= deadline:
+                self.evdev.down('session_settlement_timeout')
+                return
+            yield
+
+    def evdev_selftest_attempt(self):
         keyboard = not any(v["mapped"] and v["type"] != "popup" for v in self.w.cache.windows.values())
         test = None
         old_focus = self.w.cache.focus
@@ -1882,11 +1922,12 @@ class Engine:
         r = {"id": "selftest", "attempts": [], "rev": {"dispatched": None}, "dispatch_status": "not_dispatched"}
         try:
             if not (yield from self.evdev.startup()):
-                return
+                return True
             origin = yield from self.query("pointer", deadline=self.clock() + 0.2)
             test = self.t.test_window(keyboard)
             yield from self.query("barrier", deadline=self.clock() + 0.2)
             events = []
+            r['evdev_intent_epoch'] = self.evdev.map_epoch
             if keyboard:
                 shift = self.t.keycode("Shift_L")
                 if shift is None:
@@ -1902,16 +1943,21 @@ class Engine:
             while keyboard and self.t.test_presses < 50 and self.clock() < until:
                 yield
             pointer = yield from self.query("pointer", deadline=self.clock() + 0.2)
-            if self.evdev.health['state'] == 'down':
-                raise ActError("channel_down")
+            yield from self.wait_evdev(a, diagnostic=True)
             if pointer["x"] != x or pointer["y"] != y or keyboard and self.t.test_presses != 50:
                 raise ActError("selftest_delivery_failed")
-            self.evdev.health.update(state="up", keyboard="tested" if keyboard else "untested", last_error=None)
+            self.evdev.health.update(state="up", keyboard="tested" if keyboard and
+                                     r.get('evdev_map_epoch') == self.evdev.map_epoch else "untested", last_error=None)
         except ActError as exc:
+            if exc.reason == 'provider_degraded':
+                # Only the private diagnostic surface may restart after a
+                # changed table. Application actions are never replayed.
+                return False
             self.evdev.down(exc.reason)
         finally:
             yield from self.release_evdev(a, r)
             self.t.end_test(test, old_focus)
+        return True
 
     def channel_selftest(self):
         start = self.clock()

@@ -1210,9 +1210,9 @@ class Worker:
     def channels(self):
         return {"xtest": dict(self.act.channel) if getattr(self, "act", None) else
                           {"state": "untested", "keyboard": "untested", "pointer": "untested"},
-                "evdev": dict(self.act.evdev.health) if getattr(self, "act", None) and self.act.evdev else
+                "evdev": dict(self.act.evdev.health, recompiles=self.act.evdev.recompiles) if getattr(self, "act", None) and self.act.evdev else
                          {"state": "untested" if self.record["profile"] == "xorg" else "down",
-                          "grab": False, "keyboard": "untested", "last_error":
+                          "grab": False, "keyboard": "untested", "recompiles": 0, "last_error":
                           None if self.record["profile"] == "xorg" else "backend_unsupported",
                           "reason": "not_implemented" if self.record["profile"] == "xorg" else "backend_unsupported"},
                 "paste": {"state": "unavailable", "reason": "not_implemented"},
@@ -1929,7 +1929,8 @@ class Worker:
                 self.x.ax.flush()
                 self.x.inp_ax.flush()
                 timeout = max(0, min(0.05, self.control_due - time.monotonic()))
-                if self.act and (self.act.active or self.act.queue or self.act.selftest):
+                if self.act and (self.act.active or self.act.queue or self.act.selftest or
+                                 self.act.evdev and self.act.evdev.recompile_runner is not None):
                     timeout = min(timeout, 0.001)
                 if self.x.ax.pending or self.x.inp_ax.pending:
                     timeout = min(timeout, 0.01)
