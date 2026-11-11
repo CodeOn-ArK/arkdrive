@@ -240,7 +240,16 @@ class Soak:
                 for tag in tags:
                     self.act(dict(target=handles[tag], intent=dict(kind='key', keys=['Tab']),
                                   expect=dict(kind='dialog_present', match={'title': tag+' popup'})))
-                self.wait_for(lambda wins: {tag+' popup' for tag in tags} <= {w['title'] for w in wins})
+                    # The modal rule: while a popup is up, acts must target
+                    # the modal itself. Dismiss each popup (Return on the
+                    # dialog) before triggering the next fixture's popup.
+                    obs, _ = self.wait_for(lambda wins, t=tag: any(
+                        w['title'] == t + ' popup' for w in wins))
+                    modal = next(w['handle'] for w in obs['state']['windows']
+                                 if w['title'] == tag + ' popup')
+                    self.act(dict(target=modal, require={'modal': modal},
+                                  intent=dict(kind='key', keys=['Return']),
+                                  expect=dict(kind='dialog_absent', window=modal)))
                 self.sample('popups', completed=start+len(tags))
             self.stop_fixtures(children)
             self.wait_for(lambda wins: not any(w['title'] in tags or w['title'] in
@@ -282,8 +291,10 @@ class Soak:
         if info.get('memory', {}).get('schema') != 1:
             raise RuntimeError('worker lacks Step-0 counter schema 1')
         self.meta = self.rpc.call('session.attach', dict(client='api', name='memory-step0'))
-        # A dedicated session must contain no pre-existing application windows.
-        self.wait_for(lambda wins: not wins)
+        # A dedicated session must contain no pre-existing application
+        # windows. The Openbox pseudo-window is always listed in state;
+        # it is WM scaffolding, not an application window.
+        self.wait_for(lambda wins: not any(w.get('title') != 'Openbox' for w in wins))
         self.churn('window_churn', self.args.windows)
         window_samples = list(self.samples)
         self.act_churn()
