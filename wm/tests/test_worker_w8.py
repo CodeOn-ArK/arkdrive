@@ -877,6 +877,8 @@ class BaselineRoutes(tree_tests.ProviderHarness):
         super().tick()
         for task in list(self.p.pending.values()):
             raw = self.raw if task['op'] == 'snapshot' else dict(alive=True)
+            if task['op'] == 'snapshot' and task['window'] in getattr(self, 'no_tree_handles', set()):
+                raw = dict(tree_tests.node(), status='unmatched', showing=False, visible=False, children=[])
             self.answer(raw, task=task)
         self.w.settle_pixels()
 
@@ -955,6 +957,134 @@ class BaselineRoutes(tree_tests.ProviderHarness):
             self.assertEqual(self.e.family_stamp(self.handle), before)
             self.assertEqual(step['effect']['status'], 'not_observed')
         self.assertEqual(step['route_change']['reason'], 'synthetic_input_rejected_suspect')
+
+    def unsettled_route(self, reaction=False, publication_dirty=False):
+        ref = self.refs()['entry']
+        step = self.key(target=dict(window=self.handle, ref=ref), timeout_ms=300,
+                        expect=dict(kind='text_equals', window=self.handle, ref=ref, value='never'))
+        self.repeat(step, 'one')
+        key = next(iter(self.e.routes.entries))
+        self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
+        snapshot = self.e.route_snapshot
+        prepared, dispatched = [], []
+        rect = dict(x=0, y=0, w=256, h=256)
+
+        def prepare(*args):
+            if not prepared:
+                # The app already displays this content, but the cache still
+                # has startup hashes/tree. The normal owner pump will publish
+                # it during verification unless dispatch drains it first.
+                self.shadow.update(rect, b'\x40\x00\x00\x00' * (256 * 256))
+                self.w.pixels.mark([rect])
+                self.raw['children'][0]['text'] = 'settled at dispatch'
+                if publication_dirty:
+                    self.raw['dirty'] = True
+                task = self.p.request('snapshot', self.handle)
+                self.assertIsNotNone(task)
+                prepared.append(self.e.family_stamp(self.handle))
+            return snapshot(*args)
+
+        def write(event):
+            if event[0] == 'key_down':
+                r = self.e.active['receipt']['steps'][0]
+                dispatched.append(copy.deepcopy(r['_family_before']))
+                if publication_dirty:
+                    self.assertIn(self.handle, self.p.dirty)
+                    self.raw.pop('dirty')
+            if reaction and event[0] == 'key_up':
+                # A real post-dispatch edit is first revealed by verification's
+                # ordinary hashing/publication, and must break the streak.
+                self.shadow.update(dict(x=20, y=20, w=1, h=1), b'\xff\x00\x00\x00')
+                self.w.pixels.mark([dict(x=20, y=20, w=1, h=1)])
+                self.raw['children'][0]['text'] = 'real reaction'
+                self.change_event()
+
+        self.t.on_write = write
+        with patch.object(self.e, 'route_snapshot', side_effect=prepare), \
+                patch.object(self.shadow, 'digest', wraps=self.shadow.digest) as hashed:
+            result = self.repeat(step, 'unsettled')['steps'][0]
+        # Only the known 16 dirty tiles (plus the real reaction's one tile)
+        # are hashed. Route stamping adds no full-screen scan or rehash.
+        self.assertEqual(hashed.call_count, 16 + int(reaction))
+        self.assertEqual(result['effect']['status'], 'not_observed')
+        self.assertEqual(result['dispatch_status'], 'accepted')
+        self.assertEqual(len(dispatched), 1)
+        # Both the 16 dirty tiles and the pending tree have been published
+        # before the baseline; there was no application reaction in doing so.
+        self.assertNotEqual(prepared[0], dispatched[0])
+        self.assertGreater(dispatched[0]['tree['+self.handle+']'],
+                           prepared[0]['tree['+self.handle+']'])
+        for tile in self.w.pixels.tiles(rect):
+            facet = self.w.pixels.facet(tile)
+            self.assertGreater(dispatched[0][facet], prepared[0][facet])
+        after = self.e.family_stamp(self.handle)
+        if reaction:
+            self.assertNotEqual(dispatched[0], after)
+            self.assertNotIn('route_change', result)
+            self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 0)
+        else:
+            self.assertEqual(dispatched[0], after)
+            self.assertEqual(result['route_change']['reason'], 'synthetic_input_rejected_suspect')
+
+    def test_unsettled_startup_pixels_and_tree_qualify_identical_content_miss(self):
+        self.unsettled_route()
+
+    def test_unsettled_startup_with_real_content_revealed_in_verification_resets(self):
+        self.unsettled_route(reaction=True)
+
+    def test_unsettled_completed_publication_does_not_wait_for_clean_flag(self):
+        self.unsettled_route(publication_dirty=True)
+
+    def pseudo_window(self, **changes):
+        win = dict(self.w.cache.windows[10], xid=12, title='Openbox', type='popup',
+                   geometry=dict(x=-100, y=-100, w=1, h=1))
+        win.update(changes)
+        self.w.cache.upsert(12, win)
+        self.w.cache.commit()
+        h = self.w.cache.handle(12)
+        self.no_tree_handles = {h}
+        return h
+
+    def test_no_tree_offscreen_popup_materialization_preserves_stamp_and_flip(self):
+        ref = self.refs()['entry']
+        step = self.key(target=dict(window=self.handle, ref=ref), timeout_ms=300,
+                        expect=dict(kind='text_equals', window=self.handle, ref=ref, value='never'))
+        self.repeat(step, 'one')
+        before = self.e.family_stamp(self.handle)
+        def write(event):
+            if event[0] == 'key_up':
+                h = self.pseudo_window()
+                # No AT-SPI object: even the unmatched publication facet is
+                # scaffolding, as in the live step-2 geometry/tree diff.
+                self.p.bump([h])
+                self.w.pixels.mark([dict(x=0, y=0, w=1, h=1)])
+        self.t.on_write = write
+        result = self.repeat(step, 'two')['steps'][0]
+        self.assertEqual(result['effect']['status'], 'not_observed')
+        self.assertEqual(self.e.family_stamp(self.handle), before)
+        self.assertEqual(result['route_change']['reason'], 'synthetic_input_rejected_suspect')
+
+    def test_no_tree_offscreen_popup_removal_preserves_stamp(self):
+        self.pseudo_window()
+        before = self.e.family_stamp(self.handle)
+        self.w.cache.remove(12)
+        self.w.cache.commit()
+        self.assertEqual(self.e.family_stamp(self.handle), before)
+
+    def test_popup_content_or_dialog_relationship_is_still_a_family_member(self):
+        before = self.e.family_stamp(self.handle)
+        h = self.pseudo_window()
+        self.assertEqual(self.e.family_stamp(self.handle), before)
+        self.p.cache.update(h, tree_tests.node('popup', 'entry', 'Real content'))
+        self.assertNotEqual(self.e.family_stamp(self.handle), before)
+        self.p.cache.prune(h)
+        for changes in (dict(transient_for=10), dict(is_modal=True),
+                        dict(geometry=dict(x=0, y=0, w=1, h=1)), dict(type='normal')):
+            with self.subTest(changes=changes):
+                self.w.cache.upsert(12, dict(self.w.cache.windows[12], **changes))
+                self.w.cache.commit()
+                self.assertNotEqual(self.e.family_stamp(self.handle), before)
+                self.pseudo_window()
 
     def real_change_breaks_streak(self, change):
         self.repeat(self.key(), 'one')

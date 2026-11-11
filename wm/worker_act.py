@@ -973,6 +973,8 @@ class Engine:
             while not self.w.settle_pixels():
                 self.gate(a)
                 yield
+            if r.get("target_resolved"):
+                yield from self.route_snapshot(a, r, r["target_resolved"])
             # Targeted macros may span multiple flush/ack groups. A focus or
             # modal transition between groups stops them before more input.
             release_only = events and all(ev[0] in ("key_up", "button_up") for ev in events)
@@ -983,8 +985,6 @@ class Engine:
                     any(self.w.cache.facets.get(f, 1) > r["macro_rev"] for f in ("focus", "modal"))):
                 raise ActError("unexpected_state")
             self.arm(a, r)
-            if r.get("target_resolved"):
-                self.route_snapshot(r, r["target_resolved"])
         if self.route == "evdev" and not cleanup:
             return (yield from self.send_evdev(a, r, events))
         ack = Ack([(k, d) for k, d, *xy in events], self.t.sources, self.t.raw_seq)
@@ -1381,13 +1381,28 @@ class Engine:
         except OSError as exc:
             raise ActError('worker_fault', 'route_table_unavailable') from exc
 
+    def family_content(self, member):
+        # Override-redirect WM focus/check windows can inherit the focused
+        # client's family. A noninteractive, invisible 1x1 placeholder is not
+        # application content. Absence of a tree alone never excludes a window.
+        g, h = member['geometry'], member['handle']
+        tree = getattr(self.w, 'tree', None)
+        nodes = getattr(getattr(tree, 'cache', None), 'windows', {}).get(h, {}).get('nodes')
+        raw = getattr(tree, 'raw', {}).get(h)
+        semantic = bool(nodes or raw and raw.get('status') != 'unmatched')
+        offscreen = (g['x'] + g['w'] <= 0 or g['y'] + g['h'] <= 0 or
+                     g['x'] >= self.w.screen['w'] or g['y'] >= self.w.screen['h'])
+        return not (member['type'] == 'popup' and g['w'] == g['h'] == 1 and offscreen and
+                    not member.get('transient_for') and not member.get('is_modal') and
+                    self.w.cache.focus != h and not semantic)
+
     def family_stamp(self, handle):
         cache = self.w.cache
         win = self.window(handle)
         if not win:
             return None
         family = win['family']
-        members = [v for v in cache.windows.values() if v['family'] == family]
+        members = [v for v in cache.windows.values() if v['family'] == family and self.family_content(v)]
         stamp = {}
         pixels = getattr(self.w, 'pixels', None)
         for member in members:
@@ -1401,15 +1416,37 @@ class Engine:
                     name = pixels.facet(tile)
                     stamp[name] = cache.facets.get(name, 1)
         for h, old in cache.tombstones.items():
-            if old.get('family') == family:
+            if old.get('family') == family and self.family_content(old):
                 stamp['removed:'+h] = cache.removed.get(h)
         return stamp
 
-    def route_snapshot(self, r, handle):
-        # The first actual dispatch, after focus/position setup, is the baseline.
-        if '_family_before' not in r:
-            r['_family_before'] = self.family_stamp(handle)
-            r['_focus_dispatch'] = self.w.cache.focus == handle
+    def route_snapshot(self, a, r, handle):
+        if '_family_before' in r:
+            return
+        # Reuse W4's publication pump, including a finite set of already
+        # building family snapshots. Do not chase the dirty flag or successors:
+        # completed publications remain usable while a follow-up builds.
+        tree = getattr(self.w, 'tree', None)
+        if tree:
+            win = self.window(handle)
+            family = {v['handle'] for v in self.w.cache.windows.values()
+                      if win and v['family'] == win['family'] and self.family_content(v)}
+            publications = [t for t in tree.pending.values()
+                            if t['op'] == 'snapshot' and t['window'] in family]
+            if publications:
+                tree.tick()
+            while any(not t['done'] and not t['breached'] for t in publications):
+                self.gate(a)
+                yield
+        # W3 already hashes only known dirty tiles. Finish that work before
+        # stamping, rather than treating verification's cache catch-up as input
+        # reaction. Never mark tiles or force an extra capture for this stamp.
+        while not self.w.covered() or not self.w.settle_pixels():
+            self.gate(a)
+            yield
+        self.gate(a)
+        r['_family_before'] = self.family_stamp(handle)
+        r['_focus_dispatch'] = self.w.cache.focus == handle
 
     def learn_route(self, r, handle):
         key, route = r.get('_route_key'), r.get('route')
@@ -1596,7 +1633,7 @@ class Engine:
             if k == 'text' and not s.get('_node') and 'focused' not in node.get('states', []):
                 raise ActError('precondition_failed')
             yield from self.focus(a, r, handle)
-            self.route_snapshot(r, handle)
+            yield from self.route_snapshot(a, r, handle)
             fields = dict(text=intent["text"], focused_required=not bool(s.get('_node'))) if k == "text" else dict(action=intent.get("action"))
             self.gate(a)
             self.arm(a, r)
@@ -1662,7 +1699,6 @@ class Engine:
             r["macro_focus"], r["macro_modal"] = self.w.cache.focus, list(self.w.cache.modal)
             r["macro_rev"] = self.w.cache.rev
             yield from self.position(a, r, point, handle)
-        self.route_snapshot(r, handle)
         if route == 'paste':
             self.gate(a)
             self.arm(a, r)
@@ -1672,6 +1708,7 @@ class Engine:
             yield from self.send(a, r, self.key_events(paste_codes))
             return
         if k in ("focus_window", "close_window"):
+            yield from self.route_snapshot(a, r, handle)
             self.gate(a)
             self.arm(a, r)
             start = self.clock()
