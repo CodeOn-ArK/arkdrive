@@ -459,25 +459,27 @@ class AsyncX:
         # Xlib swallows handler exceptions, so report to the owner explicitly.
         self.fatal.append(exc)
 
-    def ask(self, cls, callback, *, optional=False, **args):
+    def ask(self, cls, callback, *, optional=False, error_callback=None, **args):
         req = cls(display=self.connection.display, defer=True, **args)
-        self.pending.append((req, callback, optional))
+        self.pending.append((req, callback, optional, error_callback))
 
     def pump(self):
         events = []
         while self.connection.pending_events():
             events.append(self.connection.next_event())
         pending, self.pending = self.pending, []
-        for req, callback, optional in pending:
+        for req, callback, optional, error_callback in pending:
             if req._error is not None:
-                if optional and isinstance(req._error, (error.BadWindow, error.BadDrawable)):
+                if error_callback is not None:
+                    error_callback(req._error)
+                elif optional and isinstance(req._error, (error.BadWindow, error.BadDrawable)):
                     callback(None)
                 else:
                     raise req._error
             elif req._data is not None:
                 callback(req._data)
             else:
-                self.pending.append((req, callback, optional))
+                self.pending.append((req, callback, optional, error_callback))
         return events
 
     def flush(self):
@@ -583,7 +585,8 @@ class XState:
                 if present:
                     own = self.w.recorded_openbox()
                     if own is None or own.poll() is not None:
-                        raise RuntimeError("wm_already_running")
+                        stale_wm()
+                        return
                     # Openbox's WM-check/selection windows have no _NET_WM_PID.
                     # The validated process identity and root redirect ownership
                     # are sufficient: two live WMs cannot own this root.
@@ -591,6 +594,42 @@ class XState:
                     launch(False)
                 else:
                     launch(True)
+            def stale_wm():
+                if (checks["selection"] or len(checks["check"]) != 1 or
+                        not checks["check"][0] or
+                        checks["attributes"]["all_event_masks"] & X.SubstructureRedirectMask or
+                        not self.w.recorded_openbox_dead()):
+                    raise RuntimeError("wm_already_running")
+                def exists(_):
+                    raise RuntimeError("wm_already_running")
+                def missing(exc):
+                    if not isinstance(exc, error.BadWindow):
+                        raise RuntimeError("wm_already_running")
+                    # Recheck presence after the BadWindow round trip. A WM
+                    # taking over while the proof was pending must still win.
+                    latest = {}
+                    def verified(key, value):
+                        latest[key] = value
+                        if len(latest) != 3:
+                            return
+                        if (latest["selection"] or latest["check"] != checks["check"] or
+                                latest["attributes"]["all_event_masks"] & X.SubstructureRedirectMask or
+                                not self.w.recorded_openbox_dead()):
+                            raise RuntimeError("wm_already_running")
+                        self.root.delete_property(self.atoms["_NET_SUPPORTING_WM_CHECK"])
+                        # Consume the deletion before starting a WM on another
+                        # connection; a buffered delete must never erase the
+                        # fresh child's newly published check property.
+                        self.ax.ask(request.GetInputFocus, lambda _: launch(True))
+                    self.ax.ask(request.GetSelectionOwner,
+                                lambda d: verified("selection", xid(d["owner"])),
+                                selection=self.atoms["WM_S0"])
+                    self.property(self.root, "_NET_SUPPORTING_WM_CHECK",
+                                  lambda d: verified("check", list(prop_values(d))))
+                    self.ax.ask(request.GetWindowAttributes,
+                                lambda d: verified("attributes", d), window=self.root)
+                self.ax.ask(request.GetWindowAttributes, exists, error_callback=missing,
+                            window=checks["check"][0])
             def launch(spawn):
                 self.root.change_attributes(event_mask=X.SubstructureNotifyMask | X.PropertyChangeMask
                                             | X.StructureNotifyMask | X.PointerMotionMask)
@@ -618,7 +657,6 @@ class XState:
         if self.phase == "channel_setup" and self.w.act.t.initialised and not self.ax.pending:
             if self.w.record["profile"] == "xorg":
                 evdev = EvdevTransport(self.w, self.w.act.t)
-                evdev.discover(self.w.act.t.device_list)
                 self.w.act.evdev = evdev
                 mask = (xinput.RawKeyPressMask | xinput.RawKeyReleaseMask | xinput.RawButtonPressMask |
                         xinput.RawButtonReleaseMask | xinput.RawMotionMask | xinput.HierarchyChangedMask)
@@ -1273,6 +1311,25 @@ class Worker:
             return AdoptedOpenbox(pid, stamp)
         except (OSError, ValueError, KeyError, TypeError):
             return None
+
+    def recorded_openbox_dead(self):
+        # Failure to validate/adopt is not proof of death (permissions, foreign
+        # cmdline or a reused live PID must all keep refusing WM replacement).
+        try:
+            identity_path = self.sd / "openbox.json"
+            if not identity_path.exists():
+                identity_path = self.sd / "worker.json"
+            identity = json.loads(identity_path.read_text())
+            pid, stamp = identity["wm_pid"], identity["wm_starttime"]
+            if type(pid) is not int or pid <= 0 or not isinstance(stamp, str) or not stamp:
+                return False
+            try:
+                fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                return True
+            return len(fields) >= 20 and fields[0] == "Z"
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            return False
 
     def read_openbox_version(self):
         # Package metadata is local and read only; never execute openbox just

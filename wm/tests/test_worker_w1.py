@@ -567,6 +567,194 @@ class XEventTests(unittest.TestCase):
         self.assertEqual(xs.w.x_errors, [bad_access])
 
 
+class StaleWMRestartTests(SandboxCase):
+    """Drive the real startup phase and AsyncX error pump with fake replies."""
+    def setUp(self):
+        super().setUp()
+        self.owner = w.Worker.__new__(w.Worker)
+        self.owner.sd = self.path
+        self.owner.openbox = None
+        self.owner.timings, self.owner.elapsed = {}, lambda: 1
+        self.owner.cache = w.StateCache('s1', GEN)
+        self.owner.settle_pixels = lambda: True
+        self.owner.recorded_openbox = Mock(return_value=None)
+        self.owner.read_openbox_version = Mock()
+        self.owner.start_openbox = Mock(side_effect=self.spawn)
+        (self.path / 'openbox.json').write_text(json.dumps({'wm_pid': 321, 'wm_starttime': 'old-wm'}))
+        self.proc_state = 'missing'
+        self.selection, self.redirect, self.check = 0, 0, [50]
+        self.check_error = w.error.BadWindow
+        self.check_queried, self.after_badwindow = [], None
+        self.spawned = False
+        self.deletion_acked = False
+        self.x = xs = w.XState.__new__(w.XState)
+        xs.w, xs.phase, xs.root = self.owner, 'versions', Mock(id=1)
+        xs.atoms = {name: i+100 for i, name in enumerate(w.ATOM_NAMES)}
+        xs.wm_ready, xs.initialised = False, False
+        xs.refreshing = set()
+        xs.inp_ax = NS(pending=[])
+        xs.reconcile, xs.derive = Mock(), Mock()
+        connection = Mock()
+        connection.pending_events.return_value = 0
+        xs.ax = w.AsyncX(connection, [])
+        real_ask = xs.ax.ask
+        def ask(cls, cb, **kw):
+            data, exc = None, None
+            if cls is w.request.GetSelectionOwner:
+                data = {'owner': self.selection}
+            elif cls is w.request.GetWindowAttributes:
+                if kw['window'] is xs.root:
+                    data = {'all_event_masks': self.redirect}
+                else:
+                    self.check_queried.append(kw['window'])
+                    if self.check_error:
+                        exc = self.check_error.__new__(self.check_error)
+                    else:
+                        data = {'all_event_masks': 0}
+                    if self.after_badwindow:
+                        self.after_badwindow()
+            elif cls is w.request.GetProperty:
+                self.assertEqual(kw['property'], xs.atoms['_NET_SUPPORTING_WM_CHECK'])
+                data = {'property_type': 1, 'value': (32, [60] if self.spawned else self.check)}
+            elif cls is w.request.GetInputFocus:
+                self.assertFalse(self.spawned)
+                xs.root.delete_property.assert_called_once_with(xs.atoms['_NET_SUPPORTING_WM_CHECK'])
+                data = {'focus': 0}
+                callback = cb
+                def cb(reply):
+                    self.deletion_acked = True
+                    callback(reply)
+            else:
+                raise AssertionError(cls)
+            # Keep AsyncX.ask/pump and its exact error classification real.
+            real_ask(lambda **_: NS(_data=data, _error=exc), cb, **kw)
+        xs.ax.ask = ask
+
+    def spawn(self):
+        self.assertTrue(self.deletion_acked)
+        self.spawned = True
+        self.owner.openbox = NS(pid=322)
+
+    def run_start(self):
+        real_read = Path.read_text
+        def read(path, *args, **kwargs):
+            if str(path) == '/proc/321/stat':
+                if self.proc_state == 'missing':
+                    raise FileNotFoundError()
+                if self.proc_state == 'denied':
+                    raise PermissionError()
+                if self.proc_state == 'malformed':
+                    return 'unreadable stat'
+                if self.proc_state == 'short-zombie':
+                    return '321 (openbox) Z'
+                return '321 (openbox) ' + self.proc_state + ' ' + ' '.join(['0']*18 + ['old-wm'])
+            return real_read(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', read), \
+                patch.object(w, 'Engine', return_value=NS(t=NS(initialised=False))), \
+                patch.object(w, 'XTestTransport', return_value=NS(initialised=False)):
+            self.x.advance()
+            for _ in range(10):
+                self.x.ax.pump()
+                self.x.advance()
+                if self.x.phase == 'channel_setup':
+                    return
+        self.fail('WM startup did not proceed')
+
+    def assert_refused(self):
+        with self.assertRaisesRegex(RuntimeError, '^wm_already_running$'):
+            self.run_start()
+        self.owner.start_openbox.assert_not_called()
+        self.x.root.delete_property.assert_not_called()
+
+    def test_dead_record_destroyed_window_no_owner_spawns_fresh_openbox(self):
+        self.run_start()
+        self.owner.start_openbox.assert_called_once_with()
+        self.assertEqual(self.owner.openbox.pid, 322)
+        self.assertEqual(self.check_queried, [50])
+        self.x.root.delete_property.assert_called_once_with(self.x.atoms['_NET_SUPPORTING_WM_CHECK'])
+        self.x.reconcile.assert_called_once_with()
+        self.assertTrue(self.x.initialised)
+        self.assertEqual(self.x.phase, 'channel_setup')
+
+    def test_zombie_record_destroyed_window_no_owner_spawns(self):
+        self.proc_state = 'Z'
+        self.run_start()
+        self.owner.start_openbox.assert_called_once_with()
+
+    def test_dead_record_but_check_window_alive_refuses(self):
+        self.check_error = None
+        self.assert_refused()
+        self.assertEqual(self.check_queried, [50])
+
+    def test_live_foreign_selection_owner_refuses(self):
+        self.selection = 51
+        self.assert_refused()
+        self.assertEqual(self.check_queried, [])
+
+    def test_live_foreign_redirect_owner_refuses(self):
+        self.redirect = w.X.SubstructureRedirectMask
+        self.assert_refused()
+        self.assertEqual(self.check_queried, [])
+
+    def test_live_recorded_openbox_still_adopted(self):
+        own = NS(pid=321, poll=lambda: None)
+        self.owner.recorded_openbox.return_value = own
+        self.proc_state = 'S'
+        self.selection, self.redirect = 50, w.X.SubstructureRedirectMask
+        self.run_start()
+        self.assertIs(self.owner.openbox, own)
+        self.owner.start_openbox.assert_not_called()
+        self.owner.read_openbox_version.assert_called_once_with()
+        self.x.root.delete_property.assert_not_called()
+        self.assertEqual(self.check_queried, [])
+
+    def test_live_unadoptable_pid_is_not_proof_of_death(self):
+        self.proc_state = 'S'
+        self.assert_refused()
+
+    def test_missing_or_invalid_identity_is_not_proof_of_death(self):
+        for contents in (None, '{}', 'bad json', '{"wm_pid":true,"wm_starttime":"old"}'):
+            with self.subTest(contents=contents):
+                self.setUp()
+                record = self.path / 'openbox.json'
+                if contents is None:
+                    record.unlink()
+                else:
+                    record.write_text(contents)
+                self.assert_refused()
+
+    def test_proc_permission_or_parse_failure_is_not_proof_of_death(self):
+        for state in ('denied', 'malformed', 'short-zombie'):
+            with self.subTest(state=state):
+                self.setUp()
+                self.proc_state = state
+                self.assert_refused()
+
+    def test_baddrawable_or_badaccess_does_not_prove_window_destroyed(self):
+        for exc in (w.error.BadDrawable, w.error.BadAccess):
+            with self.subTest(exc=exc):
+                self.setUp()
+                self.check_error = exc
+                self.assert_refused()
+
+    def test_selection_appearing_during_window_query_refuses(self):
+        self.after_badwindow = lambda: setattr(self, 'selection', 51)
+        self.assert_refused()
+
+    def test_redirect_appearing_during_window_query_refuses(self):
+        self.after_badwindow = lambda: setattr(self, 'redirect', w.X.SubstructureRedirectMask)
+        self.assert_refused()
+
+    def test_check_property_changing_during_window_query_refuses(self):
+        self.after_badwindow = lambda: setattr(self, 'check', [51])
+        self.assert_refused()
+
+    def test_worker_metadata_fallback_can_prove_dead_openbox(self):
+        (self.path / 'openbox.json').rename(self.path / 'worker.json')
+        self.run_start()
+        self.owner.start_openbox.assert_called_once_with()
+
+
 class XIdentityTests(SandboxCase):
     def setUp(self):
         super().setUp()

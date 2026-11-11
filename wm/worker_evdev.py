@@ -88,6 +88,12 @@ class EvdevTransport:
         self.connector = connector or self.connect
         self.health = {'state': 'untested', 'grab': False, 'keyboard': 'untested', 'last_error': None}
         self.initialised = False
+        # Establishment is independent of the later delivery-test health. Xorg
+        # may still be attaching our slaves while this transport is created.
+        self.established = False
+        self.revision = 0
+        self.settle_until = self.clock() + 0.05
+        self.provided_keycodes = keycodes
         self.inflight = False
         self.last_ack = None
 
@@ -223,6 +229,7 @@ class EvdevTransport:
                 self.reconnects += 1
 
     def discover(self, devices):
+        self.sources.clear()
         for dev in devices:
             def get(k):
                 return getattr(dev, k) if hasattr(dev, k) else dev[k]
@@ -235,12 +242,46 @@ class EvdevTransport:
                 self.sources['keyboard' if name == 'kbd' else 'pointer'] = get('deviceid')
         self.initialised = True
 
-    def grab_check(self):
+    def devices(self, callback):
+        from Xlib.ext import xinput
+        self.w.x.ax.ask(xinput.XIQueryDevice, lambda d: callback(d['devices']),
+                        error_callback=lambda _: callback(None),
+                        opcode=self.w.x.ev.display.get_extension_major('XInputExtension'),
+                        deviceid=xinput.AllDevices)
+
+    def snapshot(self):
+        devices = []
+        try:
+            self.devices(lambda value: devices.append(value))
+        except (OSError, ValueError, AttributeError, TypeError) as exc:
+            raise ChannelError('assigned_slaves_unavailable') from exc
+        deadline = self.clock() + 0.25
+        while not devices:
+            if self.clock() >= deadline:
+                raise ChannelError('assigned_slaves_unavailable')
+            yield
+        if devices[0] is None:
+            raise ChannelError('assigned_slaves_unavailable')
+        self.discover(devices[0])
+
+    def barrier(self):
+        done = []
+        self.xtest.barrier(lambda _: done.append(True))
+        deadline = self.clock() + 0.25
+        while not done:
+            if self.clock() >= deadline:
+                raise ChannelError('session_settlement_timeout')
+            yield
+        # Even a synchronous test callback must allow event ingestion before
+        # the revision is compared and the channel is established.
+        yield
+
+    def grab_check(self, *, retire=True):
         try:
             reply = yield from self.request(op='grab_check')
             busy = reply.get('kbd') == reply.get('ptr') == 'busy' and reply.get('ok') is True
             self.health['grab'] = busy
-            if not busy:
+            if not busy and retire:
                 self.down('no_exclusive_grab')
             return busy
         except ChannelError as exc:
@@ -248,34 +289,74 @@ class EvdevTransport:
             return False
 
     def startup(self):
-        if self.health['state'] == 'down':
-            return False
-        if set(self.sources) != {'keyboard', 'pointer'}:
-            self.down('assigned_slaves_unavailable')
-            return False
-        if not (yield from self.grab_check()):
-            return False
-        if self.health['state'] == 'down':
-            return False
-        try:
-            if self.keycodes is None:
-                self.keycodes = compile_keycodes(':' + str(self.w.record['display']), self.sources['keyboard'])
-        except (OSError, ValueError, AttributeError):
-            self.down('session_keymap_unavailable')
-            return False
-        return True
+        deadline = self.clock() + 2
+        while self.health['state'] != 'down':
+            if self.established:
+                return True
+            if self.clock() >= deadline:
+                self.down('session_settlement_timeout')
+                return False
+            if self.clock() < self.settle_until:
+                yield
+                continue
+            revision, failure = self.revision, None
+            try:
+                yield from self.snapshot()
+                if self.revision != revision:
+                    continue
+                if set(self.sources) != {'keyboard', 'pointer'}:
+                    failure = 'assigned_slaves_unavailable'
+                else:
+                    try:
+                        self.keycodes = (self.provided_keycodes if self.provided_keycodes is not None else
+                                        compile_keycodes(':' + str(self.w.record['display']), self.sources['keyboard']))
+                    except (OSError, ValueError, AttributeError):
+                        failure = 'session_keymap_unavailable'
+                # A round trip on the event connection orders notifications
+                # already generated during discovery/compilation before commit.
+                yield from self.barrier()
+            except ChannelError as exc:
+                failure = exc.reason
+            if self.revision != revision:
+                continue
+            if failure:
+                self.down(failure)
+                return False
+            busy = yield from self.grab_check(retire=False)
+            try:
+                yield from self.barrier()
+            except ChannelError as exc:
+                self.down(exc.reason)
+                return False
+            if self.revision != revision:
+                continue
+            if self.health['state'] == 'down':
+                return False
+            if not busy:
+                self.down('no_exclusive_grab')
+                return False
+            self.established = True
+            return True
+        return False
 
     def events(self, events):
-        # XTEST owns the sole raw-event stream and test surface. A changed
-        # keymap retires this compiled evdev mapping rather than guessing.
+        # XTEST owns the sole raw-event stream and test surface. Only an
+        # established mapping can be invalidated for the generation.
         from Xlib import X
         from Xlib.ext import xinput
         for event in events:
+            reason = None
             if event.type == X.MappingNotify:
-                self.down('session_keymap_changed')
+                reason = 'session_keymap_changed'
             if (getattr(event, 'evtype', None) == xinput.HierarchyChanged and
                     getattr(event, 'extension', None) == self.w.x.ev.display.get_extension_major('XInputExtension')):
-                self.down('assigned_device_changed')
+                reason = 'assigned_device_changed'
+            if reason:
+                if self.established:
+                    self.down(reason)
+                else:
+                    self.revision += 1
+                    self.settle_until = self.clock() + 0.05
 
     @staticmethod
     def guard(intent):

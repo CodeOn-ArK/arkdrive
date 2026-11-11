@@ -671,6 +671,7 @@ class EngineW6(base.Harness):
         self.w.record['profile'] = 'xorg'
         self.log = []
         self.ack_evdev, self.fail_frame = True, None
+        self.slave_ids = {'keyboard': 9, 'pointer': 10}
         self.frame_count = 0
         self.buffers = {'kbd': [], 'ptr': []}
         mapping = {37: 29, 50: 42, 64: 56, 133: 125, 38: 30, 56: 48, 68: 60, 36: 28, 23: 15}
@@ -708,7 +709,7 @@ class EngineW6(base.Harness):
                 self.t.ack = previous
                 if self.ack_evdev:
                     self.t.raw_seq += 1
-                    source = 9 if dev == 'kbd' else 10
+                    source = self.slave_ids['keyboard' if dev == 'kbd' else 'pointer']
                     self.t.raw.append((self.t.raw_seq, ev[0], ev[1], source, source))
         def gate(generation):
             c = self.w.cache.control
@@ -718,9 +719,16 @@ class EngineW6(base.Harness):
             connector=lambda: MemorySocket(self.helper.handle, self.log, fragment=65536),
             clock=lambda: self.now, keycodes=mapping)
         self.evdev.sources = {'keyboard': 9, 'pointer': 10}
+        self.evdev.devices = Mock(side_effect=lambda cb: cb(self.assigned_devices()))
         self.evdev.health.update(state='up', grab=True)
         self.e.evdev = self.evdev
         self.addCleanup(self.evdev.close)
+
+    def assigned_devices(self):
+        from Xlib.ext import xinput
+        return [NS(name=name, enabled=True, use=use, deviceid=self.slave_ids[kind])
+                for name, kind, use in (('kbd', 'keyboard', xinput.SlaveKeyboard),
+                                        ('ptr', 'pointer', xinput.SlavePointer))]
 
     def params(self, steps=None, **extra):
         return super().params(steps, **dict(generation=GEN, **extra))
@@ -785,6 +793,228 @@ class EngineW6(base.Harness):
         self.assertEqual(self.e.channel['state'], 'ok')
         self.assertEqual(self.evdev.health['last_error'], 'input_unacknowledged')
 
+    def settlement_event(self, hierarchy=False):
+        from Xlib import X
+        from Xlib.ext import ge, xinput
+        self.w.x = NS(ev=NS(display=NS(get_extension_major=lambda name: 131)))
+        return (NS(type=ge.GenericEventCode, evtype=xinput.HierarchyChanged, extension=131)
+                if hierarchy else NS(type=X.MappingNotify))
+
+    def test_settlement_burst_compiles_final_hierarchy_and_runs_full_selftests(self):
+        self.evdev.provided_keycodes = None
+        mapping = dict(self.evdev.keycodes)
+        self.evdev.health.update(state='untested', grab=False)
+        self.w.cache.windows.clear()
+        self.e.start_selftest()
+        with patch('worker_evdev.compile_keycodes', return_value=mapping) as compile_map:
+            for n in range(4):
+                self.slave_ids = {'keyboard': 19+n, 'pointer': 29+n}
+                self.evdev.events([self.settlement_event(), self.settlement_event(True)])
+                for _ in range(20):
+                    self.tick()
+                self.assertFalse(self.evdev.established)
+                self.assertEqual(self.evdev.health['state'], 'untested')
+                compile_map.assert_not_called()
+                self.evdev.devices.assert_not_called()
+                self.assertFalse(self.log)
+            self.drain()
+            compile_map.assert_called_once_with(':91', 22)
+        self.assertEqual(self.evdev.sources, {'keyboard': 22, 'pointer': 32})
+        self.assertTrue(self.evdev.established)
+        self.assertEqual(self.evdev.health, dict(state='up', grab=True, keyboard='tested', last_error=None))
+        self.assertEqual(self.e.channel['state'], 'ok')
+        self.assertEqual(sum(len(r.get('frames', [])) for r in self.log), 200)
+        self.assertEqual(len(self.t.log), 400)
+        self.assertEqual(self.t.test_presses, 50)
+        self.assertEqual(self.t.position, {'x': 2, 'y': 2})
+
+    def test_settlement_during_discovery_discards_snapshot_before_compile(self):
+        mapping = dict(self.evdev.keycodes)
+        self.evdev.provided_keycodes = None
+        def devices(cb):
+            snapshot = self.assigned_devices()
+            if self.evdev.devices.call_count == 1:
+                self.slave_ids = {'keyboard': 19, 'pointer': 20}
+                self.evdev.events([self.settlement_event(True)])
+            cb(snapshot)
+        self.evdev.devices.side_effect = devices
+        self.e.start_selftest()
+        with patch('worker_evdev.compile_keycodes', return_value=mapping) as compile_map:
+            self.drain()
+            compile_map.assert_called_once_with(':91', 19)
+        self.assertEqual(self.evdev.devices.call_count, 2)
+        self.assertEqual(self.evdev.sources, self.slave_ids)
+        self.assertEqual(self.evdev.health['state'], 'up')
+
+    def test_settlement_during_compile_retries_instead_of_latching_compile_failure(self):
+        mapping = dict(self.evdev.keycodes)
+        self.evdev.provided_keycodes = None
+        def compile_map(display, keyboard):
+            if keyboard == 9:
+                self.slave_ids = {'keyboard': 19, 'pointer': 20}
+                self.evdev.events([self.settlement_event()])
+                raise OSError('old slave disappeared during compile')
+            return mapping
+        self.e.start_selftest()
+        with patch('worker_evdev.compile_keycodes', side_effect=compile_map) as compile_mock:
+            self.drain()
+            self.assertEqual([call.args for call in compile_mock.call_args_list], [(':91', 9), (':91', 19)])
+        self.assertTrue(self.evdev.established)
+        self.assertEqual(self.evdev.health['state'], 'up')
+        self.assertIsNone(self.evdev.health['last_error'])
+
+    def test_settlement_during_grab_check_rediscovers_and_recompiles(self):
+        mapping = dict(self.evdev.keycodes)
+        self.evdev.provided_keycodes = None
+        sock = PausedSocket(self.helper.handle, self.log)
+        self.evdev.connector = Mock(return_value=sock)
+        self.e.start_selftest()
+        with patch('worker_evdev.compile_keycodes', return_value=mapping) as compile_map:
+            for _ in range(1000):
+                self.tick()
+                if sock.blocked:
+                    break
+            self.assertTrue(sock.blocked)
+            self.assertFalse(self.evdev.established)
+            self.slave_ids = {'keyboard': 19, 'pointer': 20}
+            self.evdev.events([self.settlement_event(True), self.settlement_event()])
+            self.assertIs(self.evdev.sock, sock)
+            sock.paused = False
+            self.drain()
+            self.assertEqual([c.args for c in compile_map.call_args_list], [(':91', 9), (':91', 19)])
+        self.assertEqual(self.evdev.devices.call_count, 2)
+        self.assertEqual(sum(r.get('op') == 'grab_check' for r in self.log), 2)
+        self.assertEqual(self.evdev.health['state'], 'up')
+        self.evdev.connector.assert_called_once_with()
+
+    def test_free_grab_during_settlement_can_establish_after_final_busy_probe(self):
+        handle = self.helper.handle
+        def reply(req):
+            result = handle(req)
+            if req.get('op') == 'grab_check' and self.evdev.devices.call_count == 1:
+                self.evdev.events([self.settlement_event(True)])
+                result['kbd'] = 'free'
+            return result
+        self.evdev.connector = lambda: MemorySocket(reply, self.log, fragment=65536)
+        self.e.start_selftest()
+        self.drain()
+        self.assertEqual(self.evdev.devices.call_count, 2)
+        self.assertTrue(self.evdev.established)
+        self.assertEqual(self.evdev.health['state'], 'up')
+
+    def test_discovery_failure_after_settlement_is_contained_and_honest(self):
+        self.evdev.events([self.settlement_event(), self.settlement_event(True)])
+        self.evdev.devices.side_effect = lambda cb: cb([])
+        self.w.cache.windows.clear()
+        self.e.start_selftest()
+        self.drain()
+        self.assert_xtest_allows_worker_ready('assigned_slaves_unavailable')
+        self.assertEqual(self.evdev.sources, {})  # Cached identities cannot survive a fresh query.
+        self.assertFalse(self.evdev.established)
+        self.assertEqual(len(self.t.log), 200)
+        self.assertFalse(any('frames' in req for req in self.log))
+
+    def test_discovery_error_reply_and_timeout_are_contained(self):
+        for value in (None, 'timeout'):
+            with self.subTest(value=value):
+                self.setUp()
+                self.evdev.devices.side_effect = lambda cb: cb(None) if value is None else None
+                self.e.start_selftest()
+                self.drain()
+                self.assert_xtest_allows_worker_ready('assigned_slaves_unavailable')
+                self.assertFalse(self.evdev.established)
+
+    def test_bootstrap_queries_current_session_and_contains_xi_query_error(self):
+        from Xlib.ext import xinput
+        for query_error in (False, True):
+            with self.subTest(query_error=query_error):
+                self.setUp()
+                del self.evdev.devices  # Use the production XIQueryDevice bridge.
+                self.t.device_list = self.assigned_devices()  # Obsolete cached ids 9/10.
+                self.slave_ids = {'keyboard': 19, 'pointer': 20}
+                queries = []
+                def ask(cls, cb, **kw):
+                    self.assertIs(cls, xinput.XIQueryDevice)
+                    self.assertEqual((kw['opcode'], kw['deviceid']), (131, xinput.AllDevices))
+                    queries.append(True)
+                    if query_error:
+                        kw['error_callback'](OSError('fake XI failure'))
+                    else:
+                        cb({'devices': self.assigned_devices()})
+                self.w.x = NS(ax=NS(ask=ask), ev=NS(display=NS(get_extension_major=lambda _: 131)))
+                self.e.start_selftest()
+                self.drain()
+                self.assertEqual(len(queries), 1)
+                if query_error:
+                    self.assert_xtest_allows_worker_ready('assigned_slaves_unavailable')
+                else:
+                    self.assertEqual(self.evdev.sources, self.slave_ids)
+                    self.assertTrue(self.evdev.established)
+                    self.assertEqual(self.evdev.health['state'], 'up')
+
+    def test_compile_failure_after_settlement_keeps_xtest_and_cause(self):
+        self.evdev.provided_keycodes = None
+        self.evdev.events([self.settlement_event()])
+        self.e.start_selftest()
+        with patch('worker_evdev.compile_keycodes', side_effect=OSError('missing map')):
+            self.drain()
+        self.assert_xtest_allows_worker_ready('session_keymap_unavailable')
+        self.assertFalse(self.evdev.established)
+
+    def test_grab_failure_after_settlement_keeps_xtest_and_cause(self):
+        self.evdev.events([self.settlement_event(True)])
+        self.helper.grab = lambda dev: 'free'
+        self.e.start_selftest()
+        self.drain()
+        self.assert_xtest_allows_worker_ready('no_exclusive_grab')
+        self.assertFalse(self.evdev.established)
+        self.assertFalse(self.evdev.health['grab'])
+        self.assertFalse(any('frames' in req for req in self.log))
+
+    def test_settlement_during_final_barrier_cannot_establish_old_snapshot(self):
+        original_barrier = self.t.barrier
+        barriers = []
+        def barrier(cb):
+            barriers.append(True)
+            if len(barriers) == 2:  # After the first successful startup grab.
+                self.slave_ids = {'keyboard': 19, 'pointer': 20}
+                self.evdev.events([self.settlement_event(True)])
+            original_barrier(cb)
+        self.t.barrier = barrier
+        self.e.start_selftest()
+        self.drain()
+        self.assertEqual(self.evdev.devices.call_count, 2)
+        self.assertEqual(self.evdev.sources, self.slave_ids)
+        self.assertTrue(self.evdev.established)
+        self.assertEqual(self.evdev.health['state'], 'up')
+
+    def test_endless_settlement_is_bounded_and_keeps_xtest(self):
+        self.e.start_selftest()
+        for _ in range(105):
+            self.evdev.events([self.settlement_event()])
+            for _ in range(20):
+                self.tick()
+        self.drain()
+        self.assert_xtest_allows_worker_ready('session_settlement_timeout')
+        self.assertFalse(self.evdev.established)
+        self.evdev.devices.assert_not_called()
+
+    def test_established_mapping_and_hierarchy_changes_retire_without_rebootstrap(self):
+        for hierarchy, reason in ((False, 'session_keymap_changed'), (True, 'assigned_device_changed')):
+            with self.subTest(hierarchy=hierarchy):
+                self.setUp()
+                self.e.start_selftest()
+                self.drain()
+                self.assertTrue(self.evdev.established)
+                self.evdev.events([self.settlement_event(hierarchy)])
+                self.assertEqual(self.evdev.health['last_error'], reason)
+                self.assertEqual(self.evdev.health['state'], 'down')
+                self.assertIsNone(self.evdev.sock)
+                self.e.start_selftest()
+                self.drain()
+                self.assert_xtest_allows_worker_ready(reason)
+                self.evdev.devices.assert_called_once()
+
     def assert_xtest_allows_worker_ready(self, reason):
         self.assertEqual(self.evdev.health['state'], 'down')
         self.assertEqual(self.evdev.health['last_error'], reason)
@@ -828,21 +1058,26 @@ class EngineW6(base.Harness):
         self.assertEqual(self.t.position, {'x': 2, 'y': 2})
         self.assertIn('release_all', [req.get('op') for req in self.log])
 
-    def test_startup_hierarchy_invalidation_during_grab_check_continues_xtest(self):
+    def test_startup_hierarchy_invalidation_after_establishment_continues_xtest(self):
         from Xlib.ext import ge, xinput
         self.w.x = NS(ev=NS(display=NS(get_extension_major=lambda name: 131)))
         sock = PausedSocket(self.helper.handle, self.log)
+        original_recv = sock.recv
+        sock.recv = lambda size: original_recv(size) if 'frames' in self.log[-1] else MemorySocket.recv(sock, size)
         self.evdev.connector = Mock(return_value=sock)
         self.e.start_selftest()
-        self.tick()  # bootstrap request sends grab_check
-        self.tick()  # recv/EAGAIN
+        for _ in range(1000):
+            self.tick()
+            if sock.blocked:
+                break
         self.assertTrue(sock.blocked)
+        self.assertTrue(self.evdev.established)
         self.assertTrue(self.evdev.inflight)
         self.evdev.events([NS(type=ge.GenericEventCode, evtype=xinput.HierarchyChanged, extension=131)])
         self.drain()
         self.assert_xtest_allows_worker_ready('assigned_device_changed')
         self.evdev.connector.assert_called_once()  # Invalidation never reconnects a retired channel.
-        self.assertFalse(any('frames' in req for req in self.log))
+        self.assertEqual(sum('frames' in req for req in self.log), 1)
 
     def test_unexpected_event_transport_fault_preserves_cause_and_runs_xtest(self):
         self.w.cache.windows.clear()
