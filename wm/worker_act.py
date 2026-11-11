@@ -1446,6 +1446,8 @@ class Engine:
             yield
         self.gate(a)
         r['_family_before'] = self.family_stamp(handle)
+        r['_route_visual'] = any(predicate_class(p) in ('pixels', 'ocr')
+                                 for p in leaves(self.effective_predicate(r['expect'])))
         r['_focus_dispatch'] = self.w.cache.focus == handle
 
     def learn_route(self, r, handle):
@@ -1458,11 +1460,19 @@ class Engine:
             v['dispatch_status'] == 'accepted' and v.get('server_ack') is not None and
             v['server_ack']['expected'] > 0 and v['server_ack']['seen'] == v['server_ack']['expected']
             for v in attempts)
+        before, after = r.get('_family_before'), self.family_stamp(handle)
+        if not r.get('_route_visual', True):
+            # A key-triggered caret repaint proves arrival, not the tree/state
+            # reaction being verified. Project both stamps from the same
+            # settled baseline; other family_stamp consumers retain pixels.
+            before, after = (None if stamp is None else
+                             {k: v for k, v in stamp.items() if not k.startswith('pixels[')}
+                             for stamp in (before, after))
         try:
             flipped = self.routes.result(key, route, verified=r['effect']['status'] == 'verified',
                 acknowledged=acknowledged, focused_before=r.get('_focus_dispatch', False),
                 focused_after=self.w.cache.focus == handle,
-                no_change=r.get('_family_before') is not None and r['_family_before'] == self.family_stamp(handle),
+                no_change=before is not None and before == after,
                 effect=r['effect']['status'], recover=r['dispatch_status'] != 'unknown')
         except OSError as exc:
             raise ActError('worker_fault', 'route_table_unavailable') from exc
@@ -2281,7 +2291,7 @@ class Engine:
                                          "rev": self.w.cache.rev})
         for s in steps:
             s.pop("windows_before", None)
-            for field in ('_route_key', '_routes', '_rung_count', '_family_before', '_focus_dispatch', '_route_learned'):
+            for field in ('_route_key', '_routes', '_rung_count', '_family_before', '_route_visual', '_focus_dispatch', '_route_learned'):
                 s.pop(field, None)
             if s['effect'].get('fallback_from') == 'tree':
                 s['predicate_class'] = predicate_class(s['effect']['predicate'])

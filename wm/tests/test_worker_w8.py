@@ -1086,8 +1086,14 @@ class BaselineRoutes(tree_tests.ProviderHarness):
                 self.assertNotEqual(self.e.family_stamp(self.handle), before)
                 self.pseudo_window()
 
-    def real_change_breaks_streak(self, change):
-        self.repeat(self.key(), 'one')
+    def tree_key(self):
+        ref = self.refs()['entry']
+        return self.key(target=dict(window=self.handle, ref=ref), timeout_ms=300,
+                        expect=dict(kind='text_equals', window=self.handle, ref=ref, value='never'))
+
+    def real_change_breaks_streak(self, change, step=None):
+        step = step or self.tree_key()
+        self.repeat(step, 'one')
         key = next(iter(self.e.routes.entries))
         self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
         stamps = []
@@ -1096,14 +1102,15 @@ class BaselineRoutes(tree_tests.ProviderHarness):
                 stamps.append(self.e.family_stamp(self.handle))
                 change()
         self.t.on_write = react
-        step = self.repeat(dict(self.key(), timeout_ms=300), 'reaction')['steps'][0]
-        self.assertEqual(step['effect']['status'], 'not_observed')
+        result = self.repeat(step, 'reaction')['steps'][0]
+        self.assertEqual(result['effect']['status'], 'not_observed')
         self.assertNotEqual(stamps[0], self.e.family_stamp(self.handle))
-        self.assertNotIn('route_change', step)
+        self.assertNotIn('route_change', result)
         self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 0)
         self.t.on_write = None
-        self.repeat(self.key(), 'after')['steps'][0]
+        self.repeat(step, 'after')['steps'][0]
         self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
+        return stamps[0], self.e.family_stamp(self.handle)
 
     def test_preexisting_real_text_change_breaks_streak(self):
         def change():
@@ -1126,11 +1133,80 @@ class BaselineRoutes(tree_tests.ProviderHarness):
             self.w.cache.commit()
         self.real_change_breaks_streak(change)
 
-    def test_preexisting_real_pixel_content_change_breaks_streak(self):
+    def repaint_entry(self, value=255):
+        rect = dict(x=20, y=20, w=1, h=1)
+        self.shadow.update(rect, bytes((value, 0, 0, 0)))
+        self.w.pixels.mark([rect])
+
+    def visual_repaint_breaks_streak(self, expect):
+        # Supply an unmet visual oracle, retaining the real input/verify/
+        # pixel/learning path (frame verification has no built-in oracle yet).
+        evaluate = self.e.evaluate
+        def unmet_visual(p, sampled=False):
+            return False if p['kind'] in ('frame_matches', 'ocr_text_present') else evaluate(p, sampled)
+        with patch.object(self.e, 'evaluate', side_effect=unmet_visual):
+            before, after = self.real_change_breaks_streak(self.repaint_entry,
+                self.key(expect=expect, timeout_ms=300))
+        self.assertEqual({k for k in before.keys() | after.keys() if before.get(k) != after.get(k)},
+                         {'pixels[0]'})
+
+    def test_preexisting_real_pixel_content_change_breaks_visual_streak(self):
+        self.visual_repaint_breaks_streak(dict(kind='frame_matches'))
+
+    def test_ocr_step_single_tile_repaint_resets_streak(self):
+        self.visual_repaint_breaks_streak(dict(kind='ocr_text_present', text='never'))
+
+    def test_composite_with_visual_leaf_single_tile_repaint_resets_streak(self):
+        self.visual_repaint_breaks_streak(dict(kind='all', of=[
+            self.tree_key()['expect'], dict(kind='frame_matches')]))
+
+    def repainting_misses(self, step, expected_class):
+        for index, ident in enumerate(('one', 'two'), 1):
+            before = self.e.family_stamp(self.handle)
+            self.t.on_write = lambda event: self.repaint_entry(index) if event[0] == 'key_up' else None
+            result = self.repeat(step, ident)['steps'][0]
+            after = self.e.family_stamp(self.handle)
+            # Exactly the live shape: one changed-content tile, no tree,
+            # geometry, member, last_window or tombstone change.
+            self.assertEqual({k for k in before.keys() | after.keys() if before.get(k) != after.get(k)},
+                             {'pixels[0]'})
+            self.assertGreater(after['pixels[0]'], before['pixels[0]'])
+            self.assertEqual(result['predicate_class'], expected_class)
+            self.assertEqual(result['effect']['status'], 'not_observed')
+            self.assertEqual(result['route'], 'xtest')
+            self.assertEqual(result['dispatch_status'], 'accepted')
+            self.assertEqual(result['focus']['before'], self.handle)
+            self.assertEqual(result['focus']['after'], self.handle)
+            self.assertEqual(result['attempts'][0]['server_ack']['expected'], 2)
+            self.assertEqual(result['attempts'][0]['server_ack']['seen'], 2)
+            key = next(iter(self.e.routes.entries))
+            if index == 1:
+                self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
+                self.assertNotIn('route_change', result)
+            else:
+                self.assertEqual(self.e.routes.state(key, 'xtest'), 'rejected')
+                self.assertEqual(result['route_change'], {'from': 'xtest', 'to': None,
+                    'reason': 'synthetic_input_rejected_suspect'})
+            self.assertFalse(any(k.startswith('_') for k in result))
+            self.assertEqual(self.rows()[-1]['receipt']['steps'][0], json.loads(json.dumps(result)))
+
+    def test_tree_key_per_step_single_tile_repaints_qualify_and_flip_second_receipt(self):
+        self.repainting_misses(self.tree_key(), 'tree')
+
+    def test_state_key_per_step_single_tile_repaints_qualify_and_flip(self):
+        self.repainting_misses(self.key(), 'state')
+
+    def test_composite_tree_state_per_step_single_tile_repaints_qualify_and_flip(self):
+        self.repainting_misses(self.key(expect=dict(kind='all', of=[
+            self.tree_key()['expect'], self.key()['expect']])), 'composite')
+
+    def test_tree_step_member_metadata_changed_then_restored_breaks_streak(self):
         def change():
-            rect = dict(x=20, y=20, w=1, h=1)
-            self.shadow.update(rect, b'\xff\x00\x00\x00')
-            self.w.pixels.mark([rect])
+            win = self.w.cache.windows[10]
+            self.w.cache.upsert(10, dict(win, title='Changed'))
+            self.w.cache.commit()
+            self.w.cache.upsert(10, win)
+            self.w.cache.commit()
         self.real_change_breaks_streak(change)
 
     def test_preexisting_family_window_added_and_removed_breaks_streak(self):
