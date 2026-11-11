@@ -233,3 +233,66 @@ the complete rerun passed after that assertion was updated.
 **Raj's live skill gate re-run — NOT RUN.** No live session or display was
 opened or driven, including display `:0`. Nothing staged or committed.
 Existing unrelated checkout changes were preserved.
+
+## Fix round 4
+
+Full live receipts diagnosed the create failure as dispatch-time provider
+readiness: immediately after typing, the AT-SPI child is still re-walking the
+dialog. The in-batch invoke never dispatches (`not_dispatched`, no attempts),
+while the same invoke in a separate act after fresh observes works.
+
+`thunar.create_folder` now uses two acts. Act 1 keeps the open-dialog and
+replace-text steps, binding only `dialog` and `entry`. After both steps verify,
+fresh session/window observes resolve the dialog handle (preferring
+`state.modal`, otherwise a mapped create-dialog title), its `Create`
+`push_button` ref, and the main window's current `tree_table` container ref.
+Act 2 contains only the invoke, targeting `{window: dialog, ref: create_ref}`,
+requiring that modal, and expecting both `dialog_absent` and `item_present`
+with a 3500 ms timeout. The playbook example uses the same two-act shape and
+explains why the provider needs the gap after typing. The rename batch remains
+unchanged.
+
+Only an act-2 step receipt with `dispatch_status: not_dispatched` permits one
+retry, after another fresh target resolution. Accepted/unknown dispatch,
+missing dispatch proof, and a second failure never replay the commit. Because
+the adapter's normal projection omits dispatch status, the pack reads the
+completed receipt using the original action ID/generation through read-only
+`action.get`; all input still goes through `Adapter.call('act', ...)`.
+Other outcomes retain the existing compact `_outcome` handling, and the
+filesystem oracle runs only after both acts verify.
+
+`_observe()` retains the last complete, revision-consistent page set, including
+sets flagged dirty. It still seeks a clean set within five initial reads and
+keeps the three-restart limit for dirty continuations. A terminal dirty page
+can complete a fallback set; a dirty continuation with another cursor still
+discards the partial set and restarts. Exhausting the bounds returns the last
+complete set if available, otherwise `listing_unavailable` / `tree_dirty`.
+Incomplete later attempts cannot overwrite a complete fallback. Settled,
+resync, window, class, focus, modal and per-page revision checks remain in
+force. Tree publication revisions are checked separately from session-state
+revisions, since those can legitimately differ. Worker ref admission, batch
+expectations and the filesystem oracle still verify mutations.
+
+Headless pack tests: **48 passed**. Updated assertions cover the two-act
+playbook and skill, fresh post-dialog refs/container/revision, title fallback,
+one safe retry (including successful recovery), exhausted retry, no retry
+after accepted/unknown/missing dispatch proof, unavailable receipt handling,
+missing/unsettled post-dialog targets, last-complete dirty fallback, split-page
+assembly, preservation across later incomplete attempts, and zero-complete-set
+no-act exits. The worked-example regression in `test_worker_w5_fix2.py` also
+uses two acts.
+
+Full headless validation, with temporary paths in the checkout and bytecode
+disabled:
+
+```sh
+TMPDIR="$PWD/wm/tests/.tmp" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wm/tests
+```
+
+**1047 tests in 133.289 s: 1046 passed, 1 skipped**, exit 0,
+`OK (skipped=1)`. The existing sandbox-dependent ptrace/strace check remains
+skipped. Log: `wm/tests/.tmp/packs-thunar-fix4-full-suite.log`.
+
+**Raj's live skill gate re-run — NOT RUN.** No live session or display was
+opened or driven, including display `:0`. Nothing staged or committed.
+Existing unrelated checkout changes were preserved.
