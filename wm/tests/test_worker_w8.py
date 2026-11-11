@@ -8,11 +8,12 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
 
-from test_worker_w2 import Harness, Engine, GEN, ActError
+from test_worker_w2 import Harness, Engine, GEN, ActError, DeferredMetadata
 import test_worker_w4 as tree_tests
 from worker_routes import RouteTable, ladder, KEY_FIELDS
 from worker_paste import Clipboard
 from worker_atspi import Backend
+from worker_pixels import Pixels, Shadow
 from Xlib import X, Xatom
 
 
@@ -856,6 +857,158 @@ class MoreEngineRoutes(Harness):
         self.assertNotIn('route_change', r)
         key = next(iter(self.e.routes.entries))
         self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
+
+
+class BaselineRoutes(tree_tests.ProviderHarness):
+    """A mapped window predates both provider startup and pixel tracking."""
+    repeat = EngineRoutes.repeat
+
+    def setUp(self):
+        super().setUp()
+        self.shadow = Shadow(640, 480)
+        self.shadow.mode = 'mmap'  # Synthetic captured bytes; no display.
+        self.addCleanup(self.shadow.close)
+        self.w.pixels = Pixels(self.w, self.shadow)
+        self.w.pixels.settle()
+        self.w.cache.baseline()
+        self.p.consumers[self.handle] = self.w.lease
+
+    def tick(self):
+        super().tick()
+        for task in list(self.p.pending.values()):
+            raw = self.raw if task['op'] == 'snapshot' else dict(alive=True)
+            self.answer(raw, task=task)
+        self.w.settle_pixels()
+
+    def idle(self):
+        for _ in range(2100):
+            self.tick()
+
+    def change_event(self):
+        self.wire.incoming.append(dict(event='changed', app='101', window=self.handle))
+
+    def test_preexisting_idle_family_stamp_with_provider_pump_and_pixel_damage(self):
+        before = self.e.family_stamp(self.handle)
+        rev = self.w.cache.rev
+        # Same-content DAMAGE and semantic invalidation must settle without
+        # changing a publication facet; the provider also runs liveness probes.
+        self.w.pixels.mark([self.w.pixels.bounds])
+        self.change_event()
+        self.idle()
+        self.assertFalse(self.p.dirty)
+        self.assertFalse(self.w.pixels.dirty)
+        self.assertTrue(any(t['op'] == 'probe' for t in self.wire.sent))
+        self.assertEqual(self.w.cache.rev, rev)
+        self.assertEqual(self.e.family_stamp(self.handle), before)
+
+    def test_preexisting_delta_observe_is_unchanged_at_current_rev(self):
+        for _ in range(3):
+            self.idle()
+            result = self.w.observation(dict(since_rev=self.w.cache.rev,
+                scope=dict(kind='window', window=self.handle)))
+            self.w.observed(self.peer, {}, result)
+            self.assertTrue(result['unchanged'], result)
+            self.assertNotIn('state', result)
+
+    def test_ocr_fallback_can_report_changed_without_family_stamp_churn(self):
+        self.p.apps['101'].degrade(self.now, 'application_unreachable')
+        self.w.ocr = NS(state='down', reason='provider_unavailable', read=lambda *args: None,
+            health=lambda: dict(state='down', reason='provider_unavailable'),
+            coverage=lambda: dict(complete=False, reason='provider_degraded'))
+        before, rev = self.e.family_stamp(self.handle), self.w.cache.rev
+        for _ in range(3):
+            result = self.w.observation(dict(since_rev=rev,
+                scope=dict(kind='window', window=self.handle)))
+            self.w.observed(self.peer, {}, result)
+            self.assertFalse(result['unchanged'])
+            self.assertNotIn('state', result)
+            self.assertEqual(result['rev'], rev)
+            self.assertEqual(self.e.family_stamp(self.handle), before)
+
+    def test_preexisting_two_misses_flip_and_stamp_receipt(self):
+        self.idle()
+        first = self.repeat(self.key(), 'one')['steps'][0]
+        key = next(iter(self.e.routes.entries))
+        self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
+        self.assertNotIn('route_change', first)
+        second = self.repeat(self.key(), 'two')['steps'][0]
+        for step in (first, second):
+            self.assertEqual(step['dispatch_status'], 'accepted')
+            self.assertEqual(step['attempts'][0]['server_ack']['expected'], 2)
+            self.assertEqual(step['attempts'][0]['server_ack']['seen'], 2)
+            self.assertEqual(step['effect']['status'], 'not_observed')
+        self.assertEqual(second['route_change'], {'from': 'xtest', 'to': None,
+            'reason': 'synthetic_input_rejected_suspect'})
+        self.assertTrue(self.e.routes.path.exists())
+
+    def test_preexisting_metadata_reply_pump_preserves_stamp_and_route_learning(self):
+        self.metadata = DeferredMetadata(self)
+        self.w.x = self.metadata.x
+        self.t.refresh = self.metadata.transport.refresh
+        self.metadata.x.refresh(10)
+        for _ in range(200):
+            self.tick()
+        self.w.cache.baseline()
+        before = self.e.family_stamp(self.handle)
+        for ident in ('one', 'two'):
+            step = self.repeat(dict(self.key(), timeout_ms=300), ident)['steps'][0]
+            self.assertEqual(self.e.family_stamp(self.handle), before)
+            self.assertEqual(step['effect']['status'], 'not_observed')
+        self.assertEqual(step['route_change']['reason'], 'synthetic_input_rejected_suspect')
+
+    def real_change_breaks_streak(self, change):
+        self.repeat(self.key(), 'one')
+        key = next(iter(self.e.routes.entries))
+        self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
+        stamps = []
+        def react(event):
+            if event[0] == 'key_up' and not stamps:
+                stamps.append(self.e.family_stamp(self.handle))
+                change()
+        self.t.on_write = react
+        step = self.repeat(dict(self.key(), timeout_ms=300), 'reaction')['steps'][0]
+        self.assertEqual(step['effect']['status'], 'not_observed')
+        self.assertNotEqual(stamps[0], self.e.family_stamp(self.handle))
+        self.assertNotIn('route_change', step)
+        self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 0)
+        self.t.on_write = None
+        self.repeat(self.key(), 'after')['steps'][0]
+        self.assertEqual(self.e.routes.entries[key]['states']['xtest']['misses'], 1)
+
+    def test_preexisting_real_text_change_breaks_streak(self):
+        def change():
+            self.raw['children'][0]['text'] = 'real edit'
+            self.change_event()
+        self.real_change_breaks_streak(change)
+
+    def test_preexisting_real_tree_change_breaks_streak(self):
+        def change():
+            self.raw['children'].append(tree_tests.node('new', 'label', 'New content'))
+            self.change_event()
+        self.real_change_breaks_streak(change)
+
+    def test_preexisting_geometry_changed_then_restored_breaks_streak(self):
+        def change():
+            win = self.w.cache.windows[10]
+            self.w.cache.upsert(10, dict(win, geometry=dict(win['geometry'], x=20)))
+            self.w.cache.commit()
+            self.w.cache.upsert(10, win)
+            self.w.cache.commit()
+        self.real_change_breaks_streak(change)
+
+    def test_preexisting_real_pixel_content_change_breaks_streak(self):
+        def change():
+            rect = dict(x=20, y=20, w=1, h=1)
+            self.shadow.update(rect, b'\xff\x00\x00\x00')
+            self.w.pixels.mark([rect])
+        self.real_change_breaks_streak(change)
+
+    def test_preexisting_family_window_added_and_removed_breaks_streak(self):
+        def change():
+            self.later()
+            self.w.cache.remove(11)
+            self.w.cache.commit()
+        self.real_change_breaks_streak(change)
 
 
 class PasteRecovery(PasteHarness):
