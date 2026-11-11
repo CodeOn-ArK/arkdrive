@@ -234,3 +234,35 @@ Changed files: `wm/ark-worker`, `wm/tests/memory_step0.py`,
 `wm/tests/test_worker_w_memory_step0.py`, the one-field W2 stub update in
 `wm/tests/test_worker_w2.py`, and this new note. The W8 bench note is
 unchanged. Temporary test/dry-run output stays under `wm/tests/.tmp`.
+
+## Live baseline (Raj, 2026-11-11, xvfb session, this tree)
+
+Harness run: --windows 200 --acts 300 --popups 40 (full JSON on ArK2,
+~/memory-step0-live2.json). All four phases MEASURED.
+
+- window_churn (200 fx_log windows opened + closed):
+  removed_windows +200, atspi_apps +200. Tombstones and per-app AT-SPI
+  records grow exactly 1:1 with window churn and are never reclaimed.
+- act_churn (300 completed wait acts): actions_retained +300 (1:1,
+  never retired), journal_bytes +1,290,168 (~4.3 KB per act on disk).
+- popup_flood (40 fixtures, 80 acts incl. modal dismissals):
+  removed_windows +80 (fixture + its popup each leave a tombstone),
+  atspi_apps +40, journal +460,930 bytes.
+- observe_size: a full session observe grows 3,666 -> 7,576 response
+  bytes across the 200 tombstones (~19.6 bytes per removed handle,
+  linear). Extrapolated, the full observe crosses the adapter's
+  256 KiB frame cap at roughly 13k destroyed windows - past that
+  point a new lease cannot take the full observe it needs before
+  acting, matching the council round-2 estimate (~11k at 23 B/handle).
+
+Baseline conclusion: the growth the cleanup plan targets is real and
+linear in exactly the three structures steps 1-3 address - completed
+action records (RAM), removed-window tombstones (RAM + observe size),
+and per-app AT-SPI records (worker + child). Journal growth is
+~4.3 KB/act on disk (step 5 scope).
+
+Two harness defects found and fixed during the baseline (committed
+5580565): the dedicated-session startup check counted the Openbox
+pseudo-window as an application window; the popup phase targeted the
+parent window while a modal was up (the worker's modal rule correctly
+refused it) - it now dismisses each popup on its own handle first.
