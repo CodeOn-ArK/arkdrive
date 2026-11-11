@@ -428,3 +428,18 @@ The actual `fx_log`/Openbox/AT-SPI soak, live latency/PSS, popup input,
 24-hour and hardware gates remain **NOT RUN**. Raj should repeat the
 original Step-0 harness unchanged on a dedicated display 91–120 before
 calling the live regression closed.
+
+## Verifier addendum (Raj, 2026-11-11)
+
+Fix round 1 committed 647cf02; suite 981 OK on ArK2. Combined live
+soak (step-0 harness, fresh xvfb session, --windows 200 --acts 300
+--popups 40) on the final tree: ALL PHASES MEASURED, no queue_full.
+window_churn: atspi_apps +0, actions_retained +0, pending_x 0,
+removed_windows +200 (under the 4,096 floor). act_churn:
+actions_retained +0, action_stubs +300, journal +1,316,826 bytes
+(journal bytes are conserved by design). popup_flood: stubs +80,
+removed +80, atspi +0. observe_size: full observe ends at 7,595
+bytes (mid-run peak 17,200), far under the 256 KiB cap. Against the
+step-0 baseline (+200 removed with +200 atspi, +300 full actions,
+observe growing linearly), the plan's targets hold live. The 24 h
+PSS plateau run folds into W9.
