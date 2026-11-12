@@ -395,3 +395,47 @@ registry/host session set is needed for the stop-all/global-kill check.
 Presenter transforms, nested hit-testing, takeover input capabilities and
 promotion remain WM-C/WM-D work. Live results must be appended separately;
 the sandbox result does not qualify either machine's live gates.
+
+## Raj verifier addendum (Nov 11, 2026)
+
+Suite: 1,126 tests OK verified by Raj on ArK2 (commit 19fa9d8).
+
+Live gate (~/wm_b_gate.py on ArK2, real sessiond/worker/controller on
+xvfb sessions :91-:120): **PASS 36/36**.
+
+- Spawn/result flow: parent (worker running) -> capability -> spawn
+  returns child incarnation at depth 1 with the exact parent debit
+  (100 acts / 10,000 tokens), a separate child allocation with zero
+  charges, and the task provenance-tagged (origin human, source =
+  parent). A byte-identical request-id retry returns the same child
+  with no second debit. The child's queue carries its tagged task.
+- Result flow: child driver reports session.human_need passcode ->
+  attention appears on the parent record with child
+  incarnation/task/category only -> cleared via attention.report.
+  Child session.done with an artifact -> one result event in the
+  parent queue, provenance untrusted:true, exchange copy under
+  STATE/exchange/<child>/<task>/0-report.txt with matching SHA-256;
+  tampering with the private source leaves the copy intact. Ack +
+  controller restart -> no redelivery.
+- Refusals, all with zero new debit: oversized reservation ->
+  budget_exhausted; third live session -> admission_limit; parent in
+  HUMAN control state -> parent_human.
+- Controller frames.get beside the parent's held driver lease
+  returns a WM-A frame; the driver's next observe succeeds (lease
+  undisturbed).
+- DECIDING GATE, controller-dead reap: controller SIGKILLed and left
+  dead; `ark-sessiond stop --incarnation P` reaps the whole tree
+  from registry data alone (sessiond journal shows stop.gate before
+  stop.reaped), tombstones written for parent and child, controller
+  restart resurrects nothing. A new session reusing s1 gets a fresh
+  incarnation and survives a repeat stop of the old incarnation.
+- Global kill: with a fresh parent+child live, creating
+  CU_KILL_FILE reaps the whole forest on the controller tick and a
+  further spawn is refused global_kill; kill file removed after.
+- Socket facts: wmctl.sock is 0600; a foreign-UID CLI call is
+  refused before any data flows (blocked at exec/access level by
+  the owner-only home/state paths; SO_PEERCRED itself is covered by
+  the headless tests). Gate-script defects found and fixed during
+  the run (human_need sent after done had released the lease; a
+  spawn parent with no worker started fails closed with
+  parent_control_unavailable, as designed) — no product defects.
