@@ -37,8 +37,9 @@ BUS_VIRTUAL = 0x06
 class EventProtocol:
     """No device creation here: writers/grabs/clock are injectable for tests."""
     def __init__(self, writers, gate, grab, sleep=time.sleep, *, frame_grab=None,
-                 generation_state=None, instance=None):
+                 generation_state=None, instance=None, human_gate=None):
         self.writers, self.gate, self.grab, self.sleep = writers, gate, grab, sleep
+        self.human_gate = human_gate
         self.frame_grab = frame_grab or grab
         self.held = {"kbd": set(), "ptr": set()}
         self.replies = {}
@@ -107,7 +108,16 @@ class EventProtocol:
                 return dict(reply, error='helper_restarted')
             req = dict(req)
             del req['instance']
-        payload = json.dumps(req, sort_keys=True, separators=(",", ":"))
+        # No human key content in the reply cache, even in memory.
+        import hashlib
+        payload = hashlib.sha256(json.dumps(req, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        human = req.get('op') == 'human'
+        human_token, human_epoch = req.get('human_token'), req.get('human_epoch')
+        if human:
+            if not self.human_gate or not isinstance(human_token, str) or len(human_token) != 64 or type(human_epoch) is not int:
+                return reply
+            req = {k: v for k, v in req.items() if k not in ('op', 'human_token', 'human_epoch')}
+        gate = (lambda gen: self.human_gate(gen, human_token, human_epoch)) if human else self.gate
         if seq in self.replies:
             previous, result = self.replies[seq]
             return dict(result) if previous == payload else reply
@@ -131,7 +141,7 @@ class EventProtocol:
                         self.write(dev, [(EV_KEY, code, 0) for code in codes])
                 reply.update(ok=True, error=None)
             elif self.valid(req) and self.generation in (None, req["generation"]):
-                epoch = self.gate(req["generation"])
+                epoch = gate(req["generation"])
                 # Pin one generation per device lifetime. W1 restarts still
                 # work through XTEST; new evdev authority needs new devices.
                 if epoch is not None:
@@ -140,7 +150,7 @@ class EventProtocol:
                 for n, frame in enumerate(req["frames"]):
                     if n and req["gap_us"]:
                         self.sleep(req["gap_us"] / 1e6)
-                    current = self.gate(req["generation"])
+                    current = gate(req["generation"])
                     if epoch is None or current != epoch:
                         reply["error"] = "gate_closed"
                         break
@@ -425,7 +435,8 @@ class HelperSupervisor:
         protocol = EventProtocol(dict(zip(('kbd', 'ptr'), map(device_writer, self.fds))),
             lambda gen: control_snapshot(args.control, gen),
             lambda dev: node_grab(self.nodes[dev]), frame_grab=lambda dev: probes[dev](),
-            generation_state=self.generation, instance=instance)
+            generation_state=self.generation, instance=instance,
+            human_gate=lambda gen, token, epoch: control_snapshot(args.control, gen, token, epoch))
         events = EventSocket(args.event_socket, args.owner_uid, protocol)
         events.start()
         # Publish after listen, atomically; stale tokens are refused by the
@@ -520,7 +531,8 @@ def main():
             protocol = EventProtocol(dict(zip(("kbd", "ptr"), map(device_writer, fds))),
                                      lambda gen: control_snapshot(args.control, gen),
                                      lambda dev: node_grab(nodes[dev]),
-                                     frame_grab=lambda dev: probes[dev]())
+                                     frame_grab=lambda dev: probes[dev](),
+                                     human_gate=lambda gen, token, epoch: control_snapshot(args.control, gen, token, epoch))
             events = EventSocket(args.event_socket, args.owner_uid, protocol)
             events.start()
         devices_json.write_text(json.dumps(nodes) + "\n")

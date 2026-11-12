@@ -226,7 +226,7 @@ class Engine:
         except OSError:
             self.boot_id = None
         digest = hashlib.sha256()
-        for name in ("ark-worker", "worker_act.py", "worker_xtest.py", "worker_evdev.py", "worker_keymap.py", "worker_routes.py", "worker_paste.py", "input_protocol.py", "worker_pixels.py", "worker_tree.py", "worker_atspi.py", "openbox-rc.xml"):
+        for name in ("ark-worker", "worker_act.py", "worker_human.py", "worker_xtest.py", "worker_evdev.py", "worker_keymap.py", "worker_routes.py", "worker_paste.py", "input_protocol.py", "worker_pixels.py", "worker_tree.py", "worker_atspi.py", "openbox-rc.xml"):
             digest.update(name.encode() + Path(__file__).with_name(name).read_bytes())
         self.build_id = digest.hexdigest()
         try:

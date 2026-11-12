@@ -41,6 +41,7 @@ from worker_evdev import EvdevTransport
 from input_protocol import control_store
 from worker_pixels import Pixels, Shadow, intersect, bbox
 from worker_framefeed import FrameFeed, FeedClient
+from worker_human import Takeover, HumanError
 from worker_tree import Provider as TreeProvider, MAP_GRACE
 from worker_ocr import Provider as OCRProvider
 from worker_paste import ATOMS as PASTE_ATOMS
@@ -1455,6 +1456,7 @@ class Worker:
         self.act = None
         self.pixels = None
         self.frame_feed = None
+        self.human = Takeover(self)
         self.tree = None
         self.ocr = None
         self.resync_baseline = None
@@ -1597,7 +1599,7 @@ class Worker:
                 "coverage": self.coverage(), "counters": dict(self.counters),
                 "versions": self.versions(), "development_flags": FLAGS,
                 "profile_hash": getattr(self, "profile_hash", None),
-                "human_transport": "unavailable", "awaiting_reconciliation": bool(act and act.pending_effects),
+                "human_transport": getattr(getattr(self, "human", None), "state", "idle"), "awaiting_reconciliation": bool(act and act.pending_effects),
                 "pending_effects": act.pending_effects if act else [],
                 "lease_suspended": bool(act and act.lease_state.get(self.lease, {}).get("suspended"))}
 
@@ -1852,6 +1854,8 @@ class Worker:
     def disconnect(self, peer):
         if peer not in self.peers:
             return
+        if getattr(self, "human", None):
+            self.human.disconnected(peer)
         peer.retire_at = time.monotonic() + 5
         if peer is self.lease_peer:
             self.lease_peer = None
@@ -1951,6 +1955,9 @@ class Worker:
             if "id" not in msg:
                 return  # No side effects for JSON-RPC notifications in W1.
             method = msg["method"]
+            if method.startswith("human."):
+                self.human.handle(peer, ident, method, params)
+                return
             if method in ('window.observe', 'window.wait') and self.x_busy():
                 raise RPCError('queue_full')
             if method == "window.act":
@@ -1987,6 +1994,8 @@ class Worker:
                 path.write_text(json.dumps(self.tree.raw[handle], ensure_ascii=False, indent=2) + "\n")
                 result = {"path": str(path)}
             elif method == "session.attach":
+                if getattr(self, "human", None) and self.human.state not in ("idle",):
+                    raise RPCError("human_control")
                 self.expire_lease()
                 if self.lease:
                     raise RPCError("lease_held")
@@ -2003,6 +2012,10 @@ class Worker:
                           "control_epoch": (self.cache.control or {}).get("epoch"),
                           "channels": self.channels(), "limits": {"steps": 8, "deadline_ms": 10000}}
             elif method == "window.observe":
+                if getattr(self, "human", None) and self.human.resume_observe and (
+                        params.get("scope", {}).get("kind", "session") != "session" or
+                        params.get("since_rev") is not None or params.get("region") or params.get("ignore_regions")):
+                    raise RPCError("full_observe_required")
                 self.observe(peer, ident, params)
                 return
             elif method == "window.wait":
@@ -2050,11 +2063,17 @@ class Worker:
             self.respond(peer, ident, result)
         except (UnicodeError, ValueError, RecursionError):
             self.respond(peer, ident, exc=RPCError("parse_error", code=-32700))
+        except HumanError as exc:
+            self.respond(peer, ident, exc=RPCError(str(exc)))
         except RPCError as exc:
             self.respond(peer, ident, exc=exc)
         except ActError as exc:
             self.respond(peer, ident, exc=RPCError(exc.reason, exc.detail,
                          code=-32602 if exc.reason in ("invalid_params", "invalid_request", "invalid_expectation") else -32000))
+
+    @staticmethod
+    def human_error(reason):
+        return RPCError(reason)
 
     def validate_params(self, method, params):
         keys = {
@@ -2312,6 +2331,9 @@ class Worker:
         self.respond(peer, ident, result)
 
     def observed(self, peer, params, result):
+        human = getattr(self, "human", None)
+        if human and human.resume_observe and peer is self.lease_peer and self.lease and params.get("lease") == self.lease and result.get("full") and result.get("settled") and not result.get("resync_required") and params.get("scope", {}).get("kind", "session") == "session":
+            human.resume_observe = False
         if getattr(self, "act", None):
             self.act.observed(peer, params, result)
         token = getattr(self, 'lease', None)
@@ -2483,6 +2505,15 @@ class Worker:
             self.selector.register(self.x.inp.fileno(), selectors.EVENT_READ, "inp")
             while True:
                 if self.stopping:
+                    if self.human.state in ("closing", "human"):
+                        self.human.finish("worker_stopping")
+                    self.human.tick()
+                    if self.human.runner:
+                        self.ingest()
+                        self.x.ax.flush()
+                        self.x.inp_ax.flush()
+                        self.selector.select(0.001)
+                        continue
                     if self.act and self.act.evdev:
                         self.quiesce_evdev()
                     if self.stop_deadline is None:
@@ -2517,6 +2548,7 @@ class Worker:
                     self.act.tick()
                 if self.frame_feed:
                     self.frame_feed.publish()
+                self.human.tick()
                 if not self.published and self.elapsed() > 10000:
                     raise RuntimeError("worker_start_timeout")
                 self.x.ax.flush()
@@ -2524,6 +2556,8 @@ class Worker:
                 timeout = max(0, min(0.05, self.control_due - time.monotonic()))
                 if self.act and (self.act.active or self.act.queue or self.act.selftest or
                                  self.act.evdev and self.act.evdev.recompile_runner is not None):
+                    timeout = min(timeout, 0.001)
+                if self.human.runner:
                     timeout = min(timeout, 0.001)
                 if self.x.ax.pending or self.x.inp_ax.pending:
                     timeout = min(timeout, 0.01)

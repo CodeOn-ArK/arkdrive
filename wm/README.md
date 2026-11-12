@@ -68,4 +68,29 @@ depth three and fan-out four. The controller never acquires a worker lease.
 See [the WM-B bench note](../bench/wm2-controller-2026-11-11.md) for wire
 shapes, config, recovery, artifact exchange and Raj's outstanding live gates.
 Run `PYTHONDONTWRITEBYTECODE=1 python3 tests/run_wm_b_headless.py full` for the
-full headless suite. Presenter/takeover and promotion remain later stages.
+full headless suite.
+
+## WM v1 stage WM-C
+
+`./ark-present --host-display :121` opens the presenter on an explicitly
+chosen local human/test host display. `:0` is refused before opening X. The
+host needs python-xlib, XRender and the existing system X11/XKB libraries;
+no new Python package is required. Session workers still target :91–:120.
+
+Select a surface, then use **Takeover** for human input. **Resume** releases
+holds, requires a fresh captured frame, and returns automation admission for
+a new driver lease and full settled session observe. Selection alone sends
+no native input. Drag a child title to move it, right-drag to resize;
+Collapse changes presentation only. Deeper descendants appear as attention
+chips; select a chip to re-root. Parent dialogs disable child hit testing.
+
+Human input goes directly to the worker, with generation/layout bindings,
+a one-second presenter heartbeat deadline and controller process identity
+checks. Lost authority closes the helper gate and releases holds, leaving
+the session paused. Recover with another explicit Takeover, then Resume.
+Keystroke content never enters the human journal path.
+
+Run `PYTHONDONTWRITEBYTECODE=1 python3 tests/run_wm_c_headless.py full` for
+the complete headless suite. See [the WM-C bench note](../bench/wm3-presenter-2026-11-11.md)
+for the wire protocol, state machine and Raj's unrun live gates. Promotion
+remains WM-D work.

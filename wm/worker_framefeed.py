@@ -5,6 +5,8 @@ snapshot. PNG paths are local, ephemeral artifacts, just as on observe. They
 live in a separate FIFO (32 issuances / 64 MiB), with no evidence pins.
 """
 from collections import OrderedDict
+import base64
+import time
 import copy
 import hashlib
 import json
@@ -100,6 +102,9 @@ class FrameFeed:
         self.rev = None
         self.windows = {}
         self.cursor = None
+        self.modal = None
+        self.cursor_image = None
+        self.cursor_pending, self.cursor_due = False, 0
 
     def start(self):
         self.path.unlink(missing_ok=True)
@@ -115,7 +120,38 @@ class FrameFeed:
         self.listener.setblocking(False)
         self.w.selector.register(self.listener, selectors.EVENT_READ, self)
 
+    def sample_cursor(self):
+        # Independent presentation sensing, on the worker's existing session X
+        # connection. No helper/lease and no host display is opened.
+        x = getattr(self.w, 'x', None)
+        if not x or not getattr(x, 'ev', None) or self.cursor_pending or time.monotonic() < self.cursor_due:
+            return
+        self.cursor_due = time.monotonic() + .1
+        budget = getattr(x.ax, 'budget', None)
+        if budget is not None and (budget.overloaded or budget.count >= budget.limit):
+            return  # Optional presentation sensing must not overload driver sensing.
+        self.cursor_pending = True
+        from Xlib.ext import xfixes
+        def got(data):
+            self.cursor_pending = False
+            width, height = data['width'], data['height']
+            if not 0 < width*height <= 128*128:
+                return
+            words = data['cursor_image']
+            if len(words) != width*height:
+                return
+            self.cursor_image = dict(width=width, height=height, format='argb32-le',
+                pixels=base64.b64encode(struct.pack('<' + 'I'*len(words), *words)).decode())
+            self.cursor = dict(position=dict(x=data['x'], y=data['y']), image=self.cursor_image,
+                               hotspot=dict(x=data['xhot'], y=data['yhot']))
+        def failed(_):
+            self.cursor_pending = False
+        if x.ax.ask(xfixes.GetCursorImage, got, optional=True, error_callback=failed,
+                    opcode=x.ev.display.get_extension_major('XFIXES')) is False:
+            self.cursor_pending = False
+
     def publish(self):
+        self.sample_cursor()
         """Called only by the normal owner loop; never settles/captures itself."""
         pixels, cache = self.w.pixels, self.w.cache
         if (not pixels or pixels.failure or pixels.pending or pixels.dirty or
@@ -148,10 +184,14 @@ class FrameFeed:
             self.snapshot = snapshot
         self.stamp, self.rev = stamp, cache.rev
         self.windows = {v['handle']: copy.deepcopy(v) for v in cache.windows.values() if v['mapped']}
-        self.cursor = dict(position=copy.deepcopy(cache.pointer), image=None, hotspot=None)
+        if self.cursor_image is None:
+            self.cursor = dict(position=copy.deepcopy(cache.pointer), image=None, hotspot=None)
+        self.modal = copy.deepcopy(cache.modal)
 
     def query(self, params):
-        if not isinstance(params, dict) or set(params) - {'scope', 'since_rev', 'generation'}:
+        if not isinstance(params, dict) or set(params) - {'scope', 'since_rev', 'generation', 'metadata'}:
+            raise FeedError('invalid_params')
+        if 'metadata' in params and type(params['metadata']) is not bool:
             raise FeedError('invalid_params')
         if params.get('generation', self.w.generation) != self.w.generation:
             raise FeedError('stale_generation')
@@ -173,7 +213,10 @@ class FrameFeed:
         if self.snapshot is None or handle is not None and handle not in self.windows:
             return dict(result, status='no_frame_yet', changed=False)
         if since == self.rev:
-            return dict(result, status='unchanged', changed=False)
+            result.update(status='unchanged', changed=False)
+            if params.get('metadata'):
+                result.update(cursor=copy.deepcopy(self.cursor), modal_regions=self.modal_regions())
+            return result
         bounds = dict(x=0, y=0, w=self.snapshot.w, h=self.snapshot.h)
         rect = intersect(self.windows[handle]['geometry'], bounds) if handle else bounds
         if not rect['w'] or not rect['h']:
@@ -183,10 +226,14 @@ class FrameFeed:
         if value is None:
             value = self.ring.put(key, self.snapshot.png(rect, 1),
                                   dict(rev=self.rev, rect=rect, scale=1, space='desktop'))
-        result.update(status='frame', changed=True, frame=dict(value))
+        result.update(status='frame', changed=True, frame=dict(value), modal_regions=self.modal_regions())
         if handle is None:
             result['cursor'] = copy.deepcopy(self.cursor)
         return result
+
+    def modal_regions(self):
+        return [dict(win['geometry']) for win in self.windows.values()
+                if win['handle'] in (self.modal or []) or win.get('is_modal') or win.get('type') == 'dialog']
 
     def accept(self):
         sock = None

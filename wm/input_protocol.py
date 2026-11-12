@@ -2,6 +2,8 @@
 import ctypes
 import fcntl
 import json
+import hashlib
+import hmac
 import mmap
 import os
 import struct
@@ -44,7 +46,7 @@ def packet(value):
     return struct.pack('!I', len(body)) + body
 
 
-def control_snapshot(path, generation):
+def control_snapshot(path, generation, human_token=None, human_epoch=None):
     """Reopen and double-read each frame; missing/torn/replaced pages close."""
     try:
         with Path(path).open('rb') as stream:
@@ -55,7 +57,13 @@ def control_snapshot(path, generation):
             return None
         magic, version, gen, epoch, state, flags, permit, lease = PAGE.unpack(a)
         if (magic != b'ARKC' or version != 1 or gen.hex() != generation or
-                not epoch or state != 0 or permit):
+                not epoch or permit):
+            return None
+        if human_token is None:
+            if state != 0:
+                return None
+        elif (state != 2 or epoch != human_epoch or not isinstance(human_token, str) or
+              not hmac.compare_digest(lease, hashlib.sha256(human_token.encode()).digest()[:16])):
             return None
         return epoch
     except (OSError, ValueError, TypeError):

@@ -17,6 +17,7 @@ import struct
 import time
 
 from input_protocol import PAGE, packet
+from worker_human import identity, signature
 from wm_registry import (atomic_json, amounts, by_incarnation, config,
                          DEPTH_LIMIT, FANOUT_LIMIT, new_incarnation, sync_directory, durable_mkdir)
 
@@ -604,6 +605,25 @@ class Controller:
             with sessiond.locked_registry() as records:
                 return dict(ok=True, sessions=copy.deepcopy(list(records.values())),
                             caps=dict(depth=DEPTH_LIMIT, fanout=FANOUT_LIMIT, **self.cfg))
+        if method == 'takeover.issue':
+            if params.get('explicit_action') is not True or type(params.get('layout_version')) is not int or params['layout_version'] < 1:
+                raise Refused('explicit_action_required')
+            if self.kill_file.exists():
+                raise Refused('global_kill')
+            with sessiond.locked_registry() as records:
+                record = copy.deepcopy(self.record(records, params['incarnation']))
+            if record['lifecycle'] != 'ready':
+                raise Refused('session_stopping')
+            worker = json.loads((Path(record['session_dir']) / 'worker.json').read_text())
+            if params.get('generation') != worker['generation']:
+                raise Refused('stale_generation')
+            grant = dict(incarnation=record['incarnation'], generation=worker['generation'],
+                         layout_version=params['layout_version'], nonce=secrets.token_hex(32),
+                         expires=time.time() + 3600, controller_pid=os.getpid(), controller_start=identity(os.getpid()))
+            self.log.append('takeover.issued', incarnation=record['incarnation'], generation=worker['generation'],
+                            layout_version=params['layout_version'])
+            return dict(ok=True, grant=grant, signature=signature(self.key, grant),
+                        socket=str(Path(record['session_dir']) / 'driver/act.sock'))
         if method == 'capability.issue':
             with sessiond.locked_registry() as records:
                 record = self.record(records, params['incarnation'])
