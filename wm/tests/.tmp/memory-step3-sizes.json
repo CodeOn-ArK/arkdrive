@@ -1,0 +1,1 @@
+{"samples": [{"churned": 4096, "removed": 4096, "elided": 0, "response_bytes": 86147}, {"churned": 8192, "removed": 4096, "elided": 4096, "response_bytes": 87256}, {"churned": 12288, "removed": 4096, "elided": 8192, "response_bytes": 89546}], "live_windows": 128, "title_bytes": 517, "with_live_response_bytes": 183145, "cap": 262144}
