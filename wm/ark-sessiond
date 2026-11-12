@@ -19,6 +19,8 @@ import time
 
 from input_protocol import close_control_gate
 from worker_housekeeping import cap_logs, reclaim_scratch, matches_instance
+from wm_registry import (atomic_json, metadata, retire, by_incarnation,
+                         durable_mkdir, sync_directory)
 
 
 STATE = Path(os.path.expanduser("~/.local/state/ark-sessiond")).absolute()
@@ -35,25 +37,23 @@ def milliseconds(start):
 
 @contextmanager
 def locked_registry():
-    STATE.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, mode=0o700, exist_ok=True)
     with (STATE / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = STATE / "sessions.json"
         records = json.loads(path.read_text()) if path.exists() else {}
+        changed = False
         for record in records.values():
+            changed = metadata(STATE, record) or changed
             cap_logs(record['session_dir'])
+        if changed:
+            save_registry(records)
         yield records
 
 
 def save_registry(records):
     # Call only with .lock held; replace atomically to avoid partial JSON.
-    tmp = STATE / "sessions.json.tmp"
-    with tmp.open("w") as stream:
-        json.dump(records, stream)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    tmp.replace(STATE / "sessions.json")
+    atomic_json(STATE / 'sessions.json', records)
 
 
 def journal(sid, action, ok, start, **extras):
@@ -144,6 +144,10 @@ def require_helper_dead(record):
             # supervisor is dead this final pidfile is stable.
             try:
                 record['mkdevs_pid'] = int((Path(record['session_dir']) / 'devices.json.pid').read_text())
+            except FileNotFoundError:
+                if (record.get('startup_complete', True) or record.get('pid_x') or
+                        record.get('mkdevs_pid')):
+                    raise UnsafeTeardown('cannot establish final helper pid; refusing to signal Xorg')
             except (OSError, ValueError):
                 raise UnsafeTeardown('cannot establish final helper pid; refusing to signal Xorg')
         if any(alive(record.get(key)) for key in ('mkdevs_pid', 'mkdevs_supervisor_pid')):
@@ -206,9 +210,26 @@ def marked_pids(record):
     return pids
 
 
-def teardown(record, records):
+def teardown(record, records, *, retain=False):
     """Section 8, shared by stop and failed starts; caller journals once."""
     errors = []
+    directory = Path(record['session_dir'])
+    if not directory.exists() and not record.get('startup_complete', True):
+        # A durable reservation can be stopped before any scratch/process exists.
+        if not retain:
+            retire(STATE, record)
+            records.pop(record['session'], None)
+        save_registry(records)
+        return
+    if record['profile'] == 'xorg' and not record.get('startup_complete', True):
+        # The controller may have died during wait_file, before a checkpoint.
+        # sessiond alone must recover these identities, not depend on wmctl.
+        for name, field in (('devices.json.supervisor.pid', 'mkdevs_supervisor_pid'),
+                            ('devices.json.pid', 'mkdevs_pid'), ('xorg.pid', 'pid_x')):
+            try:
+                record[field] = int((directory / name).read_text())
+            except FileNotFoundError:
+                pass
 
     def attempt(operation):
         try:
@@ -221,7 +242,7 @@ def teardown(record, records):
     if record["profile"] == "xorg":
         # A gate-write error aborts teardown before quit or any process signal.
         directory = Path(record['session_dir'])
-        if record.get('mkdevs_supervisor_pid'):
+        if record.get('mkdevs_supervisor_pid') or (directory / 'helper.lock').exists():
             with (directory / 'helper.lock').open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 close_control_gate(directory / 'control')
@@ -299,10 +320,19 @@ def teardown(record, records):
     survivors = [pid for pid in pids if alive(pid)] + marked_pids(record)
     if survivors:
         raise UnsafeTeardown('session processes still alive; retaining scratch and registry')
-    if record.get('instance') and not matches_instance(record['session_dir'], record['instance']):
+    directory = Path(record['session_dir'])
+    if (record.get('instance') and directory.exists() and
+            (record.get('startup_complete', True) or (directory / '.instance').exists()) and
+            not matches_instance(directory, record['instance'])):
         raise UnsafeTeardown('session instance mismatch; retaining scratch and registry')
     reclaim_scratch(record)
-    records.pop(record["session"], None)
+    if not retain:
+        retire(STATE, record)
+        records.pop(record["session"], None)
+        active = {r.get('incarnation') for r in records.values()}
+        for other in records.values():
+            if 'attention' in other:
+                other['attention'] = [a for a in other['attention'] if a.get('incarnation') in active]
     save_registry(records)
 
 
@@ -369,8 +399,10 @@ def start_xorg(record, records, timings):
                     "--owner-uid", str(os.getuid()),
                     "--control", directory / "control", "--supervise"], "mkdevs.log", root=True)
     record['mkdevs_supervisor_pid'] = int(wait_file(directory / 'devices.json.supervisor.pid', 10, helper))
+    save_registry(records)
     raw = wait_file(directory / "devices.json", 10, helper, record, "mkdevs_pid")
     record["mkdevs_pid"] = int((directory / "devices.json.pid").read_text())
+    save_registry(records)
     record["devices"] = json.loads(raw)
     kbd, ptr = record["devices"]["kbd"], record["devices"]["ptr"]
     time.sleep(1)
@@ -391,6 +423,7 @@ def start_xorg(record, records, timings):
                        f':{record["display"]}', confname, f'vt{record["vt"]}'],
                      "xorg-launch.log", root=True)
     record["pid_x"] = int(wait_file(directory / "xorg.pid", 5, launcher, record, "pid_x"))
+    save_registry(records)
     wait_display(record)
     attach = (["reattach", "kbd", "Virtual core keyboard"],
               ["reattach", "ptr", "Virtual core pointer"], ["enable", "kbd"],
@@ -411,101 +444,142 @@ def start_xorg(record, records, timings):
     timings["xorg_ms"] = milliseconds(start)
 
 
+def allocate_session(profile, records, *, incarnation=None):
+    sid = f's{max((int(s[1:]) for s in records), default=0) + 1}'
+    instance = secrets.token_hex(16)
+    directory = STATE / "run" / sid / instance
+    record = {"session": sid, "instance": instance, "profile": profile, "display": None,
+              "pid_x": None, "pid_dbus": None, "bus_address": None,
+              "atspi_address": None, "pid_atspi_launcher": None,
+              "pid_registryd": None, "home": str(directory / "home"),
+              "runtime_dir": str(directory / "runtime"),
+              "session_dir": str(directory), "created_at": time.time(), 'startup_complete': False}
+    metadata(STATE, record)
+    if incarnation is not None:
+        record['incarnation'] = record['root_incarnation'] = incarnation
+    record['lifecycle'] = 'reserved'
+    if profile == "xorg":
+        record.update(vt=None, devices={}, mkdevs_pid=None, mkdevs_supervisor_pid=None)
+    records[sid] = record
+    return record
+
+
 def start_session(profile):
-    start = time.monotonic()
     with locked_registry() as records:
-        sid = f's{max((int(s[1:]) for s in records), default=0) + 1}'
-        instance = secrets.token_hex(16)
-        directory = STATE / "run" / sid / instance
-        record = {"session": sid, "instance": instance, "profile": profile, "display": None,
-                  "pid_x": None, "pid_dbus": None, "bus_address": None,
-                  "atspi_address": None, "pid_atspi_launcher": None,
-                  "pid_registryd": None, "home": str(directory / "home"),
-                  "runtime_dir": str(directory / "runtime"),
-                  "session_dir": str(directory), "created_at": time.time()}
-        if profile == "xorg":
-            record.update(vt=None, devices={}, mkdevs_pid=None, mkdevs_supervisor_pid=None)
-        timings = {}
-        try:
-            used = {r["display"] for r in records.values() if alive(r.get("pid_x"))}
-            record["display"] = next((d for d in range(91, 121) if d not in used
-                and not os.path.lexists(f"/tmp/.X{d}-lock")
-                and not os.path.lexists(f"/tmp/.X11-unix/X{d}")), None)
-            if record["display"] is None:
-                raise RuntimeError("no free display in 91..120")
-            for name in ("home", "runtime", "logs"):
-                (directory / name).mkdir(parents=True, exist_ok=True)
-            (directory / '.instance').write_text(instance + '\n')
-            (directory / "runtime").chmod(0o700)
-            record['pid_log_guard'] = subprocess.Popen(
-                ['python3', str(WM / 'worker_housekeeping.py'), '--guard', str(directory),
-                 '--instance', instance], env=session_env(record), stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True).pid
-            # Session ids may be reused after stop; discard old helper outputs.
-            for name in ("devices.json", "devices.json.pid", "devices.json.supervisor.pid", "helper.stopping",
-                         "xorg.pid", "cmd.fifo", "input.sock", "input.sock.instance"):
-                path = directory / name
-                if path.exists():
-                    path.unlink()
-            display_start = time.monotonic()
-            if profile == "xvfb":
-                (directory / "fb").mkdir(exist_ok=True)
-                process = spawn(record, ["Xvfb", f':{record["display"]}', "-screen", "0",
-                                        "1920x1080x24", "-nolisten", "tcp",
-                                        "-fbdir", directory / "fb"], "xvfb.log")
-                record["pid_x"] = process.pid
-                wait_display(record, process)
-            else:
-                start_xorg(record, records, timings)
-            timings["display_ms"] = milliseconds(display_start)
-            bus_start = time.monotonic()
-            output = execute(record, ["dbus-daemon", "--session", "--fork",
-                                      "--print-address=1", "--print-pid=1"])
-            lines = output.splitlines()
-            record["pid_dbus"] = int(lines[1])
-            record["bus_address"] = lines[0]
-            timings["bus_ms"] = milliseconds(bus_start)
-            atspi_start = time.monotonic()
-            record["pid_atspi_launcher"] = spawn(record, ["/usr/libexec/at-spi-bus-launcher"],
-                                                       "atspi-launcher.log").pid
-            time.sleep(0.5)
-            record["pid_registryd"] = spawn(record, ["/usr/libexec/at-spi2-registryd"],
-                                                  "registryd.log").pid
-            deadline = time.monotonic() + 6
-            while time.monotonic() < deadline:
-                try:
-                    response = execute(record, ["gdbus", "call", "--session", "--dest",
-                        "org.a11y.Bus", "--object-path", "/org/a11y/bus", "--method",
-                        "org.a11y.Bus.GetAddress"], timeout=max(0.01, deadline - time.monotonic()))
-                    match = re.search(r'''unix:[^"',)]+''', response)
-                    if match:
-                        record["atspi_address"] = match.group()
-                        break
-                except (RuntimeError, subprocess.TimeoutExpired):
-                    pass
-                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
-            if not record["atspi_address"]:
-                raise RuntimeError("AT-SPI GetAddress timed out")
-            timings["atspi_ms"] = milliseconds(atspi_start)
-            records[sid] = record
+        record = allocate_session(profile, records)
+        save_registry(records)
+        return launch_session(record, records)
+
+
+def launch_session(record, records):
+    """Caller holds registry lock; reservation already exists durably.
+
+    A recovered 'creating' record must be reaped before calling this again.
+    Every subprocess inherits the incarnation-scoped process sweep markers.
+    """
+    start = time.monotonic()
+    sid, profile = record['session'], record['profile']
+    directory, instance = Path(record['session_dir']), record['instance']
+    record['lifecycle'] = 'creating'
+    save_registry(records)
+    timings = {}
+    try:
+        used = {r["display"] for r in records.values() if alive(r.get("pid_x"))}
+        record["display"] = next((d for d in range(91, 121) if d not in used
+            and not os.path.lexists(f"/tmp/.X{d}-lock")
+            and not os.path.lexists(f"/tmp/.X11-unix/X{d}")), None)
+        if record["display"] is None:
+            raise RuntimeError("no free display in 91..120")
+        save_registry(records)
+        durable_mkdir(directory)
+        with (directory / '.instance').open('w') as marker:
+            marker.write(instance + '\n')
+            marker.flush()
+            os.fsync(marker.fileno())
+        sync_directory(directory)
+        for name in ("home", "runtime", "logs"):
+            (directory / name).mkdir(mode=0o700, exist_ok=True)
+        (directory / "runtime").chmod(0o700)
+        record['pid_log_guard'] = subprocess.Popen(
+            ['python3', str(WM / 'worker_housekeeping.py'), '--guard', str(directory),
+             '--instance', instance], env=session_env(record), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True).pid
+        save_registry(records)
+        # Session ids may be reused after stop; discard old helper outputs.
+        for name in ("devices.json", "devices.json.pid", "devices.json.supervisor.pid", "helper.stopping",
+                     "xorg.pid", "cmd.fifo", "input.sock", "input.sock.instance"):
+            path = directory / name
+            if path.exists():
+                path.unlink()
+        display_start = time.monotonic()
+        if profile == "xvfb":
+            (directory / "fb").mkdir(exist_ok=True)
+            process = spawn(record, ["Xvfb", f':{record["display"]}', "-screen", "0",
+                                    "1920x1080x24", "-nolisten", "tcp",
+                                    "-fbdir", directory / "fb"], "xvfb.log")
+            record["pid_x"] = process.pid
             save_registry(records)
-            journal(sid, "start", True, start, profile=profile)
-            timings["total_ms"] = milliseconds(start)
-            return {"session": sid, "display": f':{record["display"]}',
-                    "profile": profile, "state": "ready", "timings": timings}, 0
-        except Exception as exc:
-            error = str(exc)
+            wait_display(record, process)
+        else:
+            start_xorg(record, records, timings)
+        timings["display_ms"] = milliseconds(display_start)
+        bus_start = time.monotonic()
+        output = execute(record, ["dbus-daemon", "--session", "--fork",
+                                  "--print-address=1", "--print-pid=1"])
+        lines = output.splitlines()
+        record["pid_dbus"] = int(lines[1])
+        save_registry(records)
+        record["bus_address"] = lines[0]
+        timings["bus_ms"] = milliseconds(bus_start)
+        atspi_start = time.monotonic()
+        record["pid_atspi_launcher"] = spawn(record, ["/usr/libexec/at-spi-bus-launcher"],
+                                                   "atspi-launcher.log").pid
+        save_registry(records)
+        time.sleep(0.5)
+        record["pid_registryd"] = spawn(record, ["/usr/libexec/at-spi2-registryd"],
+                                              "registryd.log").pid
+        save_registry(records)
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
             try:
-                teardown(record, records)
-            except Exception as cleanup_exc:
-                error += f"; cleanup: {cleanup_exc}"
-            journal(sid, "start", False, start, profile=profile, error=error)
-            return {"session": sid, "state": "failed", "error": error}, 1
+                response = execute(record, ["gdbus", "call", "--session", "--dest",
+                    "org.a11y.Bus", "--object-path", "/org/a11y/bus", "--method",
+                    "org.a11y.Bus.GetAddress"], timeout=max(0.01, deadline - time.monotonic()))
+                match = re.search(r'''unix:[^"',)]+''', response)
+                if match:
+                    record["atspi_address"] = match.group()
+                    break
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        if not record["atspi_address"]:
+            raise RuntimeError("AT-SPI GetAddress timed out")
+        timings["atspi_ms"] = milliseconds(atspi_start)
+        record["lifecycle"] = "ready"
+        record['startup_complete'] = True
+        records[sid] = record
+        save_registry(records)
+        journal(sid, "start", True, start, profile=profile)
+        timings["total_ms"] = milliseconds(start)
+        return {"session": sid, "incarnation": record["incarnation"], "display": f':{record["display"]}',
+                "profile": profile, "state": "ready", "timings": timings}, 0
+    except Exception as exc:
+        error = str(exc)
+        try:
+            teardown(record, records)
+        except Exception as cleanup_exc:
+            error += f"; cleanup: {cleanup_exc}"
+        journal(sid, "start", False, start, profile=profile, error=error)
+        return {"session": sid, "state": "failed", "error": error}, 1
 
 
 def list_sessions():
     with locked_registry() as records:
-        return {"sessions": [{"session": sid, "profile": r["profile"],
+        return {"sessions": [{"session": sid, "incarnation": r['incarnation'],
+                  "parent_incarnation": r['parent_incarnation'], 'depth': r['depth'],
+                  'children': r['children'], 'budget': r['budget'],
+                  'task': r['task'], 'result': r['result'], 'attention': r['attention'],
+                  'lifecycle': r['lifecycle'], "profile": r["profile"],
                   "display": f':{r["display"]}', "pid": r["pid_x"],
                   "uptime_s": int(time.time() - r["created_at"]),
                   "state": "ready" if alive(r["pid_x"]) else "dead"}
@@ -535,26 +609,81 @@ def run_session(sid, cmd):
             "duration_ms": milliseconds(start), "ok": code == 0}, code
 
 
-def stop_sessions(sid):
+def stop_tree(records, sid=None):
+    """Close gates top-down, reap bottom-up, entirely from registry data.
+
+    If a descendant cannot be proved dead, retain its ancestors for retry.
+    The durable stopping flag also prevents a recovered spawn intent from
+    resurrecting a stopped tree.
+    """
+    preorder, postorder, visited = [], [], set()
+
+    def visit(record):
+        incarnation = record['incarnation']
+        if incarnation in visited:
+            return
+        visited.add(incarnation)
+        preorder.append(record)
+        # Parent links are authoritative; also honour persisted children links
+        # for conservative reap of a partially migrated/inconsistent registry.
+        for child in list(records.values()):
+            if (child.get('parent_incarnation') == incarnation or
+                    child.get('incarnation') in record.get('children', [])):
+                visit(child)
+        postorder.append(record)
+
+    if sid is None:
+        for record in sorted(records.values(), key=lambda r: r.get('depth', 0)):
+            visit(record)
+    else:
+        visit(records[sid])
+    # Fail closed even if the next gate write or process reap fails.
+    for record in preorder:
+        record['lifecycle'], record['control_state'] = 'stopping', 'QUIESCING'
+    save_registry(records)
+    for record in preorder:
+        close_control_gate(Path(record['session_dir']) / 'control')
+        journal(record['session'], 'stop.gate', True, time.monotonic(),
+                incarnation=record['incarnation'])
+    stopped, errors = [], []
+    for record in postorder:
+        incarnation = record['incarnation']
+        if any(r.get('parent_incarnation') == incarnation or
+               r.get('incarnation') in record.get('children', [])
+               for r in records.values() if r is not record):
+            errors.append(record['session'] + ': descendant retained')
+            continue
+        try:
+            teardown(record, records)
+            stopped.append(incarnation)
+            journal(record['session'], 'stop.reaped', True, time.monotonic(),
+                    incarnation=incarnation)
+        except Exception as exc:
+            errors.append(record['session'] + ': ' + str(exc))
+    return stopped, errors
+
+
+def stop_sessions(sid, *, incarnation=None):
     start = time.monotonic()
     with locked_registry() as records:
+        if incarnation is not None:
+            record = by_incarnation(records, incarnation)
+            if record is None:
+                # Incarnation-scoped stop is idempotent, never resolves a reused sN.
+                return {'incarnation': incarnation, 'state': 'stopped', 'ok': True}, 0
+            sid = record['session']
         if sid is not None and sid not in records:
             journal(sid, "stop", False, start, error="unknown session")
             return {"error": "unknown session", "session": sid}, 2
-        targets = [sid] if sid is not None else sorted(records, key=lambda s: int(s[1:]))
-        errors = []
-        for target in targets:
-            try:
-                teardown(records[target], records)
-            except Exception as exc:
-                errors.append(f"{target}: {exc}")
+        targets = list(records)
+        stopped, errors = stop_tree(records, sid)
         journal(sid, "stop", not errors, start,
                 **({"error": "; ".join(errors)} if errors else {}))
         if errors:
             return {"session": sid, "ok": False, "error": "; ".join(errors)}, 1
         if sid is None:
-            return {"stopped": targets, "ok": True}, 0
-        return {"session": sid, "state": "stopped", "ok": True}, 0
+            return {"stopped": targets, 'incarnations': stopped, "ok": True}, 0
+        return {"session": sid, "state": "stopped", 'incarnations': stopped, "ok": True}, 0
 
 
 class Parser(argparse.ArgumentParser):
@@ -577,6 +706,7 @@ def main():
     stop = commands.add_parser("stop")
     target = stop.add_mutually_exclusive_group(required=True)
     target.add_argument("--session")
+    target.add_argument("--incarnation")
     target.add_argument("--all", action="store_true")
     try:
         args = parser.parse_args()
@@ -590,7 +720,7 @@ def main():
                 raise ValueError("run requires a command after --")
             result, code = run_session(args.session, cmd)
         else:
-            result, code = stop_sessions(args.session)
+            result, code = stop_sessions(args.session, incarnation=args.incarnation)
     except ValueError as exc:
         result, code = {"error": str(exc)}, 2
     except Exception as exc:

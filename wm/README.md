@@ -51,3 +51,21 @@ signed immutable profile documents referenced by hash; (f) no warm pool —
 every start is cold; (g) the xorg profile creates and attaches input
 devices but sessiond injects no input (actuation is the worker's job);
 (h) single user, no per-slot UIDs.
+
+## WM v1 stage WM-B
+
+Sessiond now persists incarnation ids, genealogy, task/result mailboxes and
+budget ledgers. `stop --session sN` reaps its subtree, parent gate first and
+children reaped first, even with the controller dead. Prefer
+`stop --incarnation ID` for automation: `sN` can be reused after stop.
+
+`./ark-wmctl serve` runs the stdlib owner-local controller;
+`./ark-wmctl call registry '{}'` reads its registry/caps API. Spawn requires
+a ready AGENT parent worker and a delegate capability from
+`capability.issue`. Default admission is two sessions; structural caps are
+depth three and fan-out four. The controller never acquires a worker lease.
+
+See [the WM-B bench note](../bench/wm2-controller-2026-11-11.md) for wire
+shapes, config, recovery, artifact exchange and Raj's outstanding live gates.
+Run `PYTHONDONTWRITEBYTECODE=1 python3 tests/run_wm_b_headless.py full` for the
+full headless suite. Presenter/takeover and promotion remain later stages.

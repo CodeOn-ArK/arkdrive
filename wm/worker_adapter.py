@@ -266,7 +266,9 @@ TOOLS = [
     dict(name='wait', description='Wait without input for a worker predicate; returns fresh state and revision.',
          inputSchema=schema(dict(expect=PREDICATE, timeout_ms={'type': 'integer', 'minimum': 1, 'maximum': 30000}), ['expect', 'timeout_ms'])),
     dict(name='done', description='Finish the task and release the driver lease. Report only verified success.',
-         inputSchema=schema(dict(status={'type': 'string', 'enum': ['success', 'failed', 'blocked']}, summary={'type': 'string'}), ['status', 'summary']))]
+         inputSchema=schema(dict(status={'type': 'string', 'enum': ['success', 'failed', 'blocked']}, summary={'type': 'string'},
+                                 artifacts={'type': 'array', 'maxItems': 16, 'items': {'type': 'string'},
+                                            'description': 'Explicit file exports beneath this session HOME. The WM controller copies these into the exchange directory.'}), ['status', 'summary']))]
 
 
 class Adapter:

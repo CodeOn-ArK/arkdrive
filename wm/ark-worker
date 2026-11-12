@@ -1968,7 +1968,7 @@ class Worker:
                 self.act.submit(peer, ident, params)
                 return
             self.validate_params(method, params)
-            if method in ("window.observe", "window.wait", "session.done"):
+            if method in ("window.observe", "window.wait", "session.done", "session.human_need"):
                 self.require_lease(peer, params)
             if method in ("system.info", "session.attach", "action.get") and not self.settle_pixels():
                 if len(peer.waits) >= 8:
@@ -2021,12 +2021,29 @@ class Worker:
             elif method == "session.done":
                 if params.get("status") not in ("success", "failed", "blocked") or not isinstance(params.get("summary"), str):
                     raise RPCError("invalid_params")
+                artifacts = params.get('artifacts', [])
+                if (not isinstance(artifacts, list) or len(artifacts) > 16 or
+                        any(not isinstance(path, str) or not path or len(path) > 4096 for path in artifacts)):
+                    raise RPCError('invalid_params')
+                fields = dict(status=params['status'], summary=params['summary'])
+                if 'artifacts' in params:
+                    fields['artifacts'] = artifacts
+                record = getattr(self, 'record', {})
+                if record.get('incarnation'):
+                    fields['incarnation'] = record['incarnation']
+                    fields['task_id'] = (record.get('task') or {}).get('id')
                 if getattr(self, "act", None):
-                    self.act.durable("done", status=params["status"], summary=params["summary"])
+                    self.act.durable("done", **fields)
                     self.act.lease_state[self.lease]["done"] = True
                 else:
-                    self.journal.append("done", status=params["status"], summary=params["summary"])
+                    self.journal.append("done", **fields)
                 self.release_lease()
+                result = {}
+            elif method == 'session.human_need':
+                if params.get('need') not in (None, 'passcode', 'human', 'blocked'):
+                    raise RPCError('invalid_params')
+                writer = self.act.durable if getattr(self, 'act', None) else self.journal.append
+                writer('human_need', need=params.get('need'))
                 result = {}
             else:
                 raise RPCError("method_not_found", code=-32601)
@@ -2047,7 +2064,8 @@ class Worker:
             "window.observe": {"lease", "scope", "since_rev", "channels", "region", "ignore_regions", "budget", "cursor", "scale"},
             "window.wait": {"lease", "expect", "predicate", "since_rev"},
             "action.get": {"action_id"},
-            "session.done": {"lease", "status", "summary"}}
+            "session.done": {"lease", "status", "summary", "artifacts"},
+            "session.human_need": {"lease", "need"}}
         if method not in keys:
             raise RPCError("method_not_found", code=-32601)
         if set(params) - keys[method] - {"session", "generation", "deadline_ms"}:

@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""WM-B owner-local controller. Run `serve`, or `call METHOD JSON_PARAMS`."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+
+from wm_controller import Controller, Server, local_call
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--state', type=Path,
+                        default=Path(os.path.expanduser('~/.local/state/ark-sessiond')))
+    commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('serve')
+    call = commands.add_parser('call')
+    call.add_argument('method')
+    call.add_argument('params', nargs='?', default='{}')
+    args = parser.parse_args()
+    try:
+        if args.command == 'call':
+            result = local_call(args.state / 'wmctl.sock', args.method, json.loads(args.params), timeout=60)
+            print(json.dumps(result), flush=True)
+            return int('error' in result or not result.get('result', {}).get('ok', False))
+        args.state.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # Acquire before key/journal recovery or stale-socket removal. A second
+        # controller must never unlink a serving controller's endpoint.
+        with (args.state / '.wmctl.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('controller_already_running')
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+            Server(Controller(args.state)).run()
+        return 0
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps(dict(ok=False, error=str(exc))), flush=True)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
