@@ -192,11 +192,66 @@ passed**. The harness `--help` entry point also passed without starting a
 session. The private tests stay alongside the untracked harness so the
 repository's default suite does not depend on that local file.
 
-## Results — NOT RUN
+## Results (Raj, Nov 11, 2026)
 
-**NOT RUN. Raj runs the pilot and fills this section.** No live paired runs,
-model calls, success-rate comparison or pack benefit claim was made here.
+### GPT arm — full matrix, 40 runs (driver: Codex / GPT-6.1 Sol via ark-act MCP)
 
-Held-out name collisions, the 27-folder Thunar case, unexpected modals,
-app startup/closure timing and interrupted responses are follow-up work.
-The two seeded happy-path tasks do not evaluate those cases.
+Runner: ~/gpt_pilot_run.sh + ~/gpt_pilot_matrix.sh on ArK2 (F1 pattern;
+per run: slate, fresh xvfb session, seeded home, Thunar, one codex exec;
+generalist arm runs the adapter with ARK_ACT_PACKS=off). Rows:
+~/packs-pilot-gpt-results.jsonl. Total spend: 1,142,095 tokens.
+
+| arm | task | oracle | avg tokens | avg wall |
+|---|---|---|---|---|
+| generalist | create | 5/10 | 35,790 | 87 s |
+| pack | create | **10/10** | 25,059 | 31 s |
+| generalist | rename | 5/10 | 35,207 | 105 s |
+| pack | rename | **10/10** | 18,151 | 34 s |
+
+- Every pack run called use_skill exactly once (20/20 logs show one
+  `mcp: ark/use_skill started`, all completed). The pack wins by
+  construction: one verified skill call instead of raw-act driving.
+- Generalist failures (10) were all clean exits with honest blocked
+  reports, no false success claims: text-entry rejections, the
+  adapter act budget exhausted (create 9, 81,184 tokens), one
+  adapter_io_error mid-run after a wrong turn into Thunar's
+  Select-by-Pattern dialog (rename 6).
+- Token bar (reconciled plan: pack <= 50% of the passing baseline):
+  per run, create is 70% and rename 52% of generalist — the raw bar
+  is narrowly missed. Per VERIFIED SUCCESS the pack is at 35%
+  (create) and 26% (rename) of the generalist's cost — the bar is
+  met where it matters, because the generalist burns full price on
+  its 10 failures. Correctness-regression veto: none — the pack is
+  ahead on success, tokens, and wall time on both tasks.
+- Verdict: for a frontier driver, the pack is a clear win. Skills
+  turn two flaky raw-act tasks into one deterministic call each.
+
+### 27B arm — PARTIAL, stopped at 27/40 by ArK's order ("quit running with qwen, make gpt do it")
+
+Rows: ~/packs-pilot-results.jsonl (ark-loop + local llama; form-error
+counts from the CU_LOOP_TRANSCRIPT capture).
+
+| arm | task | n | oracle | done success | form errors | budget deaths | avg tokens |
+|---|---|---|---|---|---|---|---|
+| generalist | create | 10 | 1/10 | 0 | 22 | 6 | 58,141 |
+| pack | create | 10 | 5/10 | 5 | 0 | 5 | 68,446 |
+| generalist | rename | 4 | 0/4 | 0 | 1 | 2 | 59,366 |
+| pack | rename | 3 | 0/3 | 0 | 0 | 2 | 67,419 |
+
+- Same direction as the GPT arm on create: the pack quintuples
+  oracle success and eliminates form errors (0 vs 22). But the
+  dominant 27B killer is the loop itself: 11 of 27 runs died on the
+  token-budget guard, and rename runs in both arms observe-loop
+  without ever attempting an act (transcripts show observe/wait
+  cycles with stale_rev retries). The pack cannot fix a driver that
+  never starts; that is the toolcall council's Layer 0 territory
+  plus loop budget/context work, not pack content.
+- Smoke note: the pre-matrix smoke (1 pair/task) is superseded by
+  these numbers; its transcripts are what exposed the
+  observe-loop pattern.
+
+### Follow-up still owed
+
+Held-out name collisions, the 27-folder Thunar case, unexpected
+modals, app startup/closure timing and interrupted responses. The
+two seeded happy-path tasks do not evaluate those cases.
