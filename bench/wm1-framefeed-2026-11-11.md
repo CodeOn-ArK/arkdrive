@@ -229,3 +229,24 @@ qualify this stage only; they do not require a presenter or takeover path.
 
 Report live outcomes and measurement artifacts separately. Cursor image /
 hotspot remain a recorded gap even if position checks pass.
+
+## Raj verifier addendum (Nov 11, 2026)
+
+Suite: 1,082 tests OK verified by Raj on ArK2 (commit 02585c8).
+
+Live gate (~/wm_a_gate.py on ArK2; slate -> xvfb session -> worker ->
+fx_log; a w2_client driver holds the lease and types while a separate
+feed client reads frames-feed.sock): **PASS 14/14**.
+
+- Feed socket present under SD/driver with 0600 perms.
+- Session-scope frames.get returns a frame (rev 16) with a readable
+  PNG in the feed's OWN feed-frames/ directory; re-query at the same
+  rev returns `unchanged`; window-scope get returns a frame.
+- window.act over the feed is refused: -32601, data.reason read_only.
+- After each of the driver's 3 verified text acts (alpha/bravo/
+  charlie, all success), the feed advanced: changed=true, new frame
+  id, rev 24/32/40. The driver was never disturbed — no
+  provider_degraded, no frame_quota pressure; driver frame counters
+  unmoved while the feed ring held its own 5 frames.
+- The reconciled council test this stage owed — feed beside an
+  acting driver with zero quota errors against the driver — passes.
