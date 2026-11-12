@@ -250,3 +250,25 @@ feed client reads frames-feed.sock): **PASS 14/14**.
   unmoved while the feed ring held its own 5 frames.
 - The reconciled council test this stage owed — feed beside an
   acting driver with zero quota errors against the driver — passes.
+
+## VM verification (x86 Debian generic VM, Nov 11, 2026)
+
+Tree synced into the guest (~/arkdrive on Debian 13.7.0). Guest
+dependency additions found by the suite, now part of the Phase 5
+image list: python3-cairo, libtesseract5, tesseract-ocr-eng,
+python3-pil, strace, fonts-liberation, fonts-dejavu (plus the Nov 10
+list). A stray wm/test_worker_w3.py left in the guest by the Nov 10
+sync was removed (it shadowed the tests package).
+
+- WM-A live gate in the guest (~/wm_a_gate.py): **PASS 14/14**,
+  same as ArK2.
+- Full suite in the guest: 1,082 run, **1,073 pass, 9 fail — all 9
+  in test_worker_w7_corpus** (the adoption-bar test across its 8
+  rendering modes + the real-capture exactness test). These bars are
+  calibrated to ArK2's font rendering stack; the guest (Debian
+  freetype/fontconfig/Liberation/DejaVu) renders slightly
+  differently: 'original' mode scores 0.9792 exact vs the 0.98 bar
+  (about one corpus line). Functional OCR in the guest is green
+  (fx_canvas byte-exact B6 passes). Recorded as an environment
+  calibration difference, not a defect; the appliance image will
+  pin its font stack at build time in Phase 5.
