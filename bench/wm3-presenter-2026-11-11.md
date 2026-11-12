@@ -362,3 +362,52 @@ Targeted: **42 tests passed in 0.298 s**. Full suite: **1,168 tests in
 Live gates remain Raj's; none were run here. No display (including `:0`)
 was opened. Nothing was staged or committed, and all writes stayed within
 the repository.
+
+## Raj verifier addendum (Nov 11, 2026)
+
+Suite: 1,167 tests OK verified by Raj on ArK2 (commit 6f73ed8);
+fix round 1 brought it to 1,168 (commit a09b165).
+
+Live gate layer 1 — takeover protocol on a real xorg session
+(~/wm_c_gate.py, evdev helper path): **PASS 24/24**. Grant ->
+human.begin bumps the control epoch and revokes the driver (old
+acts invalid_lease, new attach refused human_control); human
+motion+click+keys land in fx_log ("base" -> "basezqx9"); the
+canary is absent from every journal and human.events rows carry
+only ts/type/session/generation/instance/count/kinds; stale
+layout and replayed sequence are rejected with zero delivered
+input; SIGKILLing the controller mid-hold ends human authority
+and releases the hold (no further input); re-takeover, then
+human.end resume -> fresh attach required, an act before a full
+observe is refused, after it the driver works; the kill file
+ends a takeover. Spot latency (n=4 begins, 13 events): begin to
+human p50 0.07 s (max 1.1 s on the first, helper-warm begin);
+human.event round trip p95 ~3 ms. The full 100-sample p95 study
+and the mapping grid remain W9 scope.
+
+Fix round 1 (found by the layer-2 gate): ark-present crashed at
+startup on any real X display — the WM_NAME title
+'ArkDrive — session presenter' holds an em dash and python-xlib
+encodes WM_NAME as latin-1. Fixed to an ASCII title with a
+regression test (1,168 tests OK). Two gate-script lessons banked:
+human button frames plan at the CURRENT pointer position (send a
+motion first, as a real presenter stream does), and the registry's
+control_state is not a live mirror — poll `ark-worker status`
+(control.state / human_transport) instead.
+
+Live gate layer 2 — the ark-present GUI (~/wm_c_presenter_gate.py
++ ~/wm_c_presenter_click.py; host Xvfb :77, presenter window
+1100x760): **PASS 4/4 + 4/4**. :0 refused
+(explicit_nonzero_host_display_required); presenter opens on :77;
+no window appears inside the session; host pixels change when the
+session changes (live feed compositing). Click-through with XTEST
+on the host: clicking the presenter's own [Takeover] puts the
+session in HUMAN (ark-worker status), clicking the presented
+fx_log entry and typing sends "p7k" through the presenter ->
+controller grant -> worker human path into fx_log
+("visualchange" -> "visualchangep7k"); [Resume] returns control
+to AGENT and the driver works after fresh attach + full observe.
+The click used the presenter's published transform (native
+1920x1080 scaled ~0.566 into the host window); landing the
+canary in the entry is a passing spot check of the inverse
+mapping — the full grid study is W9 scope.
