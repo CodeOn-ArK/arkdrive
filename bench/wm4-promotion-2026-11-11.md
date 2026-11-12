@@ -262,3 +262,14 @@ exit, which by design never happens while it holds the
 selection — the transfer now installs a detached holder in the
 destination and verifies by read-back, and the fake xclip
 models the non-returning form.
+
+## VM verification (x86 Debian generic VM, Nov 11, 2026)
+
+Live gate in the guest: **PASS 19/19** (xclip and wmctrl
+installed in the guest first — both are runtime deps). Suite in
+the guest: 1,243 run; the only failures are the 9 known
+test_worker_w7_corpus font-calibration cases, plus one apparent
+extra failure that was an invocation artifact — the stage-D
+clipboard test spawns a subprocess importing wm modules and
+needs the documented PYTHONPATH=<repo>/wm; with it, the test
+passes in the guest.
