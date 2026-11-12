@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 from promotion_recipes import RECIPES, PromotionError
@@ -162,13 +163,32 @@ class Backend:
             raise PromotionError('child_worker_failed')
 
     def clipboard_read(self, record):
-        data = self.run(record, ['xclip', '-selection', 'clipboard', '-out'])
+        try:
+            data = self.run(record, ['xclip', '-selection', 'clipboard', '-out'])
+            text = data.decode('utf-8')
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise PromotionError('clipboard_read_failed') from exc
         if len(data) > 65536:
             raise PromotionError('clipboard_quota')
-        return data.decode('utf-8')
+        return text
 
     def clipboard_set(self, record, text):
-        self.run(record, ['xclip', '-selection', 'clipboard', '-in'], input=text.encode('utf-8'))
+        from wm_controller import sessiond
+        if type(record.get('display')) is not int or not 91 <= record['display'] <= 120:
+            raise PromotionError('unsafe_display')
+        try:
+            # A file avoids a blocking pipe write, including a maximum-size
+            # payload. It is unlinked immediately and remains available to
+            # the detached holder. No payload is put in argv or the log.
+            with tempfile.TemporaryFile(dir=record['session_dir']) as payload, \
+                    (Path(record['session_dir']) / 'logs/promotion.log').open('ab') as log:
+                payload.write(text.encode('utf-8'))
+                payload.seek(0)
+                subprocess.run([sys.executable, str(Path(__file__).with_name('wm_clipboard_holder.py'))],
+                               env=sessiond.session_env(record), cwd=record['home'],
+                               stdin=payload, stdout=log, stderr=log, timeout=5, check=True)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise PromotionError('clipboard_set_failed') from exc
 
     def reopen(self, record, manifest, root):
         from wm_controller import sessiond
@@ -371,8 +391,22 @@ class Promotion:
             time.sleep(.05)
 
     def reconcile_clipboard(self, child, manifest):
-        if self.backend.clipboard_read(child) != manifest['clipboard_payload']:
-            raise PromotionError('clipboard_uncertain')
+        # The detached owner may still be acquiring the selection. Reconcile
+        # both initial installation and an armed step from native reads only.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if self.backend.clipboard_read(child) == manifest['clipboard_payload']:
+                    return
+            except (PromotionError, OSError, ValueError, subprocess.SubprocessError):
+                pass
+            if time.monotonic() >= deadline:
+                raise PromotionError('clipboard_uncertain')
+            time.sleep(.05)
+
+    def transfer_clipboard(self, child, manifest):
+        self.backend.clipboard_set(child, manifest['clipboard_payload'])
+        self.reconcile_clipboard(child, manifest)
 
     def retire(self, source, manifest, reconcile=False):
         observation = self.backend.settled(source)
@@ -444,7 +478,7 @@ class Promotion:
             root = Path(self.step('transfer', lambda: self.install(child, manifest),
                                   lambda: self.install(child, manifest)))
             if 'clipboard_payload' in manifest:
-                self.step('clipboard', lambda: self.backend.clipboard_set(child, manifest['clipboard_payload']),
+                self.step('clipboard', lambda: self.transfer_clipboard(child, manifest),
                           lambda: self.reconcile_clipboard(child, manifest))
             self.step('reopen', lambda: self.backend.reopen(child, manifest, root),
                       lambda: self.verified(child, manifest, root))

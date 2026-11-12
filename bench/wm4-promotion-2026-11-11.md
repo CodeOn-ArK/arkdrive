@@ -168,3 +168,58 @@ OK (skipped=1)**, with no failures or errors.
 No commit or staging was performed, no files were written outside
 `~/arkdrive`, and no display :0 was opened. This round's validation is
 headless; live gates remain Raj's.
+
+## Fix round 3
+
+Raj's ArK2 gate found that selected clipboard transfer waited for
+`xclip -selection clipboard -in` to exit. A selection holder must remain
+alive to serve its payload; the blocking subprocess call consequently
+timed out even after installation. The earlier in-memory clipboard fixture
+returned immediately and could not expose this process-lifetime defect.
+
+Clipboard installation now uses a short-lived launcher which forks a
+holder into its own POSIX session and exits. The controller waits only for
+the launcher. The detached holder inherits the destination's DISPLAY,
+HOME, runtime/bus environment, and exact sessiond/incarnation markers, so
+ordinary destination teardown finds and reaps it. Its input is a bounded,
+immediately unlinked temporary file inside the destination session; its
+output goes to the destination promotion log. No controller pipe or
+payload in argv/logs is retained. `xclip -quiet -loops 0` keeps the holder
+in the foreground of its own session and serves unlimited selection
+requests. There is no timer or read-count lifetime bound: it ends when
+selection ownership is replaced, the destination X server exits, or
+sessiond tears down the destination. Verification reads do not consume it.
+
+Both initial installation and recovery of an armed clipboard step now
+require destination `xclip -out` read-back equal to the checkpoint payload,
+with bounded retries while ownership is being acquired. Launcher failures
+report `clipboard_set_failed`; unverifiable destination state reports
+`clipboard_uncertain`. Read-command timeouts report clipboard-specific
+errors rather than raw subprocess exception text. A failed transfer is
+recorded before normal child teardown and source gate release; it cannot
+reach reopen or source retirement. Recovery reads native state without
+installing another holder.
+
+The added executable xclip fixture never opens X. Its `-in` process stores
+the payload and remains alive indefinitely; `-out` requires a live owner
+and reads without consuming ownership. Before the fix, the transfer test
+reproduced the reported raw five-second subprocess timeout. The success
+regression now promotes a near-quota Unicode payload through an actual
+controller subprocess that exits before read-back, checks destination
+environment and sessiond ownership, and reads the same payload repeatedly
+before and after controller reconstruction. Further cases cover mismatched
+read-back, a non-returning reader, and launcher timeout, including source
+preservation, no reopen/retirement, child cleanup, and step-specific reasons.
+The process fixture adopts and reaps its detached holders; native X
+socket/lock cleanup is disabled because no X server was created.
+
+Stage D passed **75 tests in 20.991 seconds: OK** using the same environment
+and discovery commands as Fix round 1. The full WM suite passed **1,243
+tests in 153.585 seconds: OK (skipped=1)**, with no failures or errors.
+Logs are `wm/tests/.tmp/wm-d-fix3-targeted.log` and
+`wm/tests/.tmp/wm-d-fix3-full-suite.log`. The full run emitted existing
+resource-cleanup warnings from W2 fixtures.
+
+No commit or staging was performed, no files were written outside
+`~/arkdrive`, and no display :0 was opened. Validation is headless;
+live gates remain Raj's.

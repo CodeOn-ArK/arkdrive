@@ -1,8 +1,14 @@
 """Headless promotion transactions. No display, app, or clipboard is opened."""
 import copy
+import ctypes
 import hashlib
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -101,6 +107,9 @@ class PromotionCase(unittest.TestCase):
         self.world.windows[self.root] = [self.window, dict(handle='unrelated-window', xid=11, mapped=True,
                                                          title='Other App', **{'class': 'Other'})]
         self.world.clipboards[self.root] = 'selected text'
+        self.real_marked_pids = sessiond.marked_pids
+        self.real_alive = sessiond.alive
+        self.real_sleep = time.sleep
         self.reap = patch.object(sessiond, 'marked_pids', return_value=[]).start()
         patch.object(sessiond.time, 'sleep').start()
         patch.object(sessiond, 'alive', return_value=False).start()
@@ -215,7 +224,128 @@ class PromotionCase(unittest.TestCase):
         self.assertEqual(self.world.clipboards[child], 'selected text')
         names = [e[0] for e in self.world.events]
         self.assertLess(names.index('clipboard_set'), names.index('reopen'))
+        self.assertLess(names.index('clipboard_set'), names.index('clipboard_read', 1))
+        self.assertLess(names.index('clipboard_read', 1), names.index('reopen'))
         self.assertEqual(json.loads(Path(result['checkpoint']).read_text())['clipboard_payload'], 'selected text')
+
+    def native_clipboard(self, mode='normal'):
+        """Use real subprocesses with a non-returning, display-free xclip fake."""
+        directory = self.state / 'clipboard-fixture'
+        directory.mkdir()
+        executable = directory / 'xclip'
+        executable.write_bytes(Path(__file__).with_name('wm_d_xclip_fixture.py').read_bytes())
+        executable.chmod(0o700)
+        patch.dict(os.environ, PATH=str(directory) + os.pathsep + os.environ['PATH'],
+                   ARK_TEST_CLIPBOARD=str(directory), ARK_TEST_CLIPBOARD_READ=mode).start()
+        patch.object(sessiond, 'marked_pids', side_effect=self.real_marked_pids).start()
+        patch.object(sessiond, 'alive', side_effect=self.real_alive).start()
+        patch.object(sessiond.time, 'sleep', side_effect=self.real_sleep).start()
+        provision = self.launch.side_effect
+        def launch(record, records):
+            record['display'] = 92  # An identifier only; the fake never opens X.
+            return provision(record, records)
+        self.launch.side_effect = launch
+        teardown = sessiond.teardown
+        def stop(record, records, **kwargs):
+            # Real marker-based process cleanup, without any native X lock or
+            # socket cleanup: this fixture has never created an X server.
+            display, record['display'] = record['display'], None
+            try:
+                return teardown(record, records, **kwargs)
+            finally:
+                record['display'] = display
+        patch.object(sessiond, 'teardown', side_effect=stop).start()
+        # Adopt detached test holders so the fixture can kill AND reap them,
+        # independent of whether the container's PID 1 reaps orphaned children.
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+
+        def cleanup():
+            try:
+                for path in directory.glob('*.json'):
+                    pid = json.loads(path.read_text())['pid']
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass  # A blocking-call regression already waited on it.
+            finally:
+                libc.prctl(36, previous.value, 0, 0, 0)
+        self.addCleanup(cleanup)
+        backend = Backend(self.c)
+        source_read = self.world.clipboard_read
+        self.world.clipboard_read = lambda record: (source_read(record) if
+            record['incarnation'] == self.root else backend.clipboard_read(record))
+        self.world.clipboard_set = backend.clipboard_set
+        return backend, directory
+
+    def test_clipboard_transfer_completes_with_nonreturning_holder_and_repeated_reads(self):
+        backend, directory = self.native_clipboard()
+        controllers = []
+        def install(record, text):
+            # This real controller process must EXIT before the promotion's
+            # read-back. The test's subreaper then adopts its detached holder.
+            process = subprocess.Popen([sys.executable, '-c',
+                'import json,os,sys; from pathlib import Path; '
+                'from wm_controller import sessiond; from wm_promotion import Backend; '
+                'sessiond.STATE=Path(os.environ["ARK_SESSIOND"]); '
+                'Backend(None).clipboard_set(json.loads(sys.argv[1]), sys.stdin.read())',
+                json.dumps(record)], env=sessiond.session_env(record),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            controllers.append(process.pid)
+            try:
+                _, error = process.communicate(text.encode('utf-8'), timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise
+            self.assertEqual(process.returncode, 0, error.decode())
+        self.world.clipboard_set = install
+        payload = 'selected text\nUnicode: \u2603\n' + 'x' * 65000
+        self.world.clipboards[self.root] = payload
+        result = self.promote(transfer_clipboard=True)
+        self.assertTrue(result['ok'], result)
+        child = self.record(result['child_incarnation'])
+        owner = json.loads(next(directory.glob('*.json')).read_text())
+        self.assertEqual(owner['display'], ':' + str(child['display']))
+        self.assertEqual(owner['home'], child['home'])
+        self.assertEqual(owner['runtime'], child['runtime_dir'])
+        self.assertEqual(owner['sid'], owner['pid'])
+        # It is adopted by our test subreaper, rather than the exited
+        # controller process which installed it.
+        parent = int(Path(f"/proc/{owner['pid']}/stat").read_text().split()[3])
+        self.assertEqual(parent, os.getpid())
+        self.assertNotIn(parent, controllers)
+        self.assertIn(owner['pid'], self.real_marked_pids(child))
+        self.assertEqual(owner['argv'][-2:], ['-loops', '0'])
+        self.assertEqual(backend.clipboard_read(child), payload)
+        self.restart()
+        self.assertEqual(backend.clipboard_read(child), payload)
+        os.kill(owner['pid'], 0)  # Verification/retry must not consume the holder.
+        self.assertEqual(len(list(directory.glob('*.json'))), 1)
+
+    def test_clipboard_readback_mismatch_fails_before_reopen_and_reaps_child(self):
+        _, directory = self.native_clipboard(mode='mismatch')
+        self.assert_failed(self.promote(transfer_clipboard=True), 'clipboard_uncertain')
+        self.assertNotIn('reopen', [e[0] for e in self.world.events])
+        self.assertFalse(self.real_alive(json.loads(next(directory.glob('*.json')).read_text())['pid']))
+
+    def test_clipboard_readback_timeout_has_step_reason_and_reaps_child(self):
+        _, directory = self.native_clipboard(mode='hang')
+        self.assert_failed(self.promote(transfer_clipboard=True), 'clipboard_uncertain')
+        self.assertNotIn('reopen', [e[0] for e in self.world.events])
+        self.assertFalse(self.real_alive(json.loads(next(directory.glob('*.json')).read_text())['pid']))
+
+    def test_clipboard_launcher_timeout_has_step_reason_and_reaps_child(self):
+        self.native_clipboard()
+        with patch('wm_promotion.subprocess.run', side_effect=subprocess.TimeoutExpired('launcher', 5)):
+            self.assert_failed(self.promote(transfer_clipboard=True), 'clipboard_set_failed')
+        self.assertNotIn('reopen', [e[0] for e in self.world.events])
 
     def test_clipboard_unselected_neither_reads_nor_touches_child(self):
         result = self.promote()
@@ -524,6 +654,8 @@ class PromotionCase(unittest.TestCase):
         with patch('wm_promotion.subprocess.run') as run, patch('wm_promotion.subprocess.Popen') as popen:
             with self.assertRaisesRegex(PromotionError, 'unsafe_display'):
                 Backend(self.c).run(record, ['xclip'])
+            with self.assertRaisesRegex(PromotionError, 'unsafe_display'):
+                Backend(self.c).clipboard_set(record, 'payload')
             with self.assertRaisesRegex(PromotionError, 'unsafe_display'):
                 Backend(self.c).reopen(record, {}, Path('.'))
         run.assert_not_called()
