@@ -439,3 +439,15 @@ xvfb sessions :91-:120): **PASS 36/36**.
   the run (human_need sent after done had released the lease; a
   spawn parent with no worker started fails closed with
   parent_control_unavailable, as designed) — no product defects.
+
+## VM verification (x86 Debian generic VM, Nov 11, 2026)
+
+Tree synced into the guest. WM-B live gate in the guest
+(~/wm_b_gate.py): **PASS 36/36**, same as ArK2 — including the
+controller-dead subtree reap and the global-kill fan-out.
+
+Full suite in the guest: 1,126 run, 1,117 pass, 9 fail — the same
+9 test_worker_w7_corpus calibration tests recorded at WM-A
+(adoption bar in its 8 rendering modes + real-capture exactness;
+bars calibrated to ArK2's font stack). No WM-B test fails in the
+guest.
