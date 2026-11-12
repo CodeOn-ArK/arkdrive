@@ -29,7 +29,7 @@ loader.exec_module(sessiond)
 MAX_REQUEST = 65536
 MAX_CLIENTS = 8
 MAX_REPLY = 4 * 1024 * 1024
-SCOPES = ['spawn', 'prompt', 'queue', 'queue.ack', 'budget.debit', 'attention.report']
+SCOPES = ['spawn', 'promote', 'prompt', 'queue', 'queue.ack', 'budget.debit', 'attention.report']
 
 
 class Refused(Exception):
@@ -100,6 +100,9 @@ class Controller:
         self.crash = crash or (lambda phase: None)
         self.kill_file = Path(os.environ.get('CU_KILL_FILE', '/tmp/cu-executor.kill'))
         self.frames = {}
+        self.app_processes = []
+        from wm_promotion import Backend
+        self.promotion_backend = Backend(self)
         self.scan_offsets = {}
         self.intents, self.completed = {}, {}
         for row in self.log.rows:
@@ -231,15 +234,17 @@ class Controller:
                 return copy.deepcopy(self.completed[request_id])
             return self.apply(prior)
         extra = {}
-        if method == 'spawn':
+        if method in ('spawn', 'promote'):
             try:
                 reservation = amounts(params.get('reservation', self.cfg['child_reservation']))
             except ValueError:
                 raise Refused('invalid_budget')
             with sessiond.locked_registry():
-                extra = dict(child_incarnation=new_incarnation(self.state),
-                             task_id=secrets.token_hex(16),
-                             reservation=reservation)
+                if method == 'spawn':
+                    extra = dict(child_incarnation=new_incarnation(self.state),
+                                 task_id=secrets.token_hex(16), reservation=reservation)
+                else:
+                    extra = dict(promotion_id=secrets.token_hex(16), reservation=reservation)
         elif method == 'prompt':
             extra = dict(task_id=secrets.token_hex(16))
         intent = self.log.append('intent', method=method, params=clean,
@@ -250,7 +255,10 @@ class Controller:
 
     def apply(self, intent):
         try:
-            if intent['method'] == 'stop-subtree':
+            if intent['method'] == 'promote':
+                from wm_promotion import Promotion
+                return self.complete(intent, Promotion(self, intent).run())
+            elif intent['method'] == 'stop-subtree':
                 result, code = sessiond.stop_sessions(None, incarnation=intent['params']['incarnation'])
                 if code:
                     # Retry incomplete teardown on recovery; never mark it done.
@@ -298,6 +306,9 @@ class Controller:
                 child.update(parent_incarnation=parent['incarnation'],
                              root_incarnation=parent['root_incarnation'], depth=parent['depth'] + 1,
                              spawn_request=intent['request_id'])
+                if p.get('promotion_id'):
+                    child['promotion_lineage'] = dict(promotion_id=p['promotion_id'],
+                                                     source_incarnation=parent['incarnation'])
                 child['budget']['allocation'] = dict(intent['reservation'])
                 child['task'] = dict(id=intent['task_id'], text=p['task_text'],
                                      origin=p.get('origin', 'parent-agent'),
@@ -569,6 +580,7 @@ class Controller:
                 self.scan_offsets[cache_key] = stream.tell()
 
     def tick(self):
+        self.app_processes = [p for p in self.app_processes if p.poll() is None]
         self.enforce_kill()
         with sessiond.locked_registry() as records:
             for record in records.values():
@@ -636,10 +648,35 @@ class Controller:
             if not isinstance(params.get('incarnation'), str) or not params['incarnation']:
                 raise Refused('invalid_params')
             return self.submit(method, params)
-        if method == 'spawn':
+        if method == 'promote':
+            from promotion_recipes import RECIPES, PromotionError
+            self.authorize(params['source_incarnation'], params.get('capability'))
+            if (not isinstance(params.get('window'), str) or not params['window'] or
+                    type(params.get('transfer_clipboard', False)) is not bool):
+                raise Refused('invalid_params')
+            if params.get('app_class') not in RECIPES:
+                raise Refused('no_recipe')
+            # Refuse detectable unsaved state before creating any intent,
+            # reservation, gate, exchange directory, or checkpoint.
+            if params.get('request_id') not in self.intents:
+                with sessiond.locked_registry() as records:
+                    source = self.record(records, params['source_incarnation'])
+                    with self.parent_gate(source):
+                        observation = self.promotion_backend.settled(source)
+                window = next((w for w in observation['windows'] if
+                               w['handle'] == params['window'] and w.get('mapped') and
+                               w['class'] == params['app_class']), None)
+                if window is None:
+                    raise Refused('source_window_missing')
+                try:
+                    RECIPES[params['app_class']].export(window, observation.get('trees', {}).get(window['handle']), source['home'])
+                except PromotionError as exc:
+                    raise Refused(str(exc))
+        elif method == 'spawn':
             self.authorize(params['parent_incarnation'], params.get('capability'))
             if (not isinstance(params.get('task_text'), str) or not params['task_text'] or
                     params.get('profile') not in ('xvfb', 'xorg') or
+                    'promotion_id' in params or
                     params.get('origin', 'parent-agent') not in ('human', 'parent-agent')):
                 raise Refused('invalid_params')
         elif method in ('prompt', 'queue', 'queue.ack', 'budget.debit', 'attention.report'):

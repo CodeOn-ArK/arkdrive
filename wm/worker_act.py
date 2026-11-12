@@ -374,6 +374,7 @@ class Engine:
 
     def gate(self, action):
         self.w.poll_control(force=True)
+        self.promotion_gate(action.get('_promotion_handle'))
         c = self.w.cache.control or {}
         if c.get("epoch") is None:
             self.fence("F4:control_unavailable")
@@ -385,6 +386,25 @@ class Engine:
             raise ActError("preempted")
         if self.clock() >= min(action["deadline"], action.get("step_deadline", action["deadline"])):
             raise ActError("timeout")
+
+    def promotion_gate(self, handle):
+        path = self.w.sd / 'promotion-gate.json'
+        try:
+            gate = json.loads(path.read_text())
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            raise ActError('preempted', 'promotion_gate_unavailable')
+        if not isinstance(gate, dict) or not isinstance(gate.get('window'), str):
+            raise ActError('preempted', 'promotion_gate_unavailable')
+        windows = self.w.cache.windows.values()
+        source = next((w for w in windows if w['handle'] == gate['window']), None)
+        target = next((w for w in windows if w['handle'] == handle), None)
+        family = gate.get('family') or (source or {}).get('family')
+        if (handle == gate['window'] or target and
+                (family and family == target.get('family') or
+                 gate.get('xid') is not None and gate['xid'] == target.get('xid'))):
+            raise ActError('preempted', 'promotion_quiesced')
 
     def normalise(self, params):
         closed(params, ("session", "generation", "lease", "control_epoch", "action_id", "base_rev", "deadline_ms", "steps"),
@@ -2186,6 +2206,7 @@ class Engine:
             bindings = {}
             self.dialog_initial = None
             for s, r in zip(p["steps"], receipt["steps"]):
+                a.pop('_promotion_handle', None)
                 stopping = r
                 started = self.clock()
                 r["disposition"], r["reason"], r["stop_reason"] = "failed", None, None
@@ -2207,6 +2228,8 @@ class Engine:
                         yield
                     s = self.bound(s, bindings)
                     handle, point = yield from self.admit_tree(a, lambda: self.resolve(s, base))
+                    a['_promotion_handle'] = handle
+                    self.promotion_gate(handle)
                     if getattr(self.w, "tree", None) and "selected_ref" in s["require"]:
                         selected = yield from self.admit_tree(a, lambda: self.w.tree.resolve(
                             handle, s["require"]["selected_ref"], base, completed=True))

@@ -92,5 +92,45 @@ Keystroke content never enters the human journal path.
 
 Run `PYTHONDONTWRITEBYTECODE=1 python3 tests/run_wm_c_headless.py full` for
 the complete headless suite. See [the WM-C bench note](../bench/wm3-presenter-2026-11-11.md)
-for the wire protocol, state machine and Raj's unrun live gates. Promotion
-remains WM-D work.
+for the wire protocol, state machine and Raj's unrun live gates. The next
+section documents WM-D promotion.
+
+## WM v1 stage WM-D
+
+`ark-wmctl call promote` accepts `source_incarnation`, a worker `window`
+handle, `app_class`, `request_id`, and the source's delegate `capability`.
+Optional `reservation` uses the ordinary spawn ledger; `transfer_clipboard`
+defaults to false. The reply includes `promotion_id`, and on success the
+child incarnation and checkpoint manifest path. Retry with the same request
+id and parameters. The RPC is synchronous; a client timeout does not imply
+failure or authorize a new request identity.
+
+Recipes are `org.gnome.TextEditor` (a saved file) and `Thunar` (a directory).
+They require an unambiguous path exposed by title/tree and corroborated by
+the window title, beneath the source session's private HOME. Detectable
+unsaved state is refused before any promotion intent or gate is created.
+Unsupported classes return `no_recipe`. These two exports only snapshot
+saved filesystem content; neither stops the source app, so failures before
+retirement leave that app running without a restart.
+
+The controller gates automated input to the source window/app family,
+waits for settled worker sensing, and retains an immutable manifest plus
+hashed file/directory snapshot in `STATE/exchange/promotions/ID/`. It uses
+normal stage B spawn, starts the destination worker, copies documents into
+`CHILD_HOME/Promotions/ID/`, optionally sets clipboard, reopens, verifies the
+window and filesystem, then closes only the original source window.
+Other source apps and the source session keep running. Human takeover of
+the source is unavailable during this transaction. No undo, selection,
+login, or unsaved buffer is transferred.
+
+All steps are journaled before execution. Recovery reuses a complete
+checkpoint, reconciles uncertain launches/clipboard/close from observation,
+and never resends those uncertain actions. An incomplete checkpoint fails
+safely. Failed children are reaped through sessiond; budget reservations
+follow stage B's existing no-refund policy. Checkpoints remain after either
+outcome. Native retire uses `wmctrl`; selected clipboard transfer also
+requires `xclip`. New controller/recipe code uses the Python standard
+library, with the existing worker/runtime providing desktop sensing.
+
+See [the WM-D bench note](../bench/wm4-promotion-2026-11-11.md) for headless
+results and the Debian VM live gates.

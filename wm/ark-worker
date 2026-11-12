@@ -1986,6 +1986,19 @@ class Worker:
             if method == "system.info":
                 result = self.health()
                 result["memory"] = self.memory_counters()
+            elif method == 'promotion.observe':
+                # Controller-only read surface: no attach, lease, cursor move,
+                # tree dump file, frame allocation, or clipboard access.
+                act = getattr(self, 'act', None)
+                settled = bool(self.covered() and self.settle_pixels() and
+                               not self.x_busy() and not self.stopping and
+                               (self.cache.control or {}).get('state') == 'agent' and
+                               not (act and (act.active or act.queue or act.selftest or
+                                             act.fence_reason or act.pending_effects)))
+                result = dict(incarnation=self.record.get('incarnation'), generation=self.generation,
+                              rev=self.cache.rev, settled=settled,
+                              windows=list(self.cache.windows.values()),
+                              trees=getattr(getattr(self, 'tree', None), 'raw', {}))
             elif method == "debug.tree_dump":
                 if not getattr(self, "tree", None) or params["window"] not in self.tree.raw:
                     raise RPCError("provider_degraded", "snapshot_unavailable")
@@ -2079,6 +2092,7 @@ class Worker:
         keys = {
             "session.attach": {"client", "name", "budget"},
             "system.info": set(),
+            "promotion.observe": set(),
             "debug.tree_dump": {"window"},
             "window.observe": {"lease", "scope", "since_rev", "channels", "region", "ignore_regions", "budget", "cursor", "scale"},
             "window.wait": {"lease", "expect", "predicate", "since_rev"},
@@ -2817,6 +2831,8 @@ def command(args):
         return {"session": args.session, "state": "stopped", "ok": True}, 0
     with (sd / "control").open("r+b") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
+        if args.state == 'human' and (sd / 'promotion-gate.json').exists():
+            raise RuntimeError('promotion_busy')
         with mmap.mmap(stream.fileno(), 64) as page:
             previous = decode_control(page[:], metadata["generation"])
             epoch = previous["epoch"] + 1

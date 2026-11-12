@@ -70,6 +70,8 @@ class Takeover:
                 if state in (0, 2):
                     raise HumanError('control_busy')
             with mmap.mmap(stream.fileno(), PAGE.size) as page:
+                if state in (1, 2) and (self.w.sd / 'promotion-gate.json').exists():
+                    raise HumanError('promotion_busy')
                 magic, version, gen, epoch, previous, flags, permit, lease = PAGE.unpack(page[:])
                 if (magic != b'ARKC' or version != 1 or gen.hex() != self.w.generation or
                         not epoch or permit or expected is not None and previous != expected or
@@ -136,6 +138,8 @@ class Takeover:
 
     def handle(self, peer, ident, method, params):
         if method == 'human.begin':
+            if (self.w.sd / 'promotion-gate.json').exists():
+                raise HumanError('promotion_busy')
             if self.state not in ('idle', 'paused') or self.runner:
                 raise HumanError('takeover_busy')
             if params.get('explicit_action') is not True:
