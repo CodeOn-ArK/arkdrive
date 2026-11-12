@@ -411,3 +411,27 @@ The click used the presenter's published transform (native
 1920x1080 scaled ~0.566 into the host window); landing the
 canary in the entry is a passing spot check of the inverse
 mapping — the full grid study is W9 scope.
+
+## VM verification (x86 Debian generic VM, Nov 11, 2026)
+
+Tree synced into the guest. Presenter GUI gates in the guest
+(~/wm_c_presenter_gate.py + ~/wm_c_presenter_click.py):
+**PASS 4/4 + 4/4** — :0 refusal, presenter on the virtual host
+display, session isolation, live compositing, and the full
+click-through (Takeover -> HUMAN, canary typed through the
+presenter lands in fx_log, Resume -> driver works again), same
+as ArK2. The guest session is xvfb, so its human transport is
+the XTEST write path.
+
+Layer-1 protocol gate in the guest: 21/24. The three failures
+are one cluster: on the guest's xorg profile the first human
+button event returns input_unacknowledged — the evdev helper
+writes the frame but the XI2 raw-event acknowledgement does
+not arrive under QEMU/dummy-Xorg input emulation, so delivery
+is honestly judged unknown and the takeover ends. This is the
+same guest input-ack environment difference recorded on
+Nov 10, 2026 for the W6 self-test's XTEST keyboard leg; the
+evdev human path itself is qualified on ArK2 hardware
+(24/24 above). Suite in the guest: 1,168 run, 1,159 pass, the
+9 failures again only the known test_worker_w7_corpus
+font-calibration set.
