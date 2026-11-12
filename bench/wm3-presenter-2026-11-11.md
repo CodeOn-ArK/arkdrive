@@ -330,3 +330,35 @@ X authorization, not an inherited session display. Do not run live promotion.
 
 Append VM live results and raw evidence separately. Latency, mapping and
 controller-kill delivery gates remain unqualified until Raj runs them.
+
+## Fix round 1
+
+Raj's live startup gate on ArK2 (Xvfb `:77`) found that the presenter
+immediately exited with `{"ok": false, "error": ...}`: the em dash in
+`set_wm_name` could not be encoded by python-xlib's latin-1 `WM_NAME` path.
+The window title now uses the ASCII string `ArkDrive - session presenter`.
+The presenter path has no other string-valued X property setters:
+`set_wm_protocols` receives atom IDs, and no `_NET_WM_NAME` is set.
+
+Added `PresenterCase.test_startup_wm_name_is_latin1_encodable`, which runs
+the real presenter startup with both X connections mocked and checks every
+title passed to `set_wm_name` by encoding it as latin-1. It uses the actual
+title from `Presenter.run`, without copying that value into the test. The
+test reproduced the reported `UnicodeEncodeError` before the title fix.
+
+Validation from the repository root, without opening a display:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 wm/tests/run_wm_c_headless.py
+PYTHONDONTWRITEBYTECODE=1 python3 wm/tests/run_wm_c_headless.py full
+```
+
+Targeted: **42 tests passed in 0.298 s**. Full suite: **1,168 tests in
+132.407 s; 1,167 passed, one existing environment-dependent skip**, exit 0,
+`OK (skipped=1)`. Logs: `wm/tests/.tmp/wm-c-fix1-before.log`,
+`wm/tests/.tmp/wm-c-fix1-targeted.log` and
+`wm/tests/.tmp/wm-c-fix1-full.log`.
+
+Live gates remain Raj's; none were run here. No display (including `:0`)
+was opened. Nothing was staged or committed, and all writes stayed within
+the repository.

@@ -20,6 +20,7 @@ from test_worker_w3 import decode
 import test_worker_wm_b_controller as controller_fixture
 from input_protocol import PAGE, control_snapshot
 from mkdevs import EventProtocol
+from presenter import Presenter
 from presenter_scene import Scene, Transform
 from presenter_x11 import Renderer, host_display, decode_png
 from worker_human import Takeover, HumanError, identity, signature
@@ -512,6 +513,21 @@ class HelperCase(unittest.TestCase):
             self.path.write_bytes(page)
             self.assertIsNone(control_snapshot(self.path, GEN, self.token, 5))
         self.assertFalse(self.events)
+
+
+class PresenterCase(unittest.TestCase):
+    def test_startup_wm_name_is_latin1_encodable(self):
+        # Exercise the actual startup title without opening either X connection.
+        # python-xlib's WM_NAME setter encodes text as latin-1.
+        with patch('Xlib.display.Display') as display, \
+                patch('presenter.Renderer'), patch('presenter.signal.signal'):
+            window = display.return_value.screen.return_value.root.create_window.return_value
+            window.set_wm_name.side_effect = lambda title: title.encode('latin-1')
+            presenter = Presenter(Path(__file__).parent, ':121')
+            presenter.running = False
+            presenter.run()
+            display.assert_called_once_with(':121')
+            window.set_wm_name.assert_called_once()
 
 
 class SceneCase(unittest.TestCase):

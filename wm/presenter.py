@@ -267,7 +267,7 @@ class Presenter:
             X.CopyFromParent, X.InputOutput, X.CopyFromParent, background_pixel=0x171c25,
             event_mask=X.ExposureMask | X.StructureNotifyMask | X.ButtonPressMask | X.ButtonReleaseMask |
                        X.PointerMotionMask | X.KeyPressMask | X.KeyReleaseMask | X.FocusChangeMask)
-        self.window.set_wm_name('ArkDrive — session presenter')
+        self.window.set_wm_name('ArkDrive - session presenter')
         delete = self.d.intern_atom('WM_DELETE_WINDOW')
         self.window.set_wm_protocols([delete])
         self.window.map()
