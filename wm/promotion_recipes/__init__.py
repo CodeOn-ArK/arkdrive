@@ -22,6 +22,23 @@ def strings(value):
             yield from strings(item)
 
 
+def editor_title_path(title, home):
+    """GNOME Text Editor's saved-file title, using the owning worker's HOME."""
+    from pathlib import Path
+    import re
+    match = re.fullmatch(r'([^\0/\n]+) \(([^\0\n]+)\) - Text Editor', title)
+    if match is None:
+        return None
+    name, parent = match.groups()
+    if parent == '~':
+        parent = str(home)
+    elif parent.startswith('~/'):
+        parent = str(Path(home) / parent[2:])
+    if not parent.startswith('/'):
+        return None
+    return Path(parent) / name
+
+
 def saved_path(window, tree, home, directory=False):
     from pathlib import Path
     from urllib.parse import unquote, urlparse
@@ -31,6 +48,10 @@ def saved_path(window, tree, home, directory=False):
         raise PromotionError('unsaved_state')
     candidates = set()
     for item in evidence:
+        if not directory:
+            path = editor_title_path(item, home)
+            if path is not None and path.is_file():
+                candidates.add(str(path))
         # Titles commonly use “filename — /directory — Text Editor”. Only
         # paths actually exposed by the window/tree are considered.
         for part in [item, *re.split(r'\s+[—–]\s+|\n', item)]:
@@ -57,7 +78,7 @@ def saved_path(window, tree, home, directory=False):
                     if path.is_file():
                         candidates.add(str(path))
         candidates = {p for p in candidates if Path(p).is_file()}
-    candidates = {p for p in candidates if visible(window, None, p)}
+    candidates = {p for p in candidates if visible(window, None, p, home)}
     if len(candidates) != 1:
         raise PromotionError('document_path_unavailable')
     path = Path(candidates.pop())
@@ -87,9 +108,16 @@ def unsaved(window, tree):
     return flagged(tree)
 
 
-def visible(window, tree, path):
+def visible(window, tree, path, home=None):
     from pathlib import Path
     import re
     name = Path(path).name
-    return any(name == text or name in re.split(r'\s+[—–-]\s+|\n', text) or path in text
-               for text in strings([window, tree]))
+    for text in strings([window, tree]):
+        title_path = editor_title_path(text, Path.home() if home is None else home)
+        if title_path is not None:
+            if title_path == Path(path):
+                return True
+            continue
+        if name == text or name in re.split(r'\s+[—–-]\s+|\n', text) or path in text:
+            return True
+    return False

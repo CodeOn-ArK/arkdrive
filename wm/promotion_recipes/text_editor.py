@@ -10,6 +10,6 @@ def export(window, tree, home):
     return saved_path(window, tree, home)
 
 
-def verify(window, tree, path):
+def verify(window, tree, path, home=None):
     from . import visible
-    return window.get('class') == APP_CLASS and visible(window, tree, path)
+    return window.get('class') == APP_CLASS and visible(window, tree, path, home)

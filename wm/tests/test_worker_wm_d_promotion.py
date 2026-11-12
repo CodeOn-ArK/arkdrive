@@ -9,9 +9,15 @@ from unittest.mock import patch
 import test_worker_wm_b_controller as wm_b
 from wm_controller import Controller, Refused, sessiond
 from wm_promotion import Promotion, PromotionError, Backend, copy_tree
-from promotion_recipes import RECIPES
+from promotion_recipes import RECIPES, visible
 from wm_registry import atomic_json, by_incarnation
 from test_worker_w2 import Harness
+
+
+def unmatched_tree(handle):
+    # Raw promotion.observe tree when AT-SPI has not matched the window.
+    return dict(key='unmatched:' + handle, role='frame', showing=False,
+                visible=False, status='unmatched', rendered_only=True)
 
 
 class World:
@@ -19,6 +25,7 @@ class World:
     def __init__(self, case):
         self.case = case
         self.windows = {}
+        self.trees = {}
         self.clipboards = {}
         self.events = []
         self.fail = None
@@ -34,7 +41,9 @@ class World:
             raise PromotionError('child_worker_missing')
         if incarnation != self.case.root and self.fail == 'verify':
             raise PromotionError('verify_failed')
-        return dict(incarnation=incarnation, settled=True, windows=copy.deepcopy(self.windows.get(incarnation, [])))
+        return dict(incarnation=incarnation, settled=True,
+                    windows=copy.deepcopy(self.windows.get(incarnation, [])),
+                    trees=copy.deepcopy(self.trees.get(incarnation, {})))
 
     def clipboard_read(self, record):
         self.events.append(('clipboard_read', record['incarnation']))
@@ -55,8 +64,14 @@ class World:
         # Model the launched app's native WM_CLASS independently of app_class.
         app_class = {'gnome-text-editor': 'gnome-text-editor',
                      'thunar': 'Thunar'}[manifest['launch_argv'][0]]
+        document = root / manifest['document_paths'][0]
+        title = str(document)
+        if app_class == 'gnome-text-editor':
+            parent = document.parent.relative_to(record['home'])
+            title = f'{document.name} (~/{parent}) - Text Editor'
         self.windows[record['incarnation']] = [dict(handle='child-window', xid=20, mapped=True,
-                    title=str(root / manifest['document_paths'][0]), **{'class': app_class})]
+                    title=title, **{'class': app_class})]
+        self.trees[record['incarnation']] = {'child-window': unmatched_tree('child-window')}
 
     def retire(self, record, window):
         self.events.append(('retire', record['incarnation']))
@@ -77,10 +92,12 @@ class PromotionCase(unittest.TestCase):
         self.world = World(self)
         self.c.promotion_backend = self.world
         self.home = Path(self.record(self.root)['home'])
-        self.document = self.home / 'notes.txt'
+        (self.home / 'docs').mkdir()
+        self.document = self.home / 'docs/note.txt'
         self.document.write_text('saved contents\n')
         self.window = dict(handle='source-window', xid=10, mapped=True, family='pid:123',
-                           title=str(self.document), **{'class': 'gnome-text-editor'})
+                           title='note.txt (~/docs) - Text Editor', **{'class': 'gnome-text-editor'})
+        self.world.trees[self.root] = {'source-window': unmatched_tree('source-window')}
         self.world.windows[self.root] = [self.window, dict(handle='unrelated-window', xid=11, mapped=True,
                                                          title='Other App', **{'class': 'Other'})]
         self.world.clipboards[self.root] = 'selected text'
@@ -131,9 +148,9 @@ class PromotionCase(unittest.TestCase):
         manifest = json.loads(Path(result['checkpoint']).read_text())
         self.assertEqual(manifest['promotion_id'], result['promotion_id'])
         self.assertEqual(manifest['app_class'], 'gnome-text-editor')
-        self.assertEqual(manifest['launch_argv'], ['gnome-text-editor', 'documents/notes.txt'])
+        self.assertEqual(manifest['launch_argv'], ['gnome-text-editor', 'documents/note.txt'])
         self.assertEqual(manifest['cwd'], '.')
-        self.assertEqual(manifest['document_paths'], ['documents/notes.txt'])
+        self.assertEqual(manifest['document_paths'], ['documents/note.txt'])
         self.assertNotIn('clipboard_payload', manifest)
         self.assertFalse(self.source_running())
         self.assertEqual(self.world.windows[self.root][0]['handle'], 'unrelated-window')
@@ -167,6 +184,7 @@ class PromotionCase(unittest.TestCase):
             with self.subTest(app_class=app_class):
                 recipe = RECIPES[app_class]
                 window = dict(self.window, **{'class': app_class})
+                window['title'] = str(self.document)
                 self.assertTrue(recipe.verify(window, None, str(self.document)))
                 self.assertFalse(recipe.verify(dict(window, **{'class': wrong_class}),
                                                None, str(self.document)))
@@ -174,7 +192,8 @@ class PromotionCase(unittest.TestCase):
                                                None, str(self.document)))
 
     def test_unsaved_and_no_recipe_leave_no_trace(self):
-        for title in ('*notes.txt', '• notes.txt', 'Untitled', 'notes.txt (modified)'):
+        for title in ('*notes.txt', 'notes.txt*', '• notes.txt', '● notes.txt', 'Untitled',
+                      'New Document', 'Unsaved Document - Text Editor', 'notes.txt (modified)'):
             self.window['title'] = title
             before = self.records()
             with self.assertRaisesRegex(Refused, 'unsaved_state'):
@@ -182,6 +201,7 @@ class PromotionCase(unittest.TestCase):
             self.assertEqual(self.records(), before)
             self.assertEqual(self.c.log.rows, [])
             self.assertFalse((self.state / 'exchange').exists())
+            self.assertFalse((Path(self.record(self.root)['session_dir']) / 'promotion-gate.json').exists())
             self.assertTrue(self.source_running())
         self.window['class'] = 'Unknown'
         with self.assertRaisesRegex(Refused, 'no_recipe'):
@@ -217,7 +237,7 @@ class PromotionCase(unittest.TestCase):
         self.world.fail = 'reopen'
         self.assert_failed(self.promote(), 'reopen_failed')
         checkpoint = next((self.state / 'exchange').rglob('manifest.json'))
-        self.assertEqual((checkpoint.parent / 'documents/notes.txt').read_text(), 'saved contents\n')
+        self.assertEqual((checkpoint.parent / 'documents/note.txt').read_text(), 'saved contents\n')
         self.assertTrue(list((self.state / 'retired').glob('*.json')))
         self.world.fail = 'verify'
         self.assert_failed(self.c.dispatch('promote', dict(self.params(), request_id='verify-failure')), 'verify_failed')
@@ -267,13 +287,13 @@ class PromotionCase(unittest.TestCase):
     def test_restart_after_export_never_reexports_checkpoint(self):
         self.crash_at('promotion.export.effect')
         bundle = next((self.state / 'exchange').rglob('manifest.json')).parent
-        old = (bundle / 'documents/notes.txt').read_bytes()
+        old = (bundle / 'documents/note.txt').read_bytes()
         self.document.write_text('later file change')
         with patch.object(Promotion, 'export', side_effect=AssertionError('must reuse checkpoint')):
             self.restart()
         result = self.c.completed['promote-1']
         self.assertTrue(result['ok'], result)
-        self.assertEqual((bundle / 'documents/notes.txt').read_bytes(), old)
+        self.assertEqual((bundle / 'documents/note.txt').read_bytes(), old)
         self.assertEqual([e[0] for e in self.world.events].count('retire'), 1)
 
     def test_restart_after_reopen_reconciles_without_second_launch(self):
@@ -339,7 +359,7 @@ class PromotionCase(unittest.TestCase):
     def test_checkpoint_hash_oracle_rejects_corruption(self):
         self.crash_at('promotion.export.effect')
         bundle = next((self.state / 'exchange').rglob('manifest.json')).parent
-        (bundle / 'documents/notes.txt').write_text('corrupt')
+        (bundle / 'documents/note.txt').write_text('corrupt')
         self.restart()
         self.assert_failed(self.c.completed['promote-1'], 'invalid_checkpoint')
 
@@ -351,7 +371,7 @@ class PromotionCase(unittest.TestCase):
         self.document.write_text('new contents')
         with patch.object(self.world, 'clipboard_read', side_effect=AssertionError('no export')):
             self.assertEqual(operation.export(None), manifest)
-        self.assertEqual((operation.bundle / 'documents/notes.txt').read_text(), 'saved contents\n')
+        self.assertEqual((operation.bundle / 'documents/note.txt').read_text(), 'saved contents\n')
 
     def test_transfer_failure_reaps_and_leaves_source(self):
         with patch.object(Promotion, 'install', side_effect=PromotionError('transfer_failed')):
@@ -394,12 +414,81 @@ class PromotionCase(unittest.TestCase):
 
     def test_recipe_path_from_tree_and_parent_escape_refusal(self):
         recipe = RECIPES[self.window['class']]
-        title_only = dict(self.window, title='notes.txt — Text Editor')
+        title_only = dict(self.window, title='note.txt — Text Editor')
         self.assertEqual(recipe.export(title_only, {'uri': self.document.as_uri()}, self.home), str(self.document))
         outside = self.home / '..' / 'outside.txt'
         outside.write_text('private')
         with self.assertRaisesRegex(PromotionError, 'document_outside_home'):
             recipe.export(dict(self.window, title=str(outside)), None, self.home)
+
+    def test_editor_title_paths_with_unmatched_or_absent_tree(self):
+        recipe = RECIPES['gnome-text-editor']
+        for title in (self.window['title'],
+                      f'note.txt ({self.document.parent}) - Text Editor',
+                      str(self.document), self.document.as_uri(),
+                      f'note.txt — {self.document.parent} — Text Editor',
+                      f'note.txt – {self.document.parent} – Text Editor'):
+            for tree in (None, unmatched_tree('source-window')):
+                with self.subTest(title=title, tree=tree):
+                    window = dict(self.window, title=title)
+                    self.assertEqual(recipe.export(window, tree, self.home), str(self.document))
+                    self.assertTrue(recipe.verify(window, tree, str(self.document), self.home))
+
+    def test_editor_promotion_with_full_tree(self):
+        self.world.trees[self.root]['source-window'] = dict(
+            key='editor:frame', role='frame', name=self.window['title'],
+            showing=True, visible=True, children=[
+                dict(key='editor:document', role='document', name=self.document.name,
+                     uri=self.document.as_uri(), children=[
+                         dict(key='editor:text', role='text', text=self.document.read_text())])])
+        result = self.promote()
+        self.assertTrue(result['ok'], result)
+        self.assertFalse(self.source_running())
+        self.assertEqual((Path(result['checkpoint']).parent / 'documents/note.txt').read_text(),
+                         self.document.read_text())
+
+    def test_parenthesized_title_requires_matching_name_and_directory(self):
+        recipe = RECIPES['gnome-text-editor']
+        other = self.home / 'other/note.txt'
+        other.parent.mkdir()
+        other.write_text('another document')
+        for title in ('different.txt (~/docs) - Text Editor',
+                      'note.txt (~/other) - Text Editor',
+                      f'note.txt ({other.parent}) - Text Editor',
+                      'note.txt (~/missing) - Text Editor'):
+            with self.subTest(title=title):
+                window = dict(self.window, title=title)
+                self.assertFalse(visible(window, None, str(self.document), self.home))
+                self.assertFalse(recipe.verify(window, unmatched_tree('source-window'),
+                                               str(self.document), self.home))
+        # A same-name URI from another directory cannot override the title.
+        self.assertEqual(recipe.export(self.window, {'uri': other.as_uri()}, self.home),
+                         str(self.document))
+        with self.assertRaisesRegex(PromotionError, 'document_path_unavailable'):
+            recipe.export(dict(self.window, title='note.txt (~/missing) - Text Editor'),
+                          {'uri': self.document.as_uri()}, self.home)
+
+    def test_parenthesized_title_preserves_file_and_home_guards(self):
+        recipe = RECIPES['gnome-text-editor']
+        outside = self.home.parent / 'outside.txt'
+        outside.write_text('private')
+        for title, reason in (
+                ('missing.txt (~/docs) - Text Editor', 'document_path_unavailable'),
+                ('docs (~) - Text Editor', 'document_path_unavailable'),
+                ('note.txt (docs) - Text Editor', 'document_path_unavailable'),
+                ('note.txt (~/docs/../docs) - Text Editor', 'document_outside_home'),
+                (f'outside.txt ({outside.parent}) - Text Editor', 'document_outside_home')):
+            with self.subTest(title=title):
+                with self.assertRaisesRegex(PromotionError, reason):
+                    recipe.export(dict(self.window, title=title),
+                                  unmatched_tree('source-window'), self.home)
+
+    def test_parenthesized_title_keeps_ambiguous_paths_refused(self):
+        other = self.home / 'other.txt'
+        other.write_text('another document')
+        with self.assertRaisesRegex(PromotionError, 'document_path_unavailable'):
+            RECIPES['gnome-text-editor'].export(dict(self.window, description=str(other)),
+                                               unmatched_tree('source-window'), self.home)
 
     def test_recipe_refuses_tree_path_that_names_a_different_document(self):
         recipe = RECIPES[self.window['class']]

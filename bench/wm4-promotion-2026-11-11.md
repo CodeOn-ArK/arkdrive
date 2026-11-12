@@ -124,3 +124,47 @@ seconds: OK**, using the same command with
 `-p test_worker_wm_d_promotion.py`. Scratch stayed within the repository.
 No commit or staging was performed, and no display :0 was opened. Live
 gates remain Raj's; this round provides headless validation only.
+
+## Fix round 2
+
+Raj's next ArK2 live gate reported that Thunar promotion passes end to end,
+but Text Editor export fails with `document_path_unavailable`. GNOME Text
+Editor 50.1 titles saved files as `note.txt (~/docs) - Text Editor`; the
+recipe only extracted whole path parts from em/en-dash titles and could
+not corroborate the name before the parenthesized directory. A newly
+opened editor commonly has only an unmatched `rendered_only` tree stub,
+so tree content cannot supply the missing path.
+
+The shared recipe code now recognizes the parenthesized directory form
+with an absolute or tilde-abbreviated directory and joins it with the
+filename. Visibility corroboration checks both the filename and the
+directory. Tilde expansion uses the owning worker's HOME for source export
+and destination verification; the recipe verification interface accepts
+that HOME explicitly. Existing absolute-path, file-URI, and em/en-dash
+forms remain supported. The unique-candidate, regular-file, beneath-HOME,
+no-`..`, and window-visibility guards remain in place.
+
+The default source fixture now uses native class `gnome-text-editor`,
+title `note.txt (~/docs) - Text Editor`, and the unmatched frame stub from
+the real observer (`showing=false`, `visible=false`, `status=unmatched`,
+`rendered_only=true`). The reopened editor also uses a parenthesized
+tilde-directory title and an unmatched stub, exercising destination
+verification and recovery without accessible content. A full-tree
+promotion variant remains covered. Added regression cases cover legacy
+title forms, absolute directories, missing or mismatched names/directories,
+conflicting tree paths, multiple candidates, missing files, directories,
+path traversal, and paths outside HOME. Unsaved detection retains all
+existing indicators and now includes an `Unsaved Document - Text Editor`
+fixture, refusing it before an intent, gate, checkpoint, or reservation.
+
+Before the recipe fix, the updated end-to-end success fixture reproduced
+`document_path_unavailable` at preflight. After the fix, the Stage-D module
+passed **71 tests in 2.481 seconds: OK**. Validation uses the same environment
+and discovery commands as Fix round 1, with all temporary files under
+`wm/tests/.tmp` and both display environment variables cleared.
+The full WM suite passed **1,239 tests in 134.981 seconds:
+OK (skipped=1)**, with no failures or errors.
+
+No commit or staging was performed, no files were written outside
+`~/arkdrive`, and no display :0 was opened. This round's validation is
+headless; live gates remain Raj's.

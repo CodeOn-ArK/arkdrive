@@ -358,7 +358,7 @@ class Promotion:
         validate_files(root, manifest)  # filesystem oracle in the child's HOME
         observation = self.backend.settled(child)
         document = str(root / manifest['document_paths'][0])
-        return any(self.recipe.verify(w, observation.get('trees', {}).get(w['handle']), document)
+        return any(self.recipe.verify(w, observation.get('trees', {}).get(w['handle']), document, child['home'])
                    for w in observation['windows'] if w.get('mapped'))
 
     def verified(self, child, manifest, root):
