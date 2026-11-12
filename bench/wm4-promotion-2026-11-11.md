@@ -223,3 +223,42 @@ resource-cleanup warnings from W2 fixtures.
 No commit or staging was performed, no files were written outside
 `~/arkdrive`, and no display :0 was opened. Validation is headless;
 live gates remain Raj's.
+
+## Raj verifier addendum (Nov 11, 2026)
+
+Suite: 1,243 tests OK verified across the build and three fix
+rounds (commits 83dd249, 7e0d260, 0b754aa, 39c0026). Runtime
+dependencies the live gates needed on the host: wmctrl and
+xclip (xclip was NOT installed on ArK2 before the gate; both
+belong on the Phase 5 image list).
+
+Live gate (~/wm_d_gate.py, real GNOME Text Editor 50.1 + Thunar
+on the ArK2 stack): **PASS 19/19**. Editor saved-file promotion
+end to end: child spawned with promotion lineage, checkpoint
+manifest written (no clipboard payload when unselected),
+document installed under the child's Promotions/<id>/documents
+with identical content, editor reopened in the child naming the
+file, source window retired only after verification, source
+session alive with its other app intact; retry with the same
+request id returns the same promotion and child. Thunar
+directory promotion likewise (reopened at the directory, source
+retired). A new unsaved document ("New Document (Draft) - Text
+Editor") is refused unsaved_state with no checkpoint or session
+created; an unknown class is refused no_recipe. With
+transfer_clipboard the payload set in the source reads back
+byte-exact in the child.
+
+The three fix rounds were all live-only defects of one family —
+the code was written against assumed app behavior the fixtures
+then repeated: (1) the editor recipe keyed on the desktop-file
+id org.gnome.TextEditor while the real WM_CLASS is
+gnome-text-editor, so it could never match (app_class is now the
+exact native WM_CLASS for both recipes); (2) saved_path and
+visible assumed an em-dash title, while the real title is
+"note.txt (~/docs) - Text Editor", and promotion.observe often
+returns an unmatched tree stub, so the recipe now works from
+the title alone; (3) the clipboard step waited for xclip -in to
+exit, which by design never happens while it holds the
+selection — the transfer now installs a detached holder in the
+destination and verifies by read-back, and the fake xclip
+models the non-returning form.
