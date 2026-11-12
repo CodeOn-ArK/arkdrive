@@ -40,7 +40,10 @@ The loop runs as a subprocess with `CU_MODEL_PROVIDER=llama`, the preset's
 default endpoint/model (inherited `CU_MODEL_SERVER` and `CU_MODEL` are
 removed), and `CU_LOOP_HTTP_TIMEOUT=300`. Other loop budgets/settings are
 inherited equally. Only G adds `ARK_ACT_PACKS=off`; P explicitly removes an
-inherited switch. The loop receives `--max-turns 40` and exactly these task
+inherited switch. Each run sets `CU_LOOP_TRANSCRIPT` to
+`~/packs-pilot-transcripts/<arm>-<task>-<i>.jsonl`, clearing that file before
+launch so repeated indices cannot include earlier calls. The loop receives
+`--max-turns 40` and exactly these task
 texts, with the same index substitution for both arms:
 
 ```
@@ -81,21 +84,19 @@ baseline has zero recorded passes, so tokens per success is undefined.
 Compare success per arm/task and matched G/P outcomes; retain failure rows
 in the denominators. An invalid-form result means a tool result/receipt
 whose `reason` or `error` names `invalid_params`, `invalid_expectation`,
-`invalid_request`, or `precondition_failed`, counted once per returned tool
-call even if several nested steps qualify. The intended rate is qualifying
-returned tool calls / returned tool calls, with the same definition in both
-arms.
+`invalid_request`, or `precondition_failed`, or names a banned-field bounce
+for `risk` / `allow_stale_pixels`. The transcript top-level reason, every
+step reason, and adapter error detail are checked. Each qualifying entry
+counts once even if several nested steps qualify. The rate is qualifying
+transcript entries / all transcript entries, with the same definition in
+both arms. Entries include malformed model calls and unknown tool names,
+which count as errored calls but do not by themselves qualify as form errors.
 
-**Current observability limit:** `worker_loop.run_loop()` retains tool
-results in memory, but neither it nor `main()` prints per-call results or
-error counters. `main()` prints one final JSON summary only. Consequently
-`errored_tool_calls` and `form_errors` are always `null` in this harness;
-the invalid-form rate cannot yet be scored from its output. Journals are
-not a complete substitute: they omit rejected pre-admission calls and do
-not represent all MCP results. No benefit claim about invalid forms can be
-made from these rows; complete call-result instrumentation is needed for
-that comparison. The harness does not change loop logging or guess counts
-from a final reason, hints, exit status or worker counters.
+`main()` still prints one final JSON summary only. The harness uses the
+separate transcript for call/error counts, including rejected pre-admission
+calls absent from worker journals. No counts are guessed from a final
+reason, hints, exit status or worker counters. A missing, empty or malformed
+transcript leaves all three call counts `null` and adds `harness_error`.
 
 For the later Codex arm, the token bar is **≤50% of the passing baseline**,
 with turns reported and a correctness-regression veto. This is follow-up
@@ -103,10 +104,11 @@ measurement; the 27B pilot does not establish a Codex token win.
 
 ## Field sources
 
-The loop sources below refer to `wm/worker_loop.py`'s `run_loop()` summary
-and the single JSON object printed by `main()`. The tool count is returned
-MCP calls, including observe/wait/done/use_skill; it is not internal worker
-acts/steps inside a skill.
+The loop sources below refer to `wm/worker_loop.py`'s `run_loop()` summary,
+the single JSON object printed by `main()`, and the per-run JSONL transcript.
+The tool count includes observe/act/wait/done/use_skill plus malformed calls
+and unknown-tool entries; it does not count internal worker acts/steps inside
+a skill separately.
 
 | JSONL field | Source / absent behavior |
 | --- | --- |
@@ -117,17 +119,31 @@ acts/steps inside a skill.
 | `turns` | Summary `turns_used`; `null` without summary. This counts attempted loop iterations, not necessarily completed provider calls. |
 | `tokens_total` | Summary `token_usage.total_tokens`, accumulated from numeric provider usage. `null` if that exact total is absent; no character estimate or prompt/completion sum is substituted. |
 | `wall_s` | Harness monotonic elapsed seconds from before slate through oracle and teardown, rounded to milliseconds; includes setup/cleanup. |
-| `tool_calls` | Summary `tool_calls_made`, incremented after each returned MCP tool call; `null` without summary. |
-| `errored_tool_calls` | `null`: per-call errors/results are not printed or summarized by the loop. |
-| `form_errors` | `null`: qualifying reason/error names in returned results/receipts are not observable in loop stdout. Definition and limitation above. |
+| `tool_calls` | Per-run transcript entry count; `null` with `harness_error` if the transcript is missing, empty or malformed. |
+| `errored_tool_calls` | Transcript entries with `is_error:true`, or `tool:act` and `status` of `failed`, `unknown` or `contradicted`, counted once per entry; same absent behavior. |
+| `form_errors` | Transcript entries whose `reason`, any step `reason`, or adapter error `detail` names `invalid_params`, `invalid_expectation`, `invalid_request`, `precondition_failed`, `risk` or `allow_stale_pixels`, counted once per entry; same absent behavior. |
 | `oracle_success` | Filesystem predicates above, before teardown; forced false for a harness failure. Never derived from done, exit code, receipt or model prose. |
 | `harness_error` (failures only) | Caught harness/setup/oracle/cleanup exception; `wall_timeout` for the overall deadline. Not a tool-error counter. |
 | `loop_reason` (summary available) | Summary `reason` verbatim, possibly null. Diagnostic only. |
 | `loop_exit_code` (summary available) | Subprocess return code. Diagnostic only; not a success oracle. |
 
-A timeout or missing/malformed summary leaves all unavailable summary
-metrics null, including when some turns/calls may have occurred before the
-process was killed. No partial totals are inferred.
+A timeout or missing/malformed summary leaves unavailable summary metrics
+null. Completed transcript entries still supply the three call counts after
+an interruption; they are observed partial counts, with the run's failure
+recorded. No partial token totals are inferred.
+
+## Fix round 1
+
+Added opt-in `CU_LOOP_TRANSCRIPT` recording, appending and flushing one JSON
+object as each tool call completes. Records contain turn/tool, error flag,
+status/reason, act step diagnostics, observe revision and error detail. String
+fields are capped at 500 characters; observe payloads, state, frames and raw
+evidence are excluded. Malformed calls and unknown tool names are recorded
+before the existing failure handling. Unset recording creates no file, and
+recording failures do not change the loop's control flow, prompts or error
+behavior. The harness reads the per-run file even after timeout and retains
+provider token totals from the summary. No pilot was run; results stay
+**NOT RUN**.
 
 ## Running and validation
 
@@ -154,8 +170,12 @@ bypass, settled Thunar observe block count, MCP inventory and skill denial.
 Private harness checks in `hidden_files/test_packs_pilot.py` cover matrix
 order, matched environments, actual summary fields/nulls, independent
 filesystem oracles, failure continuation, pre-teardown oracle timing,
-timeout recording and process-group termination. They use fake commands
-and temporary filesystem fixtures only; no X display or session is started.
+timeout recording, transcript counting (all form-error classes), absent
+transcripts, repeated-index isolation and process-group termination. Loop
+fakes cover receipt/error shapes, malformed/unknown calls, bounded payloads,
+append/flush visibility and disabled/unwritable recording. They use fake
+commands and temporary filesystem fixtures only; no X display or session
+is started.
 
 Validation commands (no live sessions):
 
@@ -164,10 +184,10 @@ TMPDIR="$PWD/wm/tests/.tmp" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discov
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s hidden_files -p test_packs_pilot.py -v
 ```
 
-Full headless suite: **1058 tests run in 132.785 s, 1057 passed and 1
+Fix round 1 full headless suite: **1064 tests run, 1063 passed and 1
 skipped**, exit 0, `OK (skipped=1)`. The existing ptrace/strace check is
 skipped in this environment. Log:
-`wm/tests/.tmp/packs-pilot-full-suite.log`. Private harness checks: **10
+`wm/tests/.tmp/packs-pilot-fix1-full-suite-final.log`. Private harness checks: **13
 passed**. The harness `--help` entry point also passed without starting a
 session. The private tests stay alongside the untracked harness so the
 repository's default suite does not depend on that local file.

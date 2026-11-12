@@ -422,7 +422,7 @@ class AdapterCase(unittest.TestCase):
             client = loop.MCPClient('s1', 'path')
         try:
             tools = client.start()
-            self.assertEqual({t['name'] for t in tools}, {'observe', 'act', 'wait', 'done'})
+            self.assertEqual({t['name'] for t in tools}, {'observe', 'act', 'use_skill', 'wait', 'done'})
             self.assertEqual(shown(client.tool('observe', {}))['rev'], 11)
             self.assertEqual(shown(client.tool('done', {'status': 'success', 'summary': 'Finished'}))['status'], 'success')
         finally:
@@ -751,6 +751,112 @@ class LoopCase(unittest.TestCase):
         c, p = self.setup_loop([])
         p.complete.side_effect = a.AdapterError('provider_http_429')
         self.assertEqual(loop.run_loop(c, p, 'Task')['reason'], 'provider_http_429')
+
+    def transcript_run(self, responses, results=None, *, enabled=True):
+        temp = tempfile.TemporaryDirectory(prefix='loop-transcript-')
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / 'calls.jsonl'
+        c, p = self.setup_loop(responses)
+        if results is not None:
+            c.tool.side_effect = results
+        with patch.dict(os.environ), patch.object(loop, 'check_kill'):
+            os.environ.pop('CU_LOOP_TRANSCRIPT', None)
+            if enabled:
+                os.environ['CU_LOOP_TRANSCRIPT'] = str(path)
+            summary = loop.run_loop(c, p, 'Task', max_turns=len(responses))
+        entries = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        return summary, entries, path
+
+    def test_transcript_records_act_receipt_and_done_without_payloads(self):
+        act = receipt()
+        act['state_now'] = {'frames': [{'data': 'PRIVATE FRAME'}]}
+        act['steps'][0]['effect']['evidence'] = ['PRIVATE EVIDENCE']
+        act['steps'][0]['status'] = 'completed'
+        result = dict(isError=False, content=[dict(type='text', text=json.dumps(act)),
+                      dict(type='image', data='PRIVATE IMAGE')])
+        summary, entries, _ = self.transcript_run(
+            [(self.call('act'), {}), (self.call('done', status='success', summary='OK'), {})],
+            [result, dict(isError=False, content=[dict(type='text', text=json.dumps(
+                dict(status='success', summary='OK')))])])
+        self.assertEqual(summary['done']['status'], 'success')
+        self.assertEqual(entries, [dict(turn=1, tool='act', is_error=False, status='success',
+            reason=None, detail=None, steps=[dict(id='1', status='completed', reason=None,
+                                                 effect=dict(status='verified'))]),
+            dict(turn=2, tool='done', is_error=False, status='success', reason=None, detail=None)])
+
+    def test_transcript_records_failed_act_and_step_reasons(self):
+        act = receipt()
+        act.update(status='failed', reason='invalid_params')
+        act['steps'][0].update(reason='invalid_expectation')
+        _, entries, _ = self.transcript_run([(self.call('act'), {})],
+            [dict(isError=False, content=[dict(type='text', text=json.dumps(act))])])
+        self.assertEqual(entries[0]['status'], 'failed')
+        self.assertEqual(entries[0]['reason'], 'invalid_params')
+        self.assertFalse(entries[0]['is_error'])
+        self.assertEqual(entries[0]['steps'][0]['reason'], 'invalid_expectation')
+
+    def test_transcript_records_observe_revision_or_error_and_bounds_strings(self):
+        results = [dict(isError=False, content=[dict(type='text', text=json.dumps(
+                       dict(rev=12, state={'private': 'DO NOT RECORD'}, frames=['PRIVATE FRAME'])))]),
+                   dict(isError=True, content=[dict(type='text', text=json.dumps(
+                       dict(error='invalid_request', detail='x' * 600)))])]
+        _, entries, _ = self.transcript_run([(self.call('observe'), {})] * 2, results)
+        self.assertEqual(entries[0], dict(turn=1, tool='observe', is_error=False, status=None,
+                                         reason=None, detail=None, rev=12))
+        self.assertEqual(entries[1], dict(turn=2, tool='observe', is_error=True, status=None,
+                                         reason='invalid_request', detail='x' * 500, rev=None))
+
+    def test_transcript_records_malformed_calls_and_unknown_tools_before_failure(self):
+        malformed = self.call('act')
+        malformed['tool_calls'][0]['function']['arguments'] = '{broken'
+        for response, reason, summary_reason in (
+                (malformed, 'malformed_call', 'loop_failure'),
+                (dict(role='assistant', tool_calls=[{}]), 'malformed_call', 'loop_failure'),
+                (self.call([]), 'malformed_call', 'loop_failure'),
+                (a.AdapterError('invalid_provider_response'), 'malformed_call', 'invalid_provider_response'),
+                (self.call('unknown'), 'unknown_tool', 'unknown_model_tool')):
+            with self.subTest(reason=reason, response=response):
+                summary, entries, _ = self.transcript_run(
+                    [response if isinstance(response, Exception) else (response, {})])
+                self.assertEqual(summary['reason'], summary_reason)
+                self.assertEqual(entries, [dict(turn=1, tool=None, is_error=True,
+                    status=None, reason=reason, detail=None)])
+                self.assertEqual(summary['tool_calls_made'], 0)
+        missing_id = self.call('observe')
+        del missing_id['tool_calls'][0]['id']
+        summary, entries, _ = self.transcript_run([(missing_id, {})])
+        self.assertEqual(summary['reason'], 'loop_failure')
+        self.assertEqual(summary['tool_calls_made'], 1)
+        self.assertEqual(entries[0]['reason'], 'malformed_call')
+        self.assertIsNone(entries[0]['tool'])
+
+    def test_transcript_unset_creates_no_file_and_unwritable_does_not_change_summary(self):
+        responses = [(self.call('done', status='success', summary='OK'), {})]
+        summary, entries, path = self.transcript_run(responses, enabled=False)
+        self.assertFalse(path.exists())
+        self.assertEqual(entries, [])
+        c, p = self.setup_loop(responses)
+        with patch.dict(os.environ, CU_LOOP_TRANSCRIPT=str(path / 'missing' / 'calls.jsonl')), \
+                patch.object(loop, 'check_kill'):
+            self.assertEqual(loop.run_loop(c, p, 'Task', max_turns=1), summary)
+
+    def test_transcript_appends_and_is_visible_before_next_call(self):
+        with tempfile.TemporaryDirectory(prefix='loop-transcript-') as directory:
+            path = Path(directory) / 'calls.jsonl'
+            path.write_text('{"prior":true}\n')
+            c, p = self.setup_loop([(self.call('observe'), {}),
+                                   (self.call('done', status='success', summary='OK'), {})])
+            original = c.tool.side_effect
+            def tool(name, args):
+                if name == 'done':
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    self.assertEqual(rows[0], dict(prior=True))
+                    self.assertEqual(rows[1]['tool'], 'observe')
+                return original(name, args)
+            c.tool.side_effect = tool
+            with patch.dict(os.environ, CU_LOOP_TRANSCRIPT=str(path)), patch.object(loop, 'check_kill'):
+                loop.run_loop(c, p, 'Task')
+            self.assertEqual(len(path.read_text().splitlines()), 3)
 
     def test_cli_exit_codes_done_success_failed_blocked_and_cap(self):
         for status, expected in [('success', 0), ('failed', 1), ('blocked', 1), (None, 1)]:

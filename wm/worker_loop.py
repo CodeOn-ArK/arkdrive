@@ -297,6 +297,62 @@ def tool_error(result):
     return 'tool_error' if result.get('isError') else None
 
 
+def record_call(turn, name, result=None, reason=None):
+    """Append bounded diagnostics only; recording must not affect loop behavior."""
+    path = os.environ.get('CU_LOOP_TRANSCRIPT')
+    if not path:
+        return
+    try:
+        def scalar(value):
+            if isinstance(value, str):
+                return value[:500]
+            return value if value is None or type(value) in (bool, int, float) else None
+
+        value, detail, error = {}, None, None
+        if result is not None:
+            for block in result.get('content', []):
+                if block.get('type') != 'text':
+                    continue
+                try:
+                    parsed = json.loads(block['text'])
+                except ValueError:
+                    if result.get('isError') and detail is None:
+                        detail = scalar(block['text'])
+                    continue
+                if isinstance(parsed, dict):
+                    value = parsed
+                    break
+            error = tool_error(result)
+            reason = error if error is not None else value.get('reason')
+            # Never serialize whole results: observes and reconciled acts can
+            # contain trees, state, frame paths, evidence and inline images.
+            if result.get('isError'):
+                detail = scalar(value.get('detail')) or detail
+            detail = scalar(result.get('detail')) or detail
+        entry = dict(turn=turn, tool=scalar(name),
+                     is_error=result is None or bool(result.get('isError')) or error is not None,
+                     status=scalar(value.get('status')), reason=scalar(reason), detail=detail)
+        if name == 'act':
+            entry['steps'] = []
+            for step in value.get('steps', [])[:8]:
+                effect = step.get('effect') or {}
+                entry['steps'].append(dict(
+                    id=scalar(step.get('id')), status=scalar(step.get('status')),
+                    reason=scalar(step.get('reason')),
+                    effect={key: scalar(effect[key]) for key in
+                            ('status', 'predicate_class', 'expect_source', 'assurance', 'fallback_from')
+                            if key in effect}))
+        elif name == 'observe':
+            entry['rev'] = scalar(value.get('rev'))
+        with open(path, 'a', encoding='utf-8') as stream:
+            stream.write(json.dumps(entry, allow_nan=False) + '\n')
+            stream.flush()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # A missing/unwritable transcript is detected by the harness; it must
+        # not change a tool result, retry, prompt, or the final loop summary.
+        pass
+
+
 class MCPClient:
     def __init__(self, session, images):
         env = dict(os.environ)
@@ -382,27 +438,48 @@ def run_loop(client, provider, task, max_turns=40):
             summary['peak_estimated_prompt_tokens'] = max(summary['peak_estimated_prompt_tokens'], estimate)
             pending_frames = sum(b['type'] == 'image' for message in pending_results
                                  for b in message['content']) if provider.config['images'] else 0
-            assistant, usage = provider.complete(tools, history)
+            try:
+                assistant, usage = provider.complete(tools, history)
+            except (AdapterError, ValueError, KeyError, TypeError) as exc:
+                if not isinstance(exc, AdapterError) or exc.reason == 'invalid_provider_response':
+                    record_call(turn + 1, None, reason='malformed_call')
+                raise
             summary['frames_viewed'] += pending_frames
             pending_results = []
             for key, value in usage.items():
                 if type(value) in (int, float):
                     summary['token_usage'][key] = summary['token_usage'].get(key, 0) + value
             history.append(assistant)
-            calls = assistant.get('tool_calls', [])
+            try:
+                calls = assistant.get('tool_calls', [])
+            except (ValueError, KeyError, TypeError, AttributeError):
+                record_call(turn + 1, None, reason='malformed_call')
+                raise
             if not calls:
                 summary['reason'] = 'model_stopped_without_done'
                 break
             hints = []
             for call in calls:
                 check_kill()
-                name = call['function']['name']
-                arguments = json.loads(call['function']['arguments'])
-                if name not in allowed:
+                try:
+                    name = call['function']['name']
+                    arguments = json.loads(call['function']['arguments'])
+                    known_tool = name in allowed
+                except (ValueError, KeyError, TypeError):
+                    record_call(turn + 1, None, reason='malformed_call')
+                    raise
+                if not known_tool:
+                    record_call(turn + 1, None, reason='unknown_tool')
                     raise AdapterError('unknown_model_tool')
                 result = client.tool(name, arguments)
                 summary['tool_calls_made'] += 1
-                message = dict(role='tool', tool_call_id=call['id'], content=result['content'], is_error=result.get('isError', False))
+                try:
+                    call_id = call['id']
+                except (KeyError, TypeError):
+                    record_call(turn + 1, None, reason='malformed_call')
+                    raise
+                record_call(turn + 1, name, result)
+                message = dict(role='tool', tool_call_id=call_id, content=result['content'], is_error=result.get('isError', False))
                 history.append(message)
                 pending_results.append(message)
                 error = tool_error(result)
