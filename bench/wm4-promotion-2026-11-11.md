@@ -80,3 +80,47 @@ Raj's Debian VM live gates:
 
 No display :0 was opened or driven. Live gates remain for Raj on the
 Debian VM; headless success is not evidence that these live gates passed.
+
+## Fix round 1
+
+Raj's ArK2 live gate found that GNOME Text Editor 50.1 exposes WM_CLASS
+`gnome-text-editor`, while its recipe used the desktop-file id
+`org.gnome.TextEditor`. Recipe selection accepted the latter but source
+lookup required that same string as the native class; the real class had
+no recipe. The original headless fixture repeated the incorrect id and
+hid the mismatch.
+
+The chosen contract is exact native WM_CLASS throughout `app_class`:
+`gnome-text-editor` for GNOME Text Editor and `Thunar` for Thunar. The editor
+recipe key now matches the live class. No desktop-file-id aliases or class
+normalization are accepted: `org.gnome.TextEditor` returns `no_recipe`
+before creating any intent, gate, checkpoint, or reservation. Source
+lookup, manifest identity, destination verification, and retirement all
+use the same native class. Both recipes' `verify()` methods were audited:
+each requires exact class equality plus visible document evidence. Thunar's
+recipe and behavior are unchanged. The WM README documents this contract.
+
+Stage-D source fixtures now use `gnome-text-editor`; reopened fixtures
+derive the native class from the launched executable independently of the
+manifest's `app_class`. The existing end-to-end success test checks the
+native class in the checkpoint. Two added regression tests cover
+desktop-file-id refusal without traces and both recipes' exact-class and
+document verification. Before the recipe fix, the native-class success
+test failed with `no_recipe`, and the desktop-file-id refusal test received
+`source_window_missing` instead of `no_recipe`.
+
+Validation used the following environment for both discovery commands:
+
+```sh
+TMPDIR=/home/ark/arkdrive/wm/tests/.tmp \
+PYTHONPATH=/home/ark/arkdrive/wm \
+PYTHONDONTWRITEBYTECODE=1 DISPLAY= WAYLAND_DISPLAY= \
+python3 -m unittest discover -s wm/tests
+```
+
+The full WM suite ran **1,234 tests in 135.635 seconds: OK (skipped=1)**,
+with no failures or errors. Stage D separately ran **66 tests in 2.585
+seconds: OK**, using the same command with
+`-p test_worker_wm_d_promotion.py`. Scratch stayed within the repository.
+No commit or staging was performed, and no display :0 was opened. Live
+gates remain Raj's; this round provides headless validation only.

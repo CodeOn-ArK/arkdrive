@@ -52,8 +52,11 @@ class World:
         self.events.append(('reopen', record['incarnation']))
         if self.fail == 'reopen':
             raise PromotionError('reopen_failed')
+        # Model the launched app's native WM_CLASS independently of app_class.
+        app_class = {'gnome-text-editor': 'gnome-text-editor',
+                     'thunar': 'Thunar'}[manifest['launch_argv'][0]]
         self.windows[record['incarnation']] = [dict(handle='child-window', xid=20, mapped=True,
-                    title=str(root / manifest['document_paths'][0]), **{'class': manifest['app_class']})]
+                    title=str(root / manifest['document_paths'][0]), **{'class': app_class})]
 
     def retire(self, record, window):
         self.events.append(('retire', record['incarnation']))
@@ -77,7 +80,7 @@ class PromotionCase(unittest.TestCase):
         self.document = self.home / 'notes.txt'
         self.document.write_text('saved contents\n')
         self.window = dict(handle='source-window', xid=10, mapped=True, family='pid:123',
-                           title=str(self.document), **{'class': 'org.gnome.TextEditor'})
+                           title=str(self.document), **{'class': 'gnome-text-editor'})
         self.world.windows[self.root] = [self.window, dict(handle='unrelated-window', xid=11, mapped=True,
                                                          title='Other App', **{'class': 'Other'})]
         self.world.clipboards[self.root] = 'selected text'
@@ -127,6 +130,7 @@ class PromotionCase(unittest.TestCase):
         self.assertTrue(result['ok'], result)
         manifest = json.loads(Path(result['checkpoint']).read_text())
         self.assertEqual(manifest['promotion_id'], result['promotion_id'])
+        self.assertEqual(manifest['app_class'], 'gnome-text-editor')
         self.assertEqual(manifest['launch_argv'], ['gnome-text-editor', 'documents/notes.txt'])
         self.assertEqual(manifest['cwd'], '.')
         self.assertEqual(manifest['document_paths'], ['documents/notes.txt'])
@@ -144,6 +148,30 @@ class PromotionCase(unittest.TestCase):
         self.assertLess([e[0] for e in events].index('verified'), [e[0] for e in events].index('retire'))
         self.assertEqual(self.promote(), result)
         self.assertEqual([e[0] for e in events].count('retire'), 1)
+
+    def test_desktop_file_id_is_not_a_recipe_alias(self):
+        params = dict(self.params(), app_class='org.gnome.TextEditor')
+        before = self.records()
+        with self.assertRaisesRegex(Refused, 'no_recipe'):
+            self.c.dispatch('promote', params)
+        self.assertEqual(self.records(), before)
+        self.assertEqual(self.c.log.rows, [])
+        self.assertFalse((self.state / 'exchange').exists())
+        self.assertFalse((Path(self.record(self.root)['session_dir']) / 'promotion-gate.json').exists())
+        self.assertTrue(self.source_running())
+        self.assertEqual(self.world.events, [])
+
+    def test_both_recipes_verify_exact_native_class_and_document(self):
+        for app_class, wrong_class in [('gnome-text-editor', 'org.gnome.TextEditor'),
+                                       ('Thunar', 'thunar')]:
+            with self.subTest(app_class=app_class):
+                recipe = RECIPES[app_class]
+                window = dict(self.window, **{'class': app_class})
+                self.assertTrue(recipe.verify(window, None, str(self.document)))
+                self.assertFalse(recipe.verify(dict(window, **{'class': wrong_class}),
+                                               None, str(self.document)))
+                self.assertFalse(recipe.verify(dict(window, title='different.txt'),
+                                               None, str(self.document)))
 
     def test_unsaved_and_no_recipe_leave_no_trace(self):
         for title in ('*notes.txt', '• notes.txt', 'Untitled', 'notes.txt (modified)'):

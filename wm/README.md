@@ -105,7 +105,9 @@ child incarnation and checkpoint manifest path. Retry with the same request
 id and parameters. The RPC is synchronous; a client timeout does not imply
 failure or authorize a new request identity.
 
-Recipes are `org.gnome.TextEditor` (a saved file) and `Thunar` (a directory).
+`app_class` is the exact observed native WM_CLASS: `gnome-text-editor` (a
+saved file) or `Thunar` (a directory). Desktop-file ids such as
+`org.gnome.TextEditor` are unsupported and return `no_recipe`.
 They require an unambiguous path exposed by title/tree and corroborated by
 the window title, beneath the source session's private HOME. Detectable
 unsaved state is refused before any promotion intent or gate is created.

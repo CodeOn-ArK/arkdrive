@@ -1,5 +1,6 @@
 """GNOME Text Editor: only saved files with an observable path."""
-APP_CLASS = 'org.gnome.TextEditor'
+# app_class is the observed native WM_CLASS, not the desktop-file id.
+APP_CLASS = 'gnome-text-editor'
 COMMAND = 'gnome-text-editor'
 DIRECTORY = False
 
